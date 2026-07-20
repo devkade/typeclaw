@@ -3582,17 +3582,15 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
 
 describe('buildSandboxEnvPolicy exposable .env names', () => {
   test('adds exposable names to inherit so values stay out of argv', () => {
-    const policy = buildSandboxEnvPolicy(undefined, undefined, ['AGENT_MESSENGER_CONFIG_DIR', 'OPENSOMA_CONFIG_DIR'])
-    expect(policy.inherit).toEqual(['AGENT_MESSENGER_CONFIG_DIR', 'OPENSOMA_CONFIG_DIR'])
+    const policy = buildSandboxEnvPolicy(undefined, undefined, ['SERVICE_CONFIG_DIR', 'DATABASE_URL'])
+    expect(policy.inherit).toEqual(['SERVICE_CONFIG_DIR', 'DATABASE_URL'])
     expect(policy.set).toBeUndefined()
   })
 
   test('does not inherit a name already provided by the privileged runtime set', () => {
-    const policy = buildSandboxEnvPolicy(undefined, { AGENT_MESSENGER_CONFIG_DIR: '/runtime' }, [
-      'AGENT_MESSENGER_CONFIG_DIR',
-    ])
-    expect(policy.inherit ?? []).not.toContain('AGENT_MESSENGER_CONFIG_DIR')
-    expect(policy.set?.AGENT_MESSENGER_CONFIG_DIR).toBe('/runtime')
+    const policy = buildSandboxEnvPolicy(undefined, { SERVICE_CONFIG_DIR: '/runtime' }, ['SERVICE_CONFIG_DIR'])
+    expect(policy.inherit ?? []).not.toContain('SERVICE_CONFIG_DIR')
+    expect(policy.set?.SERVICE_CONFIG_DIR).toBe('/runtime')
   })
 
   test('deduplicates a name that is both a secret-pattern overlay and an exposable name', () => {
