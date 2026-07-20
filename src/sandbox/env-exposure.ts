@@ -6,18 +6,19 @@ import { DEFAULT_SANDBOX_ENV } from './policy'
 // safe fixed values — a PATH/loader hijack of the sandbox mechanism itself.
 const RESERVED_SANDBOX_ENV_NAMES = new Set(Object.keys(DEFAULT_SANDBOX_ENV))
 
-// Names TypeClaw's own runtime/broker OWNS: github-cli-auth gates GH_TOKEN /
-// GITHUB_TOKEN behind a capability + command-scoped overlay (only a validated
-// `gh` call gets the token, out of argv), and the TYPECLAW_* tokens are
-// host/container-injected auth. Ambient inheritance would bypass the broker and
-// hand a reusable credential to arbitrary bash — so these are withheld even when
-// declared in `.env`. Not a credential-name registry: these five names are ones
-// the runtime CLAIMS, distinct from operator credentials (which belong in
-// secrets.json). A matching `.env` line would otherwise make the runtime value
-// eligible; the parsed-value gate (below) also blocks the empty-declaration case.
+// Names host/container startup INJECTS into the container env — never something
+// an operator writes in `.env`. TYPECLAW_TUI_TOKEN / TYPECLAW_HOSTD_TOKEN /
+// TYPECLAW_HOSTD_BROKER_TOKEN are per-container generated auth; letting a matching
+// `.env` line make the live runtime value eligible would hand the sandbox a token
+// the operator never chose to expose. Not a credential-name registry: these are
+// names the runtime CLAIMS, distinct from operator credentials (which belong in
+// secrets.json when they must stay hidden). GH_TOKEN / GITHUB_TOKEN are NOT here:
+// `.env` is the operator's expose-to-the-agent surface, so an operator who
+// declares a GitHub token there has chosen to hand it to model bash (e.g. so plain
+// `gh` / `git` / `curl` work in agents with no GitHub channel). The github-cli-auth
+// broker still injects a narrower per-repo token via a command-scoped overlay, and
+// when both exist for the same name the overlay is deduplicated and its value wins.
 const RUNTIME_OWNED_ENV_NAMES = new Set<string>([
-  'GH_TOKEN',
-  'GITHUB_TOKEN',
   'TYPECLAW_TUI_TOKEN',
   'TYPECLAW_HOSTD_TOKEN',
   'TYPECLAW_HOSTD_BROKER_TOKEN',
@@ -52,10 +53,11 @@ const EXECUTION_CONTROL_ENV_NAMES = new Set<string>([
 
 const EXECUTION_CONTROL_ENV_PREFIXES = ['GIT_CONFIG', 'BASH_FUNC_'] as const
 
-// Withheld ONLY when the name would compromise sandbox integrity or the runtime
-// credential broker — not for being credential-shaped. `.env` is the operator's
-// expose-to-the-agent surface: every value they declare there reaches model bash
-// by design. Credentials that must stay hidden belong in secrets.json.
+// Withheld ONLY when the name would compromise sandbox integrity or claim a
+// host/container-injected runtime token — not for being credential-shaped. `.env`
+// is the operator's expose-to-the-agent surface: every value they declare there
+// reaches model bash by design, INCLUDING GH_TOKEN / GITHUB_TOKEN. Credentials
+// that must stay hidden belong in secrets.json.
 function isWithheldEnvName(name: string): boolean {
   if (RESERVED_SANDBOX_ENV_NAMES.has(name)) return true
   if (RUNTIME_OWNED_ENV_NAMES.has(name)) return true

@@ -4,6 +4,7 @@ import {
   configureReviewVerdictCoordinator,
   createSharedReviewVerdictGuard,
 } from '@/channels/github-review-verdict-coordinator'
+import { hasEnvKey } from '@/init/env-file'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin } from '@/plugin'
 
@@ -52,17 +53,38 @@ export default definePlugin({
         : undefined
     }
 
-    // The PAT is in the container env but stripped by --clearenv for this role,
-    // and a PAT is not re-mintable per repo, so there is no token to inject. Tell
-    // the AGENT (model-visible block) instead of letting git/gh fail ambiguously
-    // — the silent variant of this is exactly what caused a multi-day debugging
-    // hunt. App auth is the supported path for low-trust roles.
+    // The token `gh` will actually resolve INSIDE the low-trust sandbox. Only
+    // `.env`-declared names survive `--clearenv` (`hasEnvKey` reads the same
+    // `readEnvFile(agentDir)` parse the sandbox's `resolveExposableEnvNames` uses,
+    // so this is congruent with what the sandbox inherits), and gh's precedence is
+    // GH_TOKEN > GITHUB_TOKEN. So a process-only GH_TOKEN does NOT mask an
+    // inheritable, operator-declared GITHUB_TOKEN: the process-only name is cleared,
+    // leaving the declared alias as the one gh sees. Returns the surviving PAT/App
+    // token (value snapshotted from process.env, which holds the declared value),
+    // or undefined when the operator declared no usable GitHub token in `.env`.
+    const sandboxInheritedGhToken = (): { envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } | undefined => {
+      for (const envName of ['GH_TOKEN', 'GITHUB_TOKEN'] as const) {
+        if (!hasEnvKey(ctx.agentDir, envName)) continue
+        const value = process.env[envName]
+        if (value !== undefined && value !== '') return { envName, value }
+      }
+      return undefined
+    }
+
+    // A process-only PAT (runtime/App-seeded process.env, NOT declared in `.env`)
+    // is stripped by --clearenv for this role, and a PAT is not re-mintable per
+    // repo, so there is no token to inject. Tell the AGENT (model-visible block)
+    // instead of letting git/gh fail ambiguously — the silent variant of this is
+    // exactly what caused a multi-day debugging hunt. This does NOT fire for a PAT
+    // the operator declared in `.env`: that one is inherited into the sandbox and
+    // handled by the allow-path above.
     const sandboxedPatWithheldReason =
-      'A classic/fine-grained GitHub PAT is configured (via .env GH_TOKEN), but this command runs ' +
-      'in a sandboxed (low-trust) role whose environment is cleared before bash — so the PAT is ' +
-      'withheld here and is NOT available to git/gh. This is a deliberate guard, not missing auth: a ' +
-      'broad, long-lived PAT must not be reachable from a low-trust sandbox. Configure GitHub App auth ' +
-      '(channels.github) to grant per-repo, short-lived tokens that DO work for sandboxed roles.'
+      'A classic/fine-grained GitHub PAT is present in the runtime environment but was NOT declared ' +
+      'in `.env`, and this command runs in a sandboxed (low-trust) role whose environment is cleared ' +
+      'before bash — so the PAT is withheld here and is NOT available to git/gh. This is a deliberate ' +
+      'guard, not missing auth: a broad, long-lived runtime PAT must not be reachable from a low-trust ' +
+      'sandbox. Configure GitHub App auth (channels.github) for per-repo, short-lived tokens that work ' +
+      'for sandboxed roles, or declare the PAT in `.env` to deliberately expose it to model bash.'
 
     let warnedSandboxedPatWithheld = false
     const warnSandboxedPatWithheldOnce = (): void => {
@@ -250,22 +272,41 @@ export default definePlugin({
         event.args.command = decision.rewrittenCommand
       }
 
+      // When NO per-repo App minter is available, prefer the token the operator
+      // deliberately exposed via `.env`: the sandbox inherits it into bash for
+      // EVERY role, so the validated command just runs on it — no block, no
+      // overlay except GH_REPO (non-secret) for a trusted-fallback repo. This runs
+      // BEFORE the process-token-class branches so it is independent of gh's
+      // GH_TOKEN>GITHUB_TOKEN process preference: an undeclared (process-only)
+      // GH_TOKEN — even App-class `ghs_` — never masks a declared, inheritable
+      // GITHUB_TOKEN, because sandboxInheritedGhToken() only considers names that
+      // survive --clearenv. When a minter IS available it wins (least-privilege
+      // short-lived per-repo token over a broad declared PAT) via the paths below.
+      if (!hasAppTokenResolver() && sandboxInheritedGhToken() !== undefined) {
+        if (decision.kind === 'inject' && fallbackRepoUsed && fallbackRepo !== undefined) {
+          event.args[TYPECLAW_INTERNAL_BASH_ENV] = { GH_REPO: fallbackRepo }
+        }
+        return
+      }
+
       // PAT classes (classic = cross-owner, fine-grained) are not re-minted per
       // repo; the seeded GH_TOKEN is the only token we have. App minting, when
-      // available, is preferred for roles without credential-use permission,
-      // so a PAT must not suppress minting there. An entitled role receives the
-      // PAT through the narrow overlay; raw process.env and credential files
-      // remain unavailable inside bash. Sandboxed PAT-only:
-      // block with guidance instead of failing silently.
+      // available, is preferred for ALL roles (least-privilege per-repo token over
+      // a broad PAT), so a PAT must not suppress minting. An entitled role with NO
+      // minter receives the PAT through the narrow overlay; raw process.env and
+      // credential files remain unavailable inside bash. Sandboxed PAT-only with no
+      // minter and no `.env` declaration: block with guidance instead of failing
+      // silently.
       // Set when a sandboxed PAT falls through to App minting: the tail's
       // shouldMintAppToken(process.env.GH_TOKEN) re-check would see the PAT and
       // bail, so this flag forces the mint that the PAT must not suppress.
       let mintForSandboxedPat = false
       if (tokenClass === 'cross-owner' || tokenClass === 'fine-grained-pat') {
-        // Credential-entitled role: for a repo-targeting command, inject the PAT
-        // through the runtime-owned overlay. The same literal-repo and
-        // credential-safe argv gates apply to PATs and App tokens.
-        if (canUsePat(event.origin)) {
+        // Credential-entitled role, NO App minter: inject the PAT through the
+        // runtime-owned overlay. Gated on `!hasAppTokenResolver()` — when a minter
+        // is available it wins, so a declared/entitled PAT does not beat the
+        // least-privilege per-repo App token; execution falls through to minting.
+        if (canUsePat(event.origin) && !hasAppTokenResolver()) {
           if (decision.kind === 'inject') {
             event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
               [processToken?.envName ?? 'GH_TOKEN']: processToken?.value ?? '',
@@ -274,9 +315,10 @@ export default definePlugin({
           }
           return
         }
-        // Sandboxed: the PAT is stripped by --clearenv. Prefer App minting when
-        // available (a PAT must NOT suppress it, or the original silent-failure
-        // bug returns); otherwise block with guidance rather than failing mute.
+        // Sandboxed PAT, no minter, not declared in `.env`: the sandbox clears it
+        // for this role, so there is no inheritable token. Block with guidance
+        // rather than failing mute. (A declared `.env` PAT already returned via the
+        // sandbox-inherited allow-path above; an available minter falls through.)
         if (!shouldMintAppToken(undefined, hasAppTokenResolver())) {
           warnSandboxedPatWithheldOnce()
           return blockAfterLease({ block: true, reason: sandboxedPatWithheldReason })

@@ -137,9 +137,11 @@ export type SandboxPolicy = {
 
 // The env the sandbox always re-introduces after `--clearenv`. Anything not
 // listed here (or explicitly named in `env.set` / `env.passthrough` by the
-// consumer) is invisible inside the sandbox. This is the load-bearing leak
-// guard: the container env holds OPENAI_API_KEY and GH_TOKEN, and env
-// inheritance is the single highest-risk exfil path for prompt-injected bash.
+// consumer — including operator `.env` vars re-introduced via inherit) is
+// invisible inside the sandbox. This is the load-bearing leak guard: the
+// container env holds credentials the operator never declared in `.env` (e.g.
+// OPENAI_API_KEY, host-injected TYPECLAW_* tokens), and env inheritance is the
+// single highest-risk exfil path for prompt-injected bash.
 // HOME points at /tmp because the sandbox mounts /tmp as a fresh tmpfs.
 //
 // BUN_TMPDIR / BUN_INSTALL both point under /tmp because `--clearenv` strips
