@@ -3259,8 +3259,8 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       await runFixtureGit(agentDir, 'init')
       await runFixtureGit(agentDir, 'config', 'user.name', 'Test User')
       await runFixtureGit(agentDir, 'config', 'user.email', 'test@example.com')
-      await writeFile(path.join(agentDir, '.env'), 'EXAMPLE_TOKEN=placeholder')
-      await runFixtureGit(agentDir, 'add', '.env')
+      await writeFile(path.join(agentDir, 'secrets.json'), '{"token":"example-placeholder"}')
+      await runFixtureGit(agentDir, 'add', 'secrets.json')
       await runFixtureGit(agentDir, 'commit', '-m', 'add fixture')
       const wrapped = wrapBuiltinToolDefinition(fakeBash(record), {
         agentDir,

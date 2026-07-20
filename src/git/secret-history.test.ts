@@ -36,6 +36,28 @@ describe('canonical Git secret history guard', () => {
     expect(await scanCanonicalSecretsInGit(repo)).toEqual({ ok: false, paths: ['secrets.json'] })
   })
 
+  test('allows a .env reachable in history because its values are already exposed to model bash', async () => {
+    // Per the expose-to-agent policy (PR #1244) every declared `.env` var is inherited into model
+    // bash, so recovering a historical `.env` via `git show` discloses nothing the operator did not
+    // already hand the agent — blocking all git/bash over it is pure disruption. secrets.json stays
+    // blocking (never inherited). The live-file mask still covers `.env`; only the history scan skips it.
+    const repo = await makeRepo()
+    await commitFile(repo, '.env', 'EXAMPLE_TOKEN=placeholder')
+    await rm(join(repo, '.env'))
+    await git(repo, 'add', '.env')
+    await git(repo, 'commit', '-m', 'remove env')
+
+    expect(await scanCanonicalSecretsInGit(repo)).toEqual({ ok: true })
+  })
+
+  test('still blocks secrets.json in history even when a benign .env sits beside it', async () => {
+    const repo = await makeRepo()
+    await commitFile(repo, '.env', 'EXAMPLE_TOKEN=placeholder')
+    await commitFile(repo, 'secrets.json', '{"token":"example-placeholder"}')
+
+    expect(await scanCanonicalSecretsInGit(repo)).toEqual({ ok: false, paths: ['secrets.json'] })
+  })
+
   test('allows an unattributable blob left by staging and resetting a canonical secret', async () => {
     const repo = await makeRepo()
     await commitFile(repo, 'README.md', 'safe')
@@ -55,7 +77,7 @@ describe('canonical Git secret history guard', () => {
     const repo = await makeRepo()
     await commitFile(repo, 'README.md', 'safe')
     const cleanCommit = await gitOutput(repo, 'rev-parse', 'HEAD')
-    await commitFile(repo, '.env', 'EXAMPLE_TOKEN=placeholder')
+    await commitFile(repo, 'secrets.json', '{"token":"example-placeholder"}')
     const secretCommit = await gitOutput(repo, 'rev-parse', 'HEAD')
     await git(repo, 'replace', secretCommit, cleanCommit)
 
@@ -76,9 +98,9 @@ describe('canonical Git secret history guard', () => {
 
   test('detects a removed canonical file that remains reachable from history', async () => {
     const repo = await makeRepo()
-    await commitFile(repo, '.env', 'EXAMPLE_TOKEN=placeholder')
-    await rm(join(repo, '.env'))
-    await git(repo, 'add', '.env')
+    await commitFile(repo, 'secrets.json', '{"token":"example-placeholder"}')
+    await rm(join(repo, 'secrets.json'))
+    await git(repo, 'add', 'secrets.json')
     await git(repo, 'commit', '-m', 'remove example credential')
 
     await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow(GitSecretHistoryError)
@@ -205,11 +227,11 @@ describe('canonical Git secret history guard', () => {
     // path-bearing commit, so no attributable object records its canonical path.
     const repo = await makeRepo()
     await commitFile(repo, 'README.md', 'safe')
-    await writeFile(join(repo, '.env'), 'EXAMPLE_TOKEN=placeholder')
-    await git(repo, 'add', '.env')
-    const blob = await gitOutput(repo, 'rev-parse', ':.env')
-    await git(repo, 'reset', '--', '.env')
-    await rm(join(repo, '.env'))
+    await writeFile(join(repo, 'secrets.json'), '{"token":"example-placeholder"}')
+    await git(repo, 'add', 'secrets.json')
+    const blob = await gitOutput(repo, 'rev-parse', ':secrets.json')
+    await git(repo, 'reset', '--', 'secrets.json')
+    await rm(join(repo, 'secrets.json'))
     await git(repo, 'update-ref', '--create-reflog', 'refs/test/reflog-root', blob)
     await git(repo, 'update-ref', 'refs/test/reflog-root', 'HEAD')
 
@@ -559,9 +581,9 @@ describe('canonical Git secret history guard', () => {
 
   test('caches contamination fail-closed for the process lifetime', async () => {
     const repo = await makeRepo()
-    await commitFile(repo, '.env', 'EXAMPLE_TOKEN=placeholder')
+    await commitFile(repo, 'secrets.json', '{"token":"example-placeholder"}')
     await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow()
-    await git(repo, 'rm', '.env')
+    await git(repo, 'rm', 'secrets.json')
     await git(repo, 'commit', '-m', 'remove example credential')
     await git(repo, 'reflog', 'expire', '--expire=now', '--all')
     await git(repo, 'gc', '--prune=now')
