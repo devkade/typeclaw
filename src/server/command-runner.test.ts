@@ -358,6 +358,35 @@ describe('CommandRunner', () => {
     expect(pluginWarnings.length).toBe(0)
   })
 
+  test('consecutive ctx.logger calls all reach stderr', async () => {
+    const cmd = defineCommand({
+      surface: 'container',
+      description: 'chatty',
+      run: async (ctx) => {
+        ctx.logger.info('first')
+        ctx.logger.warn('second')
+        ctx.logger.error('third')
+        return 0
+      },
+    })
+    const { runner, frames } = makeRunner([registerCommand('chatty', cmd)])
+    runner.start({ callId: 'chatty', name: 'chatty', args: undefined }, null)
+    await waitForExit(frames, 'chatty')
+
+    // The logger writes every line to one shared stderr sink. Acquiring a
+    // writer per line without serializing them leaves the stream locked when
+    // the next line arrives, so the second call throws out of ctx.run and the
+    // line is lost. All three must survive, in order.
+    const stderrText = frames
+      .filter((f) => f.kind === 'stderr')
+      .map((f) => (f as { chunk: string }).chunk)
+      .join('')
+    expect(stderrText).toContain('info: first')
+    expect(stderrText).toContain('warn: second')
+    expect(stderrText).toContain('error: third')
+    expect(frames.filter((f) => f.kind === 'error').length).toBe(0)
+  })
+
   test('ctx.origin is subagent-shaped with parent TUI origin in spawnedByOrigin', async () => {
     const cmd = defineCommand({
       surface: 'container',

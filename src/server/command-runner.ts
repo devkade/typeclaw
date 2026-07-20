@@ -359,9 +359,33 @@ function makeWritable(onChunk: (chunk: Uint8Array) => void): WritableStream<Uint
   })
 }
 
+// One sink backs every logger line for a command, and `getWriter()` throws
+// while another writer holds the lock. Releasing in a `.then()` returns the
+// lock a microtask too late: the next `logger.*` call runs synchronously from
+// `ctx.run` and finds the stream still locked, so the line is lost and the
+// throw escapes into the command. Chain each line onto the previous write so
+// only one writer exists at a time, and release in `finally` so a rejected
+// write can't strand the lock permanently.
+//
+// Keyed per stream rather than held for the run because the same sink is also
+// handed to plugins as `ctx.stderr`; the lock has to be dropped between lines
+// or a plugin writing to it directly would be locked out.
+const writeTails = new WeakMap<WritableStream<Uint8Array>, Promise<void>>()
+
 function writeLine(stream: WritableStream<Uint8Array>, line: string): void {
-  const writer = stream.getWriter()
-  void writer.write(new TextEncoder().encode(`${line}\n`)).then(() => writer.releaseLock())
+  const bytes = new TextEncoder().encode(`${line}\n`)
+  const tail = (writeTails.get(stream) ?? Promise.resolve()).then(async () => {
+    const writer = stream.getWriter()
+    try {
+      await writer.write(bytes)
+    } finally {
+      writer.releaseLock()
+    }
+  })
+  writeTails.set(
+    stream,
+    tail.catch(() => {}),
+  )
 }
 
 export type CreateSessionForCommand = (options: CreateSessionOptions) => Promise<CreateSessionResult>
