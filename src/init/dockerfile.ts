@@ -477,6 +477,37 @@ link_configured_symlinks() {
   ' || true
 }
 
+# seed_runtime_home copies the image-baked Claude Code / Codex CLI settings from
+# the build-time HOME (/root) into the managed runtime HOME the non-root re-exec
+# switches to. The Dockerfile writes ~/.claude.json, ~/.claude/settings.json,
+# and ~/.codex/hooks.json against /root during \`docker build\`; once the runtime
+# runs under HOME=$runtime_home those files would be invisible, silently
+# disabling Claude onboarding state and both CLIs' completion hooks for
+# claudeCode/codexCli users. link_persistent_home_files only links CREDENTIALS,
+# not this config, so we seed it here.
+#
+# Runs in the root setup phase (HOME is still /root), BEFORE the chown so the
+# copies inherit the host ownership. \`cp -n\` never clobbers a file the operator
+# already persisted into the runtime home (the bind-mounted persist root survives
+# restarts), so seeding is idempotent and one-way: image defaults fill only what
+# is missing.
+seed_runtime_home() {
+  _src="\${1:-/root}"
+  _dst="$2"
+  [ "$_src" = "$_dst" ] && return 0
+  mkdir -p "$_dst"
+  [ -f "$_src/.claude.json" ] && cp -n "$_src/.claude.json" "$_dst/.claude.json" 2>/dev/null || true
+  if [ -f "$_src/.claude/settings.json" ]; then
+    mkdir -p "$_dst/.claude"
+    cp -n "$_src/.claude/settings.json" "$_dst/.claude/settings.json" 2>/dev/null || true
+  fi
+  if [ -f "$_src/.codex/hooks.json" ]; then
+    mkdir -p "$_dst/.codex"
+    cp -n "$_src/.codex/hooks.json" "$_dst/.codex/hooks.json" 2>/dev/null || true
+  fi
+  unset _src _dst
+}
+
 start_xvfb() {
   if ! command -v Xvfb >/dev/null 2>&1; then
     return 0
@@ -491,9 +522,23 @@ start_xvfb() {
   rm -f "$xvfb_status"
   (
     set +e
-    setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin \\
-      -- Xvfb :99 -screen 0 1920x1080x24 -ac +extension RANDR -nolisten tcp \\
-      >/dev/null 2>&1
+    # The nested setpriv strips NET_ADMIN so Xvfb never inherits it (invariant
+    # 1). But when we've ALREADY re-exec'd into the non-root runtime phase
+    # (TYPECLAW_ENTRYPOINT_RUNTIME=1), the outer handoff emptied the bounding
+    # set and dropped CAP_SETPCAP — so a second \`setpriv --bounding-set\` here
+    # can no longer modify the bounding set and exits non-zero (127), which the
+    # liveness probe would misreport as "Xvfb exited immediately". There is also
+    # nothing left to strip: NET_ADMIN is already gone. So in the runtime phase
+    # launch Xvfb DIRECTLY; keep the nested drop only for the root fallback
+    # paths (where this shim is still PID 1 with the full capability set).
+    if [ "\${TYPECLAW_ENTRYPOINT_RUNTIME:-0}" = "1" ]; then
+      Xvfb :99 -screen 0 1920x1080x24 -ac +extension RANDR -nolisten tcp \\
+        >/dev/null 2>&1
+    else
+      setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin \\
+        -- Xvfb :99 -screen 0 1920x1080x24 -ac +extension RANDR -nolisten tcp \\
+        >/dev/null 2>&1
+    fi
     printf '%s\\n' "$?" > "$xvfb_status"
   ) &
   xvfb_pid=$!
@@ -524,7 +569,35 @@ start_xvfb() {
   exit 1
 }
 
+if [ "\${TYPECLAW_ENTRYPOINT_RUNTIME:-0}" = "1" ]; then
+  link_persistent_home_files
+  link_configured_symlinks
+  start_xvfb
+  exec bun run ${TYPECLAW_CLI_ENTRY} "$@"
+fi
+
+persist_root="\${TYPECLAW_PERSIST_HOME_ROOT:-/agent/.typeclaw/home}"
+runtime_home="$persist_root/runtime"
+if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
+  mkdir -p "$runtime_home"
+  seed_runtime_home "$HOME" "$runtime_home"
+  chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$persist_root"
+fi
+
 if [ "\${TYPECLAW_NETWORK_BLOCK_INTERNAL:-0}" != "1" ]; then
+  if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
+    # NOTE: no \`--reset-env\`. setpriv --reset-env clears every non-terminal
+    # variable, which would wipe the runtime's own configuration: --env-file
+    # values (provider credentials, etc.) plus TYPECLAW_SANDBOX_SYMLINKS,
+    # TYPECLAW_TUI_TOKEN, TYPECLAW_CONTAINER_NAME, TYPECLAW_HOSTD_URL,
+    # TYPECLAW_MODEL_CACHE, and TZ — all injected by start.ts and read after the
+    # re-exec. We only need to OVERRIDE two variables for the runtime phase, and
+    # the trailing \`env HOME=… TYPECLAW_ENTRYPOINT_RUNTIME=1\` does exactly that
+    # while forwarding everything else unchanged.
+    exec setpriv --reuid="$TYPECLAW_HOST_UID" --regid="$TYPECLAW_HOST_GID" --clear-groups \\
+      --bounding-set=-all --inh-caps=-all --ambient-caps=-all \\
+      -- env HOME="$runtime_home" TYPECLAW_ENTRYPOINT_RUNTIME=1 "$0" "$@"
+  fi
   link_persistent_home_files
   link_configured_symlinks
   start_xvfb
@@ -572,6 +645,14 @@ ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 ip6tables -A OUTPUT -o lo -j ACCEPT
 ${ipv6Rules.join('\n')}
 
+if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
+  # No \`--reset-env\` — see the network-off handoff above: it would strip the
+  # --env-file values and the TypeClaw-injected runtime variables. The trailing
+  # \`env\` overrides only HOME + TYPECLAW_ENTRYPOINT_RUNTIME and forwards the rest.
+  exec setpriv --reuid="$TYPECLAW_HOST_UID" --regid="$TYPECLAW_HOST_GID" --clear-groups \\
+    --bounding-set=-all --inh-caps=-all --ambient-caps=-all \\
+    -- env HOME="$runtime_home" TYPECLAW_ENTRYPOINT_RUNTIME=1 "$0" "$@"
+fi
 link_persistent_home_files
 link_configured_symlinks
 start_xvfb
