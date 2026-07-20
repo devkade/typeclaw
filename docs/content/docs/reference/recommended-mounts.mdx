@@ -1,0 +1,228 @@
+---
+title: Recommended mounts
+description: Canonical host paths for common mount requests, with readOnly defaults and platform gotchas
+icon: FolderTree
+---
+
+import { Callout } from 'fumadocs-ui/components/callout'
+
+A companion to [`typeclaw.json` mounts](/docs/reference/typeclaw-json#mounts) and [CLI mounts](/docs/reference/cli#mounts): the canonical host path, `readOnly` default, and platform gotchas for the mount requests that come up most often. Every mount here lands at `/agent/mounts/name` inside the container after `typeclaw restart`.
+
+<Callout type="warn" title="Never mount your home directory or credentials">
+  Don't mount the whole home directory, and don't mount credential directories (SSH keys, cloud CLI config, the system
+  keychain). Mounted content is part of the agent's filesystem surface, not a credential broker. Full list in
+  Anti-patterns below.
+</Callout>
+
+## macOS: Full Disk Access (TCC)
+
+Several of the more useful macOS paths (Mail, Messages, Calendars since macOS 14, Contacts, Safari, Reminders, Photos) sit behind macOS's Transparency, Consent, and Control (TCC) subsystem. Apple's rule: the application that opens the file needs Full Disk Access (FDA) in System Settings, Privacy and Security. For typeclaw, that application is Docker Desktop, or OrbStack if that's the runtime in use, since Docker is what binds the path into the container.
+
+<Callout type="info" title="The mount succeeds even without FDA. Reads don't.">
+  A Docker bind mount is a kernel-level bind, not a file-open, so the mounted path always appears after restart
+  regardless of FDA. `ls` may even list filenames. But without FDA granted, every actual file read fails with EPERM,
+  which looks like a broken mount when it's really a missing permission. Grant Docker Desktop (or OrbStack) Full Disk
+  Access, then restart Docker itself. Toggling FDA doesn't retroactively re-permission an already-running daemon.
+</Callout>
+
+OrbStack shows up in the FDA list as "OrbStack Helper" or "OrbStack" depending on version. Rows below mark FDA-gated paths with **FDA** in the TCC column.
+
+## Tier 1: high signal, low friction
+
+Common asks, and none of these need an FDA grant (a few trigger the ordinary one-time Documents/Desktop prompt macOS already shows on first container access).
+
+### Voice memos
+
+| Platform      | Path                                                                      | `readOnly` | TCC | Notes                                                                                                                                                      |
+| ------------- | ------------------------------------------------------------------------- | ---------- | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS (12+)   | `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings` | `true`     | —   | The group container path, not the retired `~/Library/Application Support/com.apple.voicememos`. Includes iCloud-synced recordings from iPhone Voice Memos. |
+| macOS (older) | `~/Library/Application Support/com.apple.voicememos/Recordings`           | `true`     | —   | macOS 11 and earlier only. If both paths exist on a newer machine, the group container is current and the other is a stale copy.                           |
+| Linux         | (no native equivalent)                                                    | —          | —   | If recordings come from a tool like `pw-record` or `pactl`, point the mount at that output directory instead.                                              |
+| WSL           | `/mnt/c/Users/<name>/Documents/Sound recordings/`                         | `true`     | —   | Windows Voice Recorder's default. Reachable from WSL through the C drive mount.                                                                            |
+
+Once mounted, this pairs well with a transcription workflow to turn recordings into text.
+
+### Screenshots
+
+| Platform                | Path                                                              | `readOnly` | TCC | Notes                                                                                                                            |
+| ----------------------- | ----------------------------------------------------------------- | ---------- | --- | -------------------------------------------------------------------------------------------------------------------------------- |
+| macOS                   | `~/Desktop` (default)                                             | `true`     | —   | macOS defaults screenshots to Desktop. Mount the whole directory or a narrower subfolder if it's cluttered with unrelated files. |
+| macOS (custom location) | Run `defaults read com.apple.screencapture location` on the host. | `true`     | —   | Common moved locations: `~/Pictures/Screenshots`, `~/Documents/Screenshots`.                                                     |
+| Linux (GNOME)           | `~/Pictures/Screenshots`                                          | `true`     | —   | Default for GNOME Screenshot and KDE Spectacle.                                                                                  |
+| WSL                     | `/mnt/c/Users/<name>/Pictures/Screenshots/`                       | `true`     | —   | Win+Shift+S / Snipping Tool's save location. Reachable from WSL through the C drive mount.                                       |
+
+Handy paired with a multimodal model for "look at this screenshot and explain the error."
+
+### Downloads
+
+| Platform | Path                             | `readOnly`       | TCC | Notes                                                                                                                                                                        |
+| -------- | -------------------------------- | ---------------- | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS    | `~/Downloads`                    | `true` (usually) | —   | Read-only by default since the agent rarely needs to write here. macOS may show a one-time TCC prompt for Downloads on first access, which is a normal user prompt, not FDA. |
+| Linux    | `~/Downloads`                    | `true` (usually) | —   | XDG-spec location.                                                                                                                                                           |
+| WSL      | `/mnt/c/Users/<name>/Downloads/` | `true` (usually) | —   | Windows' default Downloads folder. Reachable from WSL through the C drive mount.                                                                                             |
+
+### Obsidian vault
+
+Worth setting up for Obsidian users. The storage is plain markdown files in a folder, no opaque format, no proprietary database, no encryption layer, which is exactly what a mount is good at.
+
+| Platform             | Path                                                                                            | `readOnly`                                           | TCC | Notes                                                                                                                                                                                               |
+| -------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------- | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS, iCloud-synced | `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/<vault-name>`                          | `false` (RW for editing) or `true` (RO for research) | —   | The canonical path when a vault syncs via iCloud or Obsidian Sync. iCloud lazy-loads: files not opened recently can appear as 0-byte stubs until iCloud materializes them. See Anti-patterns below. |
+| macOS, local vault   | `~/Documents/<vault-name>` or `~/Obsidian/<vault-name>`                                         | as above                                             | —   | For vaults kept out of iCloud. No lazy-load gotcha.                                                                                                                                                 |
+| macOS, Obsidian Sync | (same as the local vault path)                                                                  | as above                                             | —   | Obsidian Sync syncs in place; there's no separate sync directory.                                                                                                                                   |
+| Linux                | `~/Documents/<vault-name>` or `~/Obsidian/<vault-name>`                                         | as above                                             | —   | Same Electron app; vault lives wherever it was pointed.                                                                                                                                             |
+| WSL                  | `/mnt/c/Users/<name>/Documents/<vault-name>` (or the Linux-side path if the vault lives in WSL) | as above                                             | —   | If the vault lives on the Windows side, expect slower directory traversal on large vaults (thousands of notes) and possible CRLF line endings from Windows-side editors.                            |
+
+Use `readOnly: false` for active editing (daily logs, refiling, linking). Use `readOnly: true` for pure read access, question-answering, research synthesis. The difference matters in practice: a misconfigured RW mount can silently rewrite notes, and a misconfigured RO mount can't refile anything.
+
+Special files inside an Obsidian vault: the `.obsidian` directory (per-vault config, plugins, themes, leave alone unless debugging an Obsidian setting), `.obsidian/workspace.json` (active panes, mutated constantly while Obsidian is open, don't write to it or you'll race Obsidian itself), and `.trash` (Obsidian's local trash, gitignored by most setups).
+
+### Other notes vaults (plaintext, Logseq, etc.)
+
+For plain markdown without Obsidian, Logseq, or a custom vault structure:
+
+| Platform | Path                                            | `readOnly`                                           | TCC | Notes                                                                       |
+| -------- | ----------------------------------------------- | ---------------------------------------------------- | --- | --------------------------------------------------------------------------- |
+| macOS    | `~/Documents/<vault-name>` (wherever it's kept) | `false` (RW for editing) or `true` (RO for research) | —   | `false` for edit access, `true` for read/search only.                       |
+| Linux    | `~/Documents/<vault-name>` (wherever it's kept) | as above                                             | —   | No iCloud quirks.                                                           |
+| WSL      | `/mnt/c/Users/<name>/Documents/<vault-name>`    | as above                                             | —   | Watch for CRLF line endings on files originating from Windows-side editors. |
+
+For Logseq, the vault is plain markdown (or org-mode), same shape as above, just point at the graph directory.
+
+### Code repo
+
+| Platform | Path                                      | `readOnly`        | TCC | Notes                                                                                                                                           |
+| -------- | ----------------------------------------- | ----------------- | --- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| any      | wherever the repository lives on the host | `false` typically | —   | The standard "let me code on this" use case. Commits made inside the mounted directory go to the host repo's own history, not the agent folder. |
+
+## Tier 2: privacy-sensitive, FDA-gated
+
+These cross a real privacy boundary. Default to `readOnly: true` unless there's a specific reason to write, and surface the FDA requirement before editing `typeclaw.json`. Without it, every file read comes back EPERM.
+
+Treat adding any of these as a moment to pause and confirm the request is specific (triage my mail, search my iMessages, scan my contacts), not a default.
+
+### macOS Mail: local mailboxes
+
+| Platform                                    | Path                                                                | `readOnly` | TCC     | Notes                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------- | ------------------------------------------------------------------- | ---------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS 13+ (Ventura, Sonoma, Sequoia, Tahoe) | `~/Library/Mail/V10`                                                | `true`     | **FDA** | The `V10` directory holds per-account directories containing `.emlx` files, one per message, in RFC822 format plus a small Apple-specific binary plist trailer. The version bumped to `V10` in Ventura and has stayed there through Tahoe.                                                               |
+| macOS 12 (Monterey)                         | `~/Library/Mail/V9`                                                 | `true`     | **FDA** | Same shape, previous version directory.                                                                                                                                                                                                                                                                  |
+| macOS 11 (Big Sur)                          | `~/Library/Mail/V8`                                                 | `true`     | **FDA** | Same shape. Older releases use lower `V<n>` numbers (V7 = Catalina, and down).                                                                                                                                                                                                                           |
+| Linux, Thunderbird                          | `~/.thunderbird/<profile-name>.default-release/Mail/`               | `true`     | —       | `.msf` index plus `mbox` files. No TCC.                                                                                                                                                                                                                                                                  |
+| Linux, Evolution                            | `~/.local/share/evolution/mail/`                                    | `true`     | —       | Maildir layout. No TCC.                                                                                                                                                                                                                                                                                  |
+| WSL, Outlook (Win32)                        | `/mnt/c/Users/<name>/AppData/Local/Microsoft/Outlook/<mailbox>.pst` | `true`     | —       | Replace `<mailbox>` with a real PST filename, or mount the `.../Microsoft/Outlook/` directory and point at the file you want — mounts don't expand globs, so a literal `*.pst` won't resolve. PST is a proprietary binary format; reading it needs `libpff` or similar, not as plug-and-play as `.emlx`. |
+
+If it's unclear which version directory applies, run `ls ~/Library/Mail/` on the host. There's usually only one.
+
+### macOS Mail downloads: saved attachments
+
+Mail.app stores explicitly-saved attachments separately from the version-numbered mail directory. Useful for "the attachment from that email": the per-message `Attachments` subdirectories inside the mail store are lazy and may not have the file, but Mail Downloads is a flat directory of explicitly-saved files.
+
+| Platform | Path                                                               | `readOnly` | TCC | Notes                                                                                                                                                              |
+| -------- | ------------------------------------------------------------------ | ---------- | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| macOS    | `~/Library/Containers/com.apple.mail/Data/Library/Mail Downloads/` | `true`     | —   | Sandboxed app container path, no FDA needed since it's user-owned and accessible without a TCC grant. Complements the mail store mount for email-triage workflows. |
+
+This is the path Mail.app uses for "Save All Attachments" or a Finder drag. Files here are flat (PDF, docx, images) with no envelope or header parsing required, unlike the `.emlx` format above.
+
+### macOS Reminders
+
+Parallel to Calendar: the raw on-disk Reminders store. Prefer an API-backed or AppleScript-driven integration when one is available; this mount is the fallback for direct introspection.
+
+| Platform             | Path                   | `readOnly` | TCC                     | Notes                                                                                                                                 |
+| -------------------- | ---------------------- | ---------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS 14+            | `~/Library/Reminders/` | `true`     | **FDA**                 | TCC began gating Reminders alongside Calendar in macOS 14. SQLite-backed; mount the parent directory so WAL sidecar files come along. |
+| macOS 13 and earlier | `~/Library/Reminders/` | `true`     | none, no FDA prompt yet | Same path, no FDA needed.                                                                                                             |
+| Linux / WSL          | —                      | —          | —                       | No native equivalent.                                                                                                                 |
+
+This mount is specifically for native macOS Reminders; Google or Microsoft to-do systems have their own APIs.
+
+### iMessage history
+
+| Platform    | Path                                                                   | `readOnly` | TCC     | Notes                                                                                                                                                                                                                                                                                   |
+| ----------- | ---------------------------------------------------------------------- | ---------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS       | `~/Library/Messages` (the whole directory, not just the database file) | `true`     | **FDA** | History is SQLite. Mount the parent directory, not just the database file: SQLite's write-ahead log uses sidecar files, and mounting only the main database file gives a frozen or corrupt-looking snapshot. Attachments live under an `Attachments` subdirectory in the same location. |
+| Linux / WSL | —                                                                      | —          | —       | No equivalent; iMessage is Apple-only.                                                                                                                                                                                                                                                  |
+
+This exposes every iMessage thread on the device. Highly sensitive; make sure the request is deliberate before mounting.
+
+### macOS Calendar (raw CalDAV store)
+
+| Platform             | Path                  | `readOnly` | TCC                     | Notes                                                                  |
+| -------------------- | --------------------- | ---------- | ----------------------- | ---------------------------------------------------------------------- |
+| macOS 14+            | `~/Library/Calendars` | `true`     | **FDA**                 | TCC began gating Calendars at macOS 14. ICS-format files per calendar. |
+| macOS 13 and earlier | `~/Library/Calendars` | `true`     | none, no FDA prompt yet | Same path, no FDA needed.                                              |
+| Linux / WSL          | —                     | —          | —                       | No native equivalent on these platforms.                               |
+
+Prefer an API-backed calendar integration (Google Calendar and similar) where it's available: no FDA, and writes are first-class. This raw mount is for iCloud-only or CalDAV setups (Fastmail, for example) that an API doesn't reach.
+
+### macOS Contacts
+
+| Platform    | Path                                        | `readOnly` | TCC     | Notes                                                                                                           |
+| ----------- | ------------------------------------------- | ---------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| macOS       | `~/Library/Application Support/AddressBook` | `true`     | **FDA** | SQLite plus per-source directories. Same write-ahead-log sidecar caveat as iMessage; mount the whole directory. |
+| Linux / WSL | —                                           | —          | —       | No native equivalent.                                                                                           |
+
+If contacts also sync through an API-backed integration (Google Contacts, for example), expect two sources of truth; decide which one is actually wanted before mounting.
+
+### Safari bookmarks and reading list
+
+| Platform    | Path               | `readOnly` | TCC     | Notes                                                                                                                                                                                                |
+| ----------- | ------------------ | ---------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS       | `~/Library/Safari` | `true`     | **FDA** | Bookmarks are stored as a binary plist, readable with `plutil -convert json` on the host or a plist parser in the container. Reading list lives in the same file. History is a separate SQLite file. |
+| Linux / WSL | —                  | —          | —       | No Safari on these platforms; see browser bookmarks below for Chrome/Firefox.                                                                                                                        |
+
+### Browser bookmarks (cross-platform)
+
+| Platform       | Path                                                                          | `readOnly` | TCC | Notes                                                                                |
+| -------------- | ----------------------------------------------------------------------------- | ---------- | --- | ------------------------------------------------------------------------------------ |
+| macOS, Chrome  | `~/Library/Application Support/Google/Chrome/Default/Bookmarks`               | `true`     | —   | JSON file. No FDA.                                                                   |
+| Linux, Chrome  | `~/.config/google-chrome/Default/Bookmarks`                                   | `true`     | —   | Same JSON format.                                                                    |
+| WSL, Chrome    | `/mnt/c/Users/<name>/AppData/Local/Google/Chrome/User Data/Default/Bookmarks` | `true`     | —   | Same JSON. Reachable from WSL through the C drive mount.                             |
+| macOS, Firefox | `~/Library/Application Support/Firefox/Profiles/<profile-name>/places.sqlite` | `true`     | —   | SQLite. Mount the parent profile directory, not just the file, for the WAL sidecars. |
+
+## Opaque stores: export instead
+
+For these, the app's storage is proprietary, encrypted, or actively mutated while the app runs. The clean move is to export from the app and mount the export, not mount the raw store. A few are technically parseable, but the schema shifts across app versions and the read-side complexity rarely pays off.
+
+- **Apple Notes** (the Notes app group container under `~/Library/Group Containers/`) — encrypted SQLite with content in protobuf blobs. Even with FDA, the format isn't usefully readable without Apple's decryption logic. Export from the app (File, Export, PDF or HTML) into a regular directory and mount that, or drive it via AppleScript from the host. Don't mount the raw container.
+- **Photos library** (`~/Pictures/Photos Library.photoslibrary`) — a package containing SQLite metadata and a content-addressed blob store. Technically mountable, but reading photos by name requires querying the metadata database and joining against the blob store. Export albums to a flat directory, or use a host-side metadata dump tool.
+- **Ulysses** (its app container under `~/Library/Containers/`) — sheets in a custom binary-plus-text format keyed by UUIDs, not human-readable filenames, and undocumented. Export sheets (File, Export, Markdown or Text) to a flat directory, then mount that.
+- **Bear** (its group container under `~/Library/Group Containers/`) — SQLite database with one row per note, plaintext markdown in a column. Technically parseable, but the schema has shifted across major versions, the database locks while Bear is running, and tag/attachment relationships span multiple tables. Prefer Bear's built-in export (File, Export Notes, Markdown) for stability; the raw database is only worth it for live, in-place access with the fragility accepted.
+- **Things 3** (its group container under `~/Library/Group Containers/`) — SQLite database. Third-party tools exist and the schema is community-documented, but the same caveats as Bear apply: locked while running, schema drift, multi-table joins for projects, areas, and tags. Prefer the app's URL scheme or an AppleScript bridge for writes; raw SQLite only for read-only introspection with fragility accepted.
+- **macOS Mail attachments inside the version-numbered mail directory** — split across per-message directories, materialized lazily when Mail downloads them; briefly-opened emails may have no local attachment. For explicitly-saved attachments, use the Mail downloads mount above instead; that path is flat and reliable.
+- **Keychain** (`~/Library/Keychains/`) — encrypted blobs, useless to read directly, very sensitive. Never mount this.
+
+## Dev and workflow staples
+
+Quick wins that solve common questions without a privacy cost. The recurring pattern: for dotfiles that pair a config file with a credentials file, mount the config, never the credentials. Credentials belong to the operator's host-side setup, never to a mount.
+
+| Use case                                 | Path                                                      | `readOnly` | Notes                                                                                                                                                                                                                                                         |
+| ---------------------------------------- | --------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shell history                            | `~/.zsh_history` or `~/.bash_history`                     | `true`     | Mount the specific history file. Its parent is your home directory — never mount that (see anti-patterns).                                                                                                                                                    |
+| SSH config (not keys)                    | `~/.ssh/config`                                           | `true`     | Single file, useful for "what hosts do I have SSH aliases for?" Never mount `~/.ssh/` wholesale; private keys live there.                                                                                                                                     |
+| Git config                               | `~/.gitconfig`                                            | `true`     | Identity, aliases, signing config.                                                                                                                                                                                                                            |
+| AWS config (not credentials)             | `~/.aws/config`                                           | `true`     | Profile names, region defaults, SSO start URLs. Never mount `~/.aws/` wholesale; `credentials` lives in the same directory and carries access keys. Any AWS auth setup must happen directly on the host, outside model-driven tools.                          |
+| Kubernetes config                        | `~/.kube/config`                                          | `true`     | Caveat: depending on the auth method, this file can carry bearer tokens or certificate data inline (older OIDC flows, EKS pre-IAM-auth, direct service-account tokens). Check the contents before mounting; treat it as a credential if it has inline tokens. |
+| Editor configs (nvim, fish, helix, etc.) | `~/.config/nvim/`, `~/.config/fish/`, `~/.config/helix/`  | `true`     | Generally safe: these directories don't usually carry secrets, but some setups put API keys in plugin configs. Check first.                                                                                                                                   |
+| System hosts file                        | `/etc/hosts`                                              | `true`     | Single-file mount. Linux/macOS only. WSL has a Windows-side hosts file that takes precedence; mount whichever one is actually edited.                                                                                                                         |
+| macOS LaunchAgents (user-level)          | `~/Library/LaunchAgents/`                                 | `true`     | Plist files for user-scope launchd jobs. System-level equivalents exist too but are SIP-adjacent and rarely useful.                                                                                                                                           |
+| Time Machine-excluded scratch            | `~/scratch` (create with `tmutil addexclusion ~/scratch`) | `false`    | Ephemeral agent output that shouldn't be backed up.                                                                                                                                                                                                           |
+| iCloud Drive top-level                   | `~/Library/Mobile Documents/com~apple~CloudDocs`          | mixed      | iCloud lazy-loads; same caveat as the Obsidian iCloud row above.                                                                                                                                                                                              |
+
+## Anti-patterns
+
+- **Never mount the entire home directory.** It's tempting, and it's a security disaster: SSH keys, browser cookies, app credentials, `.env` files from every project, shell history with leaked tokens, keychain blobs. If the ask is "everything," push back and pin down what's actually needed.
+- **Never mount `~/.ssh/` wholesale.** Private keys shouldn't enter the container. Mount `~/.ssh/config` read-only if SSH host visibility is the goal.
+- **Never mount `~/Library/Keychains/`.** Even read-only, even with FDA. It's encrypted blobs the agent can't use, and bind-mounting it only expands the attack surface for no benefit.
+- **Never mount cloud-CLI credential directories** (`~/.aws/`, `~/.gcp/`, `~/.azure/`, and similar). Same reasoning as keychains: credentials, not data. Set up authentication directly on the host, outside model-driven tools; don't route it through `.env`. The config file inside each of these is fine to mount individually (see the staples table above); it's the credentials file that has to stay out.
+- **Never mount credential-bearing dotfiles**, even the ones that look innocuous: AWS credentials, npm's `.npmrc` (often carries a registry auth token), pip's config files (PyPI upload tokens), Docker's `config.json` (registry auth tokens, sometimes inline), Cargo's credentials file (crates.io token), Gradle's properties file (often signing keys and repo creds), Maven's settings file (repo passwords). Each pairs with a safe config file nearby; mount that individually, never the credentials file, never the parent directory.
+- **External-drive mounts under `/Volumes/` are fragile.** Bind mounts to removable drives don't recover when the drive is ejected; the container sees the path become an empty stub, and the only fix is `typeclaw restart` after reattaching. Consider whether copying the data to an internal path is the wiser move.
+- **iCloud Drive paths lazy-load.** The top-level iCloud Drive directory and the per-app iCloud containers only materialize files when the host system opens them. Inside the container, an unmaterialized file shows up as a 0-byte stub or a placeholder file. The fix is host-side: open the file (or force a download) before reading it through the mount. There's no way to trigger iCloud materialization from inside the container.
+- **System stores under `/private/var/db/` aren't fair game.** TCC database, Spotlight metadata, system logs; all gated by SIP on top of FDA, and none of it is useful through a mount. For Spotlight-style search, the answer is a host-side search tool, out of scope for the container, not a mount.
+- **Don't mount the same host path twice under different mount names.** Docker allows it, but now there are two views of the same data, and a write through one is immediately visible through the other. It looks like a bug from the inside ("why did one copy change when I only wrote the other?"). Pick one mount per host path.
+- **`readOnly: true` is not encryption-at-rest.** It prevents write-back, but reads still go through the kernel's normal file path; no obfuscation, no privacy gain beyond blocking writes. If read access itself is the problem, the answer is don't mount it, not "mount it read-only."
+- **macOS path versioning drifts.** Apple has moved the Mail storage directory, Voice Memos, and other paths across macOS releases. The paths on this page are current for macOS 11 through 26 as of this writing. If a future reorganization breaks one, the symptom is an empty listing under the mount after a successful mount.
+
+## When the path you need isn't here
+
+Pick a kebab-case mount name, decide `readOnly` (default to `true` unless the use case needs writes), add the entry to `typeclaw.json` or run `typeclaw mount add`, and restart the agent. Mount changes are restart-required. See [`typeclaw.json` mounts](/docs/reference/typeclaw-json#mounts) and [CLI mounts](/docs/reference/cli#mounts) for the exact schema and commands.
