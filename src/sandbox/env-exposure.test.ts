@@ -23,11 +23,14 @@ describe('resolveExposableEnvNames', () => {
     expect(names).toEqual(['MY_VAR'])
   })
 
-  test('withholds runtime/broker-owned credential names (GH_TOKEN, GITHUB_TOKEN, TYPECLAW_*)', () => {
+  test('exposes operator-declared GH_TOKEN/GITHUB_TOKEN (.env is the expose surface)', () => {
+    const names = resolveExposableEnvNames(env({ GH_TOKEN: 'ghp_x', GITHUB_TOKEN: 'ghp_y', MY_VAR: 'ok' }))
+    expect(names).toEqual(['GH_TOKEN', 'GITHUB_TOKEN', 'MY_VAR'])
+  })
+
+  test('withholds host/container-injected runtime tokens (TYPECLAW_*)', () => {
     const names = resolveExposableEnvNames(
       env({
-        GH_TOKEN: 'ghp_x',
-        GITHUB_TOKEN: 'ghp_y',
         TYPECLAW_TUI_TOKEN: 'a',
         TYPECLAW_HOSTD_TOKEN: 'b',
         TYPECLAW_HOSTD_BROKER_TOKEN: 'c',

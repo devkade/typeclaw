@@ -37,7 +37,7 @@ afterEach(() => {
   else process.env.GITHUB_TOKEN = originalGithubToken
 })
 
-type HookOpts = { permissions?: PermissionService; logger?: PluginLogger }
+type HookOpts = { permissions?: PermissionService; logger?: PluginLogger; agentDir?: string }
 
 function pluginContext(
   resolve: (repoSlug: string) => Promise<GithubTokenResolveResult>,
@@ -47,7 +47,7 @@ function pluginContext(
   return {
     name: 'github-cli-auth',
     version: undefined,
-    agentDir: '/agent',
+    agentDir: opts.agentDir ?? '/agent',
     config: undefined,
     logger: opts.logger ?? noopLogger,
     permissions: opts.permissions ?? noopPermissionService,
@@ -305,7 +305,7 @@ describe('github-cli-auth plugin', () => {
     expect(resolverCalled).toBe(false)
   })
 
-  test('classic PAT (credential-entitled): injects the PAT for a repo-targeting gh, does not mint', async () => {
+  test('classic PAT (credential-entitled) + App minter: mints the per-repo App token, PAT does not win', async () => {
     process.env.GH_TOKEN = 'ghp_classic'
     let resolverCalled = false
     const hook = await hookFor(
@@ -322,9 +322,9 @@ describe('github-cli-auth plugin', () => {
 
     expect(result).toBeUndefined()
     expect(event.args.command).toBe('gh pr view -R acme/widgets')
-    // Runtime-owned injection keeps the PAT out of the command and raw files.
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghp_classic' })
-    expect(resolverCalled).toBe(false)
+    // App minter available: the least-privilege per-repo token wins over the PAT.
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    expect(resolverCalled).toBe(true)
   })
 
   test('classic PAT still requires a literal repo for repo-scoped gh commands', async () => {
@@ -339,7 +339,7 @@ describe('github-cli-auth plugin', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('fine-grained PAT (credential-entitled): leaves command as-is, injects the PAT, does not mint', async () => {
+  test('fine-grained PAT (credential-entitled) + App minter: mints the per-repo App token, PAT does not win', async () => {
     process.env.GH_TOKEN = 'github_pat_xyz'
     let resolverCalled = false
     const hook = await hookFor(
@@ -356,8 +356,8 @@ describe('github-cli-auth plugin', () => {
 
     expect(result).toBeUndefined()
     expect(event.args.command).toBe('gh pr view -R acme/widgets')
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'github_pat_xyz' })
-    expect(resolverCalled).toBe(false)
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    expect(resolverCalled).toBe(true)
   })
 
   test('App auth: strips a redundant -R on a literal-path gh api call AND injects the minted token', async () => {
@@ -457,7 +457,7 @@ describe('github-cli-auth plugin', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('classic PAT (credential-entitled): strips a redundant -R on gh api, injects the PAT, no mint', async () => {
+  test('classic PAT (credential-entitled) + App minter: strips a redundant -R on gh api, mints the App token', async () => {
     process.env.GH_TOKEN = 'ghp_classic'
     let resolverCalled = false
     const hook = await hookFor(
@@ -473,12 +473,13 @@ describe('github-cli-auth plugin', () => {
     const result = await hook(event, hookCtx)
 
     expect(result).toBeUndefined()
+    // -R strip is a pure syntax fix, applied regardless of token source.
     expect(event.args.command).toBe('gh api repos/acme/widgets/issues')
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghp_classic' })
-    expect(resolverCalled).toBe(false)
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    expect(resolverCalled).toBe(true)
   })
 
-  test('fine-grained PAT (credential-entitled): strips a redundant -R on gh api, injects the PAT, no mint', async () => {
+  test('fine-grained PAT (credential-entitled) + App minter: strips a redundant -R on gh api, mints the App token', async () => {
     process.env.GH_TOKEN = 'github_pat_xyz'
     let resolverCalled = false
     const hook = await hookFor(
@@ -495,8 +496,8 @@ describe('github-cli-auth plugin', () => {
 
     expect(result).toBeUndefined()
     expect(event.args.command).toBe('gh api repos/acme/widgets/issues')
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'github_pat_xyz' })
-    expect(resolverCalled).toBe(false)
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    expect(resolverCalled).toBe(true)
   })
 
   test('App auth: blocks a gh api whose -R repo conflicts with the literal path (no strip)', async () => {
@@ -756,7 +757,7 @@ describe('github-cli-auth plugin', () => {
     expect(resolverCalled).toBe(false)
   })
 
-  test('repo-targeting gh uses GITHUB_TOKEN PAT when GH_TOKEN is absent', async () => {
+  test('repo-targeting gh + App minter: mints the App token even when only a GITHUB_TOKEN PAT is present', async () => {
     delete process.env.GH_TOKEN
     process.env.GITHUB_TOKEN = 'github_pat_fallback'
     let resolverCalled = false
@@ -773,8 +774,9 @@ describe('github-cli-auth plugin', () => {
     const result = await hook(event, hookCtx)
 
     expect(result).toBeUndefined()
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GITHUB_TOKEN: 'github_pat_fallback' })
-    expect(resolverCalled).toBe(false)
+    // App minter wins over the process-level GITHUB_TOKEN PAT (least-privilege).
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    expect(resolverCalled).toBe(true)
   })
 
   test('an unwired wrapper fails closed before a PAT-bearing command can execute', async () => {
@@ -971,6 +973,175 @@ describe('github-cli-auth plugin — .env PAT role gating (gh path)', () => {
 
     expect(result).toMatchObject({ block: true })
     expect((result as { reason: string }).reason).not.toContain('sandboxed')
+  })
+
+  test('PAT declared in .env (sandboxed, no minter): runs on the inherited token instead of blocking', async () => {
+    // given: a low-trust role whose .env declares GH_TOKEN — the sandbox inherits
+    // it into bash, so the broker must NOT block on the stale "cleared" assumption.
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-envpat-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_classic\n')
+      process.env.GH_TOKEN = 'ghp_classic'
+      const exports = await githubCliAuthPlugin.plugin(pluginContext(tokenResolver('ghs_minted'), false, { agentDir }))
+      const hook = exports.hooks?.['tool.before']
+      if (!hook) throw new Error('plugin did not register tool.before')
+      const event = bashEvent('gh pr view -R acme/widgets')
+
+      // when
+      const result = await hook(event, { agentDir, pluginName: 'github-cli-auth', logger: noopLogger })
+
+      // then: not blocked, and no overlay injected (explicit -R needs no GH_REPO;
+      // the token is already inherited, so the broker adds nothing).
+      expect(result).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('PAT declared in .env (sandboxed) + trusted-fallback repo: injects GH_REPO only, no token', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-envpat-fb-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_classic\n')
+      process.env.GH_TOKEN = 'ghp_classic'
+      const exports = await githubCliAuthPlugin.plugin(pluginContext(tokenResolver('ghs_minted'), false, { agentDir }))
+      const hook = exports.hooks?.['tool.before']
+      if (!hook) throw new Error('plugin did not register tool.before')
+      // repo-less command from a github-channel origin resolves the fallback repo.
+      const event = githubOriginBashEvent('gh pr view', 'acme/widgets')
+
+      const result = await hook(event, { agentDir, pluginName: 'github-cli-auth', logger: noopLogger })
+
+      expect(result).toBeUndefined()
+      // GH_REPO set (non-secret) so gh targets the repo; token stays inherited, not
+      // re-injected into the overlay.
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_REPO: 'acme/widgets' })
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('process-only PAT (NOT in .env, sandboxed, no minter): still blocks — sandbox does not inherit it', async () => {
+    // given: an empty .env directory — the PAT is process-only (App/runtime-seeded),
+    // which the sandbox clears for a low-trust role, so the block must still fire.
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-procpat-'))
+    try {
+      process.env.GH_TOKEN = 'ghp_classic'
+      const exports = await githubCliAuthPlugin.plugin(pluginContext(tokenResolver('ghs_minted'), false, { agentDir }))
+      const hook = exports.hooks?.['tool.before']
+      if (!hook) throw new Error('plugin did not register tool.before')
+
+      const result = await hook(bashEvent('gh pr view -R acme/widgets'), {
+        agentDir,
+        pluginName: 'github-cli-auth',
+        logger: noopLogger,
+      })
+
+      expect(result).toMatchObject({ block: true })
+      expect((result as { reason: string }).reason).toContain('NOT declared')
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('PAT declared in .env + App minter available: mints the per-repo App token (least-privilege wins)', async () => {
+    // given: a declared .env PAT AND a live App resolver. The short-lived per-repo
+    // App token must win over the broad inherited PAT.
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-envpat-app-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_classic\n')
+      process.env.GH_TOKEN = 'ghp_classic'
+      const exports = await githubCliAuthPlugin.plugin(pluginContext(tokenResolver('ghs_minted'), true, { agentDir }))
+      const hook = exports.hooks?.['tool.before']
+      if (!hook) throw new Error('plugin did not register tool.before')
+      const event = bashEvent('gh pr view -R acme/widgets')
+
+      const result = await hook(event, { agentDir, pluginName: 'github-cli-auth', logger: noopLogger })
+
+      // then: minted App token injected, NOT the inherited PAT.
+      expect(result).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('mixed alias: process-only GH_TOKEN + declared GITHUB_TOKEN (no minter) runs on the inherited GITHUB_TOKEN', async () => {
+    // given: process.env.GH_TOKEN is a process-only App/runtime value the sandbox
+    // clears, while the operator declared GITHUB_TOKEN in .env (inherited). The
+    // process-only GH_TOKEN must not mask the inheritable declared alias.
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-mixed-'))
+    const originalGithub = process.env.GITHUB_TOKEN
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GITHUB_TOKEN=ghp_declared\n')
+      process.env.GH_TOKEN = 'ghp_processonly'
+      process.env.GITHUB_TOKEN = 'ghp_declared'
+      const exports = await githubCliAuthPlugin.plugin(pluginContext(tokenResolver('ghs_minted'), false, { agentDir }))
+      const hook = exports.hooks?.['tool.before']
+      if (!hook) throw new Error('plugin did not register tool.before')
+      const event = bashEvent('gh pr view -R acme/widgets')
+
+      const result = await hook(event, { agentDir, pluginName: 'github-cli-auth', logger: noopLogger })
+
+      // then: not blocked — gh uses the inherited declared GITHUB_TOKEN.
+      expect(result).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    } finally {
+      if (originalGithub === undefined) delete process.env.GITHUB_TOKEN
+      else process.env.GITHUB_TOKEN = originalGithub
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('PAT declared in .env, credential-entitled role + App minter: minted App token still wins', async () => {
+    // given: a privileged (fs.see.secrets) role, a declared .env PAT, AND a live
+    // App resolver. The per-repo App token must win even for the entitled role —
+    // the canUsePat direct-inject path must not beat an available minter.
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-envpat-priv-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_classic\n')
+      process.env.GH_TOKEN = 'ghp_classic'
+      const exports = await githubCliAuthPlugin.plugin(
+        pluginContext(tokenResolver('ghs_minted'), true, { agentDir, permissions: privilegedPermissions }),
+      )
+      const hook = exports.hooks?.['tool.before']
+      if (!hook) throw new Error('plugin did not register tool.before')
+      const event = bashEvent('gh pr view -R acme/widgets')
+
+      const result = await hook(event, { agentDir, pluginName: 'github-cli-auth', logger: noopLogger })
+
+      expect(result).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('mixed alias: undeclared App-class GH_TOKEN + declared GITHUB_TOKEN (unavailable resolver) runs on GITHUB_TOKEN', async () => {
+    // given: process.env.GH_TOKEN is an undeclared App-class `ghs_` value (sandbox
+    // clears it) and the resolver is production-style unavailable. The final mint
+    // decision must not classify off that process-only GH_TOKEN and block; the
+    // declared, inheritable GITHUB_TOKEN survives and the command runs on it.
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-mixed-app-'))
+    const originalGithub = process.env.GITHUB_TOKEN
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GITHUB_TOKEN=ghp_declared\n')
+      process.env.GH_TOKEN = 'ghs_processonly'
+      process.env.GITHUB_TOKEN = 'ghp_declared'
+      const exports = await githubCliAuthPlugin.plugin(pluginContext(unavailableResolver, false, { agentDir }))
+      const hook = exports.hooks?.['tool.before']
+      if (!hook) throw new Error('plugin did not register tool.before')
+      const event = bashEvent('gh pr view -R acme/widgets')
+
+      const result = await hook(event, { agentDir, pluginName: 'github-cli-auth', logger: noopLogger })
+
+      expect(result).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    } finally {
+      if (originalGithub === undefined) delete process.env.GITHUB_TOKEN
+      else process.env.GITHUB_TOKEN = originalGithub
+      rmSync(agentDir, { recursive: true, force: true })
+    }
   })
 })
 
