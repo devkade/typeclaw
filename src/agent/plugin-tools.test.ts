@@ -1956,42 +1956,61 @@ describe('wrapSystemTool', () => {
 
   test('charges streamed file growth against the process-wide byte budget', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-growing-snapshot-budget-'))
-    const firstFile = path.join(agentDir, 'first.bin')
+    const holderFile = path.join(agentDir, 'holder.bin')
     const growingFile = path.join(agentDir, 'growing.bin')
-    const secondFile = path.join(agentDir, 'second.bin')
-    await Promise.all([writeFile(firstFile, ''), writeFile(growingFile, ''), writeFile(secondFile, '')])
-    await Promise.all([
-      truncate(firstFile, 41 * 1024 * 1024),
-      truncate(growingFile, 60 * 1024 * 1024),
-      truncate(secondFile, 38 * 1024 * 1024),
-    ])
-    let first: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
-    let second: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
+    await Promise.all([writeFile(holderFile, ''), writeFile(growingFile, '')])
+    await Promise.all([truncate(holderFile, 40 * 1024 * 1024), truncate(growingFile, 60 * 1024 * 1024)])
+
+    let acquiredResolve!: () => void
+    const acquired = new Promise<void>((resolve) => {
+      acquiredResolve = resolve
+    })
+    let streamResolve!: () => void
+    const allowStreaming = new Promise<void>((resolve) => {
+      streamResolve = resolve
+    })
+
+    type GrowingOutcome =
+      | { ok: true; pinned: Awaited<ReturnType<typeof enforceAndPinToolFiles>> }
+      | { ok: false; error: unknown }
+    let holder: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
     let unexpected: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
     try {
-      first = await enforceAndPinToolFiles({
+      // 40MiB holder stays leased for the whole test, so any stream past the
+      // growing file's declared 60MiB pushes the global total over 100MiB.
+      holder = await enforceAndPinToolFiles({
         tool: 'channel_send',
-        args: { attachments: [{ path: firstFile }] },
+        args: { attachments: [{ path: holderFile }] },
         agentDir,
       })
-      const growing = enforceAndPinToolFiles({ tool: 'read', args: { path: growingFile }, agentDir }).then((value) => {
-        unexpected = value
-        return value
-      })
-      const queuedSecond = enforceAndPinToolFiles({
-        tool: 'channel_send',
-        args: { attachments: [{ path: secondFile }] },
-        agentDir,
-      })
-      await Bun.sleep(10)
-      await truncate(growingFile, 64 * 1024 * 1024)
-      await first.cleanup()
-      first = undefined
-      second = await queuedSecond
-      await expect(growing).rejects.toThrow(/process-wide pinned byte budget|snapshot growth/i)
+      const outcome = enforceAndPinToolFiles(
+        { tool: 'read', args: { path: growingFile }, agentDir },
+        {
+          async afterBudgetAcquire() {
+            acquiredResolve()
+            await allowStreaming
+          },
+        },
+      ).then<GrowingOutcome, GrowingOutcome>(
+        (pinned) => {
+          unexpected = pinned
+          return { ok: true, pinned }
+        },
+        (error: unknown) => ({ ok: false, error }),
+      )
+
+      await acquired
+      await truncate(growingFile, 61 * 1024 * 1024)
+      streamResolve()
+      const result = await outcome
+      expect(result.ok).toBeFalse()
+      if (!result.ok) {
+        expect(result.error).toBeInstanceOf(Error)
+        expect((result.error as Error).message).toMatch(/process-wide pinned byte budget|snapshot growth/i)
+      }
     } finally {
-      await first?.cleanup()
-      await second?.cleanup()
+      streamResolve()
+      await holder?.cleanup()
       await unexpected?.cleanup()
       await rm(agentDir, { recursive: true, force: true })
     }

@@ -56,16 +56,26 @@ export type PinnedToolFiles = {
   cleanup(): Promise<void>
 }
 
-export async function enforceAndPinToolFiles(options: {
-  tool: string
-  args: Record<string, unknown>
-  agentDir: string
-  tempRoot?: string
-  genericInputs?: boolean
-  fileOperands?: ToolFileOperands
-  hidden?: HiddenPaths
-  signal?: AbortSignal
-}): Promise<PinnedToolFiles> {
+// Test-only seam: pauses between budget acquisition and source open/stream so a
+// test can grow a file post-authorization deterministically, without racing the
+// scheduler. Production never passes hooks.
+export type EnforceAndPinToolFilesHooks = {
+  afterBudgetAcquire?(): void | Promise<void>
+}
+
+export async function enforceAndPinToolFiles(
+  options: {
+    tool: string
+    args: Record<string, unknown>
+    agentDir: string
+    tempRoot?: string
+    genericInputs?: boolean
+    fileOperands?: ToolFileOperands
+    hidden?: HiddenPaths
+    signal?: AbortSignal
+  },
+  hooks: EnforceAndPinToolFilesHooks = {},
+): Promise<PinnedToolFiles> {
   if (options.signal?.aborted === true) throw abortError(options.signal)
   const maxCount = maxInputCount(options.tool)
   const targets = fileTargets(
@@ -111,6 +121,7 @@ export async function enforceAndPinToolFiles(options: {
     }
 
     lease = await pinnedSnapshotBudget.acquire(declaredBytes, verified.length, options.signal)
+    await hooks.afterBudgetAcquire?.()
 
     dir = await mkdtemp(path.join(options.tempRoot ?? tmpdir(), TOOL_INPUT_TEMP_PREFIX))
     let copiedBytes = 0
