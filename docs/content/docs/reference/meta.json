@@ -3,6 +3,7 @@
   "icon": "Library",
   "pages": [
     "typeclaw-json",
+    "recommended-mounts",
     "cron-json",
     "secrets-json",
     "cli",
