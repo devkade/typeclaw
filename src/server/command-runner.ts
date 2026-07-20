@@ -214,8 +214,14 @@ export function createCommandRunner(opts: CommandRunnerOptions): CommandRunner {
       return (command as EitherCommand<unknown>).run(ctx, argsParse.value)
     })()
 
+    // Logger lines are queued, not written inline, so they can still be in
+    // flight when `run` returns. `command_exit` is terminal for the call —
+    // `src/server/index.ts` drops the callId's websocket route as it sends it —
+    // so any frame emitted after exit is discarded. Drain the sink first on
+    // BOTH paths, or the last lines a command logs never reach the caller.
     const done = ctxPromise
-      .then((code) => {
+      .then(async (code) => {
+        await drainWrites(stderrSink)
         if (typeof code !== 'number' || !Number.isFinite(code)) {
           opts.outbound.error(callId, `command "${name}" returned a non-numeric exit code`)
           opts.outbound.exit(callId, 1)
@@ -223,7 +229,8 @@ export function createCommandRunner(opts: CommandRunnerOptions): CommandRunner {
         }
         opts.outbound.exit(callId, code)
       })
-      .catch((err: unknown) => {
+      .catch(async (err: unknown) => {
+        await drainWrites(stderrSink)
         const detail = err instanceof Error ? err.message : String(err)
         opts.outbound.error(callId, detail)
         opts.outbound.exit(callId, 1)
@@ -359,9 +366,46 @@ function makeWritable(onChunk: (chunk: Uint8Array) => void): WritableStream<Uint
   })
 }
 
+// One sink backs every logger line for a command, and `getWriter()` throws
+// while another writer holds the lock. Releasing in a `.then()` returns the
+// lock a microtask too late: the next `logger.*` call runs synchronously from
+// `ctx.run` and finds the stream still locked, so the line is lost and the
+// throw escapes into the command. Chain each line onto the previous write so
+// only one writer exists at a time, and release in `finally` so a rejected
+// write can't strand the lock permanently.
+//
+// Keyed per stream rather than held for the run because the same sink is also
+// handed to plugins as `ctx.stderr`; the lock has to be dropped between lines
+// or a plugin writing to it directly would be locked out.
+//
+// Scope of the `.catch()` on the stored tail: it keeps ONE failed write from
+// rejecting the promise every later line chains onto, and it keeps the lock
+// released. It does NOT restore delivery — per the Streams standard a sink
+// that throws leaves the stream errored, and every subsequent `write()`
+// rejects with that same error. Recovering delivery would mean replacing the
+// sink, which is out of scope here.
+const writeTails = new WeakMap<WritableStream<Uint8Array>, Promise<void>>()
+
 function writeLine(stream: WritableStream<Uint8Array>, line: string): void {
-  const writer = stream.getWriter()
-  void writer.write(new TextEncoder().encode(`${line}\n`)).then(() => writer.releaseLock())
+  const bytes = new TextEncoder().encode(`${line}\n`)
+  const tail = (writeTails.get(stream) ?? Promise.resolve()).then(async () => {
+    const writer = stream.getWriter()
+    try {
+      await writer.write(bytes)
+    } finally {
+      writer.releaseLock()
+    }
+  })
+  writeTails.set(
+    stream,
+    tail.catch(() => {}),
+  )
+}
+
+// Settles once every line queued on `stream` so far has been handed to the
+// sink. The stored tail already absorbs rejections, so this never throws.
+function drainWrites(stream: WritableStream<Uint8Array>): Promise<void> {
+  return writeTails.get(stream) ?? Promise.resolve()
 }
 
 export type CreateSessionForCommand = (options: CreateSessionOptions) => Promise<CreateSessionResult>
