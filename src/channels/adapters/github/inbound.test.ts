@@ -633,7 +633,11 @@ describe('classifyGithubInbound — review traffic on the bot-authored PR engage
   // silently observed and the bot could not address the review. Self-PR review
   // traffic must force the engagement trigger while staying sticky-free, so
   // reviews on OTHER people's PRs remain observe-only (the PR #672 fix).
-  function reviewOnSelfPr(reviewer: Record<string, unknown>, state = 'COMMENTED', body = ''): Record<string, unknown> {
+  function reviewOnSelfPr(
+    reviewer: Record<string, unknown>,
+    state = 'COMMENTED',
+    body = 'take a look at this',
+  ): Record<string, unknown> {
     return {
       action: 'submitted',
       repository: repo(),
@@ -661,6 +665,15 @@ describe('classifyGithubInbound — review traffic on the bot-authored PR engage
   it('engages a human review on the bot-authored PR', () => {
     const msg = classifyGithubInbound('pull_request_review', reviewOnSelfPr(user()), 'typeclaw-bot')
     expect(msg?.isBotMention).toBe(true)
+  })
+
+  it('drops a body-less COMMENTED review on the bot-authored PR (inline-reply container, no thanks churn)', () => {
+    const msg = classifyGithubInbound(
+      'pull_request_review',
+      reviewOnSelfPr({ login: 'peer-bot', id: 20, type: 'Bot' }, 'COMMENTED', ''),
+      'typeclaw-bot',
+    )
+    expect(msg).toBe(null)
   })
 
   it('keeps a review on someone else PR observe-only (no forced mention)', () => {
@@ -759,10 +772,14 @@ describe('classifyGithubInbound — empty-body handling', () => {
       expect(msg?.text).toBe('@alice requested changes on PR #7: "Add the thing".')
     })
 
-    it('synthesizes neutral text for a body-less COMMENTED review without implying a review was requested', () => {
+    it('drops a body-less COMMENTED review (inline-reply container delivered as separate comment events)', () => {
       const msg = classifyGithubInbound('pull_request_review', reviewSubmitted('COMMENTED'), 'typeclaw-bot')
-      expect(msg?.text).toBe('@alice submitted a review on PR #7: "Add the thing".')
-      expect(msg?.text).not.toContain('Please review')
+      expect(msg).toBe(null)
+    })
+
+    it('drops a body-less COMMENTED review case-insensitively (lowercase state from webhook payloads)', () => {
+      const msg = classifyGithubInbound('pull_request_review', reviewSubmitted('commented'), 'typeclaw-bot')
+      expect(msg).toBe(null)
     })
 
     it('matches the state case-insensitively (REST returns uppercase, some payloads lowercase)', () => {
