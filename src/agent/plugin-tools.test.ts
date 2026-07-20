@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import {
   link,
   mkdir,
@@ -3745,10 +3746,18 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
   const tui: SessionOrigin = { kind: 'tui', sessionId: 's' }
   const guest: SessionOrigin = { kind: 'subagent', subagent: 'x', parentSessionId: 'p', spawnedByRole: 'guest' }
 
+  // Backing dirs live on the REAL process-shared container /tmp (SESSION_TMP_ROOT).
+  // The oversubscription flake guard runs two `bun test` processes at once; a fixed
+  // sessionId makes both race the same dir, so one's `rm -rf` unlinks it while the
+  // other still holds an anchored parent fd. pid separates the suites; randomUUID
+  // also guards PID reuse and crashed-run artifacts.
+  const uniqueSessionId = (label: string): string => `plugin-tools-${label}-${process.pid}-${randomUUID()}`
+
   test.skipIf(lacksInodeAnchoring)(
     'a sandboxed role (guest) has its /tmp write redirected to the session backing dir',
     async () => {
-      const sessionId = 'sid42-guest-write'
+      const sessionId = uniqueSessionId('guest-write')
+      const sessionDir = `${SESSION_TMP_ROOT}/${sessionId}`
       const record: { path?: string; resolvedParent?: string } = {}
       const wrapped = wrapBuiltinToolDefinition(fakeWrite(record), {
         agentDir: '/agent',
@@ -3766,19 +3775,20 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
           {} as never,
         )
         expect(record.path).toMatch(/^\/proc\/self\/fd\/\d+\/review\.json$/)
-        expect(record.resolvedParent).toBe(`${SESSION_TMP_ROOT}/${sessionId}`)
+        expect(record.resolvedParent).toBe(sessionDir)
         expect(result.details).toEqual({ path: '/tmp/review.json' })
-        expect(await readFile(`${SESSION_TMP_ROOT}/${sessionId}/review.json`, 'utf8')).toBe('{}')
+        expect(await readFile(`${sessionDir}/review.json`, 'utf8')).toBe('{}')
       } finally {
-        await rm(`${SESSION_TMP_ROOT}/${sessionId}`, { recursive: true, force: true })
+        await rm(sessionDir, { recursive: true, force: true })
       }
     },
   )
 
   test('a sandboxed role (guest) reading /tmp resolves to the same session backing dir bash wrote', async () => {
-    const sessionId = 'sid42-guest-read'
-    await mkdir(`${SESSION_TMP_ROOT}/${sessionId}`, { recursive: true })
-    await writeFile(`${SESSION_TMP_ROOT}/${sessionId}/review.json`, '{}')
+    const sessionId = uniqueSessionId('guest-read')
+    const sessionDir = `${SESSION_TMP_ROOT}/${sessionId}`
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(`${sessionDir}/review.json`, '{}')
     const record: { path?: string; resolvedParent?: string } = {}
     const wrapped = wrapBuiltinToolDefinition(fakeRead(record), {
       agentDir: '/agent',
@@ -3798,14 +3808,15 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
       expect(result.details).toEqual({ path: '/tmp/review.json' })
       expect(record.path).not.toBe('/tmp/review.json')
     } finally {
-      await rm(`${SESSION_TMP_ROOT}/${sessionId}`, { recursive: true, force: true })
+      await rm(sessionDir, { recursive: true, force: true })
     }
   })
 
   test.skipIf(lacksInodeAnchoring)(
     'an owner write uses the session /tmp backing because owner bash is also sandboxed',
     async () => {
-      const sessionId = 'sid42-owner-write'
+      const sessionId = uniqueSessionId('owner-write')
+      const sessionDir = `${SESSION_TMP_ROOT}/${sessionId}`
       const record: { path?: string; resolvedParent?: string } = {}
       const wrapped = wrapBuiltinToolDefinition(fakeWrite(record), {
         agentDir: '/agent',
@@ -3823,19 +3834,20 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
           {} as never,
         )
         expect(record.path).toMatch(/^\/proc\/self\/fd\/\d+\/review\.json$/)
-        expect(record.resolvedParent).toBe(`${SESSION_TMP_ROOT}/${sessionId}`)
+        expect(record.resolvedParent).toBe(sessionDir)
         expect(result.details).toEqual({ path: '/tmp/review.json' })
-        expect(await readFile(`${SESSION_TMP_ROOT}/${sessionId}/review.json`, 'utf8')).toBe('{}')
+        expect(await readFile(`${sessionDir}/review.json`, 'utf8')).toBe('{}')
       } finally {
-        await rm(`${SESSION_TMP_ROOT}/${sessionId}`, { recursive: true, force: true })
+        await rm(sessionDir, { recursive: true, force: true })
       }
     },
   )
 
   test('an owner read uses the session /tmp backing because owner bash is also sandboxed', async () => {
-    const sessionId = 'sid42-owner-read'
-    await mkdir(`${SESSION_TMP_ROOT}/${sessionId}`, { recursive: true })
-    await writeFile(`${SESSION_TMP_ROOT}/${sessionId}/review.json`, '{}')
+    const sessionId = uniqueSessionId('owner-read')
+    const sessionDir = `${SESSION_TMP_ROOT}/${sessionId}`
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(`${sessionDir}/review.json`, '{}')
     const record: { path?: string; resolvedParent?: string } = {}
     const wrapped = wrapBuiltinToolDefinition(fakeRead(record), {
       agentDir: '/agent',
@@ -3855,7 +3867,7 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
       expect(result.details).toEqual({ path: '/tmp/review.json' })
       expect(record.path).not.toBe('/tmp/review.json')
     } finally {
-      await rm(`${SESSION_TMP_ROOT}/${sessionId}`, { recursive: true, force: true })
+      await rm(sessionDir, { recursive: true, force: true })
     }
   })
 
@@ -3910,13 +3922,46 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
   test.skipIf(lacksInodeAnchoring)(
     'a sandboxed role sees its original /tmp path in the receipt, not the backing dir',
     async () => {
+      const sessionId = uniqueSessionId('guest-receipt')
+      const sessionDir = `${SESSION_TMP_ROOT}/${sessionId}`
       const wrapped = wrapBuiltinToolDefinition(fakeWriteEchoingPath(), {
         agentDir: '/agent',
-        sessionId: 'sid42',
+        sessionId,
         hooks: createHookBus(),
         getOrigin: () => guest,
         permissions: createPermissionService(),
       })
+      try {
+        const result = await wrapped.execute(
+          'c',
+          { path: '/tmp/review.json', content: '{}' } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+        const text = (result.content as Array<{ type: string; text?: string }>)
+          .filter((p) => p.type === 'text')
+          .map((p) => p.text)
+          .join('\n')
+        expect(text).toContain('/tmp/review.json')
+        expect(text).not.toContain(sessionDir)
+      } finally {
+        await rm(sessionDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(lacksInodeAnchoring)('an owner still sees the virtual /tmp path in the receipt', async () => {
+    const sessionId = uniqueSessionId('owner-receipt')
+    const sessionDir = `${SESSION_TMP_ROOT}/${sessionId}`
+    const wrapped = wrapBuiltinToolDefinition(fakeWriteEchoingPath(), {
+      agentDir: '/agent',
+      sessionId,
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+    })
+    try {
       const result = await wrapped.execute(
         'c',
         { path: '/tmp/review.json', content: '{}' } as never,
@@ -3929,30 +3974,9 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
         .map((p) => p.text)
         .join('\n')
       expect(text).toContain('/tmp/review.json')
-      expect(text).not.toContain(`${SESSION_TMP_ROOT}/sid42`)
-    },
-  )
-
-  test.skipIf(lacksInodeAnchoring)('an owner still sees the virtual /tmp path in the receipt', async () => {
-    const wrapped = wrapBuiltinToolDefinition(fakeWriteEchoingPath(), {
-      agentDir: '/agent',
-      sessionId: 'sid42',
-      hooks: createHookBus(),
-      getOrigin: () => tui,
-      permissions: createPermissionService(),
-    })
-    const result = await wrapped.execute(
-      'c',
-      { path: '/tmp/review.json', content: '{}' } as never,
-      undefined,
-      undefined,
-      {} as never,
-    )
-    const text = (result.content as Array<{ type: string; text?: string }>)
-      .filter((p) => p.type === 'text')
-      .map((p) => p.text)
-      .join('\n')
-    expect(text).toContain('/tmp/review.json')
+    } finally {
+      await rm(sessionDir, { recursive: true, force: true })
+    }
   })
 })
 
