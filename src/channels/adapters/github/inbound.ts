@@ -566,6 +566,13 @@ export function classifyGithubInbound(
     const reviewer = readUser(review.user)
     const body = readString(review, 'body')
     const hasBody = body !== null && body.trim() !== ''
+    // A body-less COMMENTED review is the container GitHub submits when a user
+    // replies inline to a review thread; those replies arrive separately as
+    // pull_request_review_comment events. Synthesizing "@x submitted a review"
+    // here duplicates that traffic with a contentless line that trips the
+    // solo-human engagement fallback into a reflexive "Thanks for the review!".
+    // APPROVED / CHANGES_REQUESTED are real verdicts, so their synthesis stays.
+    if (!hasBody && isCommentedReviewState(readString(review, 'state'))) return null
     const text = hasBody
       ? body
       : reviewer !== null
@@ -910,6 +917,10 @@ function synthesizeReviewStateText(
 // varies by payload source (webhook vs REST), so normalize before matching.
 function isActionableReviewState(state: string | null): boolean {
   return state?.toLowerCase() !== 'approved'
+}
+
+function isCommentedReviewState(state: string | null): boolean {
+  return state?.toLowerCase() === 'commented'
 }
 
 async function resolveTeamMembership(
