@@ -87,7 +87,7 @@ function makeSessionFactoryForTest(): { sessionFactory: SessionFactory; agentDir
   return { sessionFactory: createSessionFactory({ agentDir }), agentDir }
 }
 
-function makeRunner(commands: RegisteredCommand[]) {
+function makeRunner(commands: RegisteredCommand[], wrapOutbound?: (outbound: CommandOutbound) => CommandOutbound) {
   const { outbound, frames, decodeStdout } = makeOutboundCapture()
   const runtime = makeRuntime(commands)
   const { sessionFactory, agentDir } = makeSessionFactoryForTest()
@@ -98,7 +98,7 @@ function makeRunner(commands: RegisteredCommand[]) {
     agentDir,
     runtimeVersion: '0.0.0-test',
     containerName: 'test-agent',
-    outbound,
+    outbound: wrapOutbound === undefined ? outbound : wrapOutbound(outbound),
     sessionFactory,
     channelRouter: undefined,
   })
@@ -358,7 +358,7 @@ describe('CommandRunner', () => {
     expect(pluginWarnings.length).toBe(0)
   })
 
-  test('consecutive ctx.logger calls all reach stderr', async () => {
+  test('consecutive ctx.logger lines reach stderr in order, all before command_exit', async () => {
     const cmd = defineCommand({
       surface: 'container',
       description: 'chatty',
@@ -373,18 +373,48 @@ describe('CommandRunner', () => {
     runner.start({ callId: 'chatty', name: 'chatty', args: undefined }, null)
     await waitForExit(frames, 'chatty')
 
-    // The logger writes every line to one shared stderr sink. Acquiring a
-    // writer per line without serializing them leaves the stream locked when
-    // the next line arrives, so the second call throws out of ctx.run and the
-    // line is lost. All three must survive, in order.
+    // One shared sink backs all three lines, so they must arrive whole and in
+    // call order — asserting the exact payload, not just membership.
     const stderrText = frames
       .filter((f) => f.kind === 'stderr')
       .map((f) => (f as { chunk: string }).chunk)
       .join('')
-    expect(stderrText).toContain('info: first')
-    expect(stderrText).toContain('warn: second')
-    expect(stderrText).toContain('error: third')
+    expect(stderrText).toBe(
+      '[command:test-plugin] info: first\n[command:test-plugin] warn: second\n[command:test-plugin] error: third\n',
+    )
+
+    // And every one of them must precede command_exit: the server drops the
+    // call's websocket route as it emits exit, so a later frame is discarded.
+    const kinds = frames.map((f) => f.kind)
+    expect(kinds.lastIndexOf('stderr')).toBeLessThan(kinds.indexOf('exit'))
     expect(frames.filter((f) => f.kind === 'error').length).toBe(0)
+  })
+
+  test('a throwing stderr sink still reaches command_exit instead of stranding the call', async () => {
+    const cmd = defineCommand({
+      surface: 'container',
+      description: 'chatty',
+      run: async (ctx) => {
+        ctx.logger.info('first')
+        ctx.logger.warn('second')
+        return 0
+      },
+    })
+    const { runner, frames } = makeRunner([registerCommand('chatty', cmd)], (outbound) => ({
+      ...outbound,
+      stderr() {
+        throw new Error('sink failure')
+      },
+    }))
+    runner.start({ callId: 'boom', name: 'chatty', args: undefined }, null)
+    const exit = await waitForExit(frames, 'boom')
+
+    // A throwing sink errors the stream, and per the Streams standard it stays
+    // errored — those lines cannot be delivered by any amount of retrying, and
+    // this pins that we do not pretend otherwise. What must still hold is that
+    // the write lock is released and the drain settles, so the command reports
+    // its own exit code rather than hanging behind a stuck queue.
+    expect((exit as { code: number }).code).toBe(0)
   })
 
   test('ctx.origin is subagent-shaped with parent TUI origin in spawnedByOrigin', async () => {
