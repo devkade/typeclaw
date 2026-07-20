@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, rename, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, chmod, mkdir, mkdtemp, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 // A GIT_ASKPASS helper git invokes for username/password prompts. The token
@@ -25,7 +26,7 @@ import { dirname, join } from 'node:path'
 // \`github.com.evil/\`, or \`x@github.com.evil/\`. Without the userinfo arm the
 // password prompt falls through to \`exit 1\` and every HTTPS clone/fetch fails
 // with "unable to read askpass response".
-const ASKPASS_SCRIPT = `#!/bin/sh
+export const ASKPASS_SCRIPT = `#!/bin/sh
 case "$1" in
   *//github.com/*|*//github.com\\'*|*//*@github.com/*|*//*@github.com\\'*) : ;;
   *) exit 1 ;;
@@ -36,26 +37,27 @@ case "$1" in
 esac
 `
 
-// The consumers that call this today (reviewer checkout, backup push) run git via
-// Node `execFile`, NOT sandboxed bash, so the helper only needs to be runtime
-// writable+readable — it does NOT need to sit under a sandbox-visible mount. The
-// old default `/usr/local/bin` assumed a root-writable /usr and EACCES'd whenever
-// the runtime ran as a non-root user, breaking the checkout with an opaque
-// permission-denied.
-//
+// The sandboxed-bash consumer (the github-cli-auth broker's authenticated git)
+// runs INSIDE the per-tool bwrap sandbox, which `--ro-bind`s /usr but masks /tmp
+// with a tmpfs (src/sandbox/build.ts). So its helper must live under /usr, baked
+// into the image at build time (dockerfile.ts) — the read-only /usr is why
+// ensureGitAskPassHelper early-returns when the file already exists rather than
+// rewriting it. TYPECLAW_GIT_ASKPASS_PATH overrides it for tests/CI.
+export const TYPECLAW_GIT_ASKPASS_PATH = '/usr/local/bin/typeclaw-git-askpass'
+
 // The base is the FIXED real `/tmp`, NOT `os.tmpdir()`: os.tmpdir() honors
-// TMPDIR/TMP/TEMP, so an env pointing it at a model-writable location (e.g. a
-// workspace path) would let a sandboxed tool replace the cached helper before a
-// later reviewer checkout / backup push executes it UNSANDBOXED with
-// TYPECLAW_GIT_TOKEN in env. bwrap binds a fresh tmpfs over `/tmp` per session
-// (see SESSION_TMP_ROOT), so the runtime's real `/tmp/typeclaw-git-askpass-*` is
-// NOT visible to model bash and cannot be pre-planted. A random `mkdtemp` subdir
-// (mode 0700) keeps the name unpredictable. TYPECLAW_GIT_ASKPASS_PATH remains the
-// trusted operator/CI/sandbox-consumer override, used verbatim with NO fallback
-// so an unusable configured path surfaces loudly.
+// TMPDIR/TMP/TEMP, so an env pointing it at a model-writable location would let a
+// sandboxed tool replace the cached helper before a later UNSANDBOXED reviewer
+// checkout / backup push executes it with TYPECLAW_GIT_TOKEN in env. A random
+// `mkdtemp` subdir (mode 0700) keeps the name unpredictable.
 const ASKPASS_DIR_BASE = '/tmp/typeclaw-git-askpass-'
 
 let defaultDirPromise: Promise<string> | null = null
+
+function configuredPath(): string | undefined {
+  const path = process.env.TYPECLAW_GIT_ASKPASS_PATH
+  return path !== undefined && path !== '' ? path : undefined
+}
 
 function resolveDefaultDir(): Promise<string> {
   if (defaultDirPromise === null) defaultDirPromise = mkdtemp(ASKPASS_DIR_BASE)
@@ -65,15 +67,23 @@ function resolveDefaultDir(): Promise<string> {
   })
 }
 
+// The path the SANDBOXED-bash consumer must use: the baked, sandbox-visible /usr
+// helper (or the test/CI override). Unlike the unsandboxed default, this never
+// falls back to /tmp, which the sandbox's tmpfs would hide from model bash.
+export function resolveSandboxGitAskPassPath(): string {
+  return configuredPath() ?? TYPECLAW_GIT_ASKPASS_PATH
+}
+
+// The path UNSANDBOXED execFile consumers (reviewer checkout, backup push) use:
+// a runtime-writable, unpredictable real-/tmp path. They don't run under bwrap, so
+// /tmp masking doesn't apply, and a non-root runtime can write here.
 async function defaultPath(): Promise<string> {
-  const override = process.env.TYPECLAW_GIT_ASKPASS_PATH
-  if (override !== undefined && override !== '') return override
-  return join(await resolveDefaultDir(), 'typeclaw-git-askpass')
+  return configuredPath() ?? join(await resolveDefaultDir(), 'typeclaw-git-askpass')
 }
 
 // Keyed by resolved path: a single shared promise would let the first caller's
 // path win even when a later caller explicitly asks for a different one (the
-// reviewer and backup consumers can legitimately request distinct paths).
+// sandbox /usr path and the unsandboxed /tmp path are legitimately distinct).
 const ensurePromises = new Map<string, Promise<string>>()
 
 export function resetGitAskPassHelperForTests(): void {
@@ -81,16 +91,23 @@ export function resetGitAskPassHelperForTests(): void {
   defaultDirPromise = null
 }
 
-// Writes the helper once per path (idempotent, race-safe via the per-path
-// promise) and returns its absolute path. The temp name is unpredictable and
-// opened with `wx` (exclusive create, fails on an existing file/symlink) so a
-// planted symlink cannot redirect the write; then atomically renamed so a
-// concurrent reader never sees a partial file.
+// Returns the helper's absolute path, creating it once per path if needed. When
+// an executable file already exists at the resolved path (the baked /usr helper),
+// we return it WITHOUT writing — the read-only /usr would EACCES a rewrite. Only
+// creates when absent: dev, the unsandboxed /tmp path, or a writable test
+// override. Idempotent + race-safe via the per-path promise; the create uses an
+// unpredictable temp opened `wx` (fails on an existing file/symlink) then renamed.
 export async function ensureGitAskPassHelper(path?: string): Promise<string> {
   const resolved = path ?? (await defaultPath())
   const existing = ensurePromises.get(resolved)
   if (existing !== undefined) return existing
   const pending = (async () => {
+    try {
+      await access(resolved, constants.X_OK)
+      return resolved
+    } catch {
+      // not present (or not executable) — fall through to create it
+    }
     await mkdir(dirname(resolved), { recursive: true })
     const tmp = join(dirname(resolved), `.typeclaw-git-askpass.${randomBytes(8).toString('hex')}.tmp`)
     await writeFile(tmp, ASKPASS_SCRIPT, { mode: 0o755, flag: 'wx' })

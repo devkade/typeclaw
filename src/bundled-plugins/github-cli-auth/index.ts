@@ -15,6 +15,7 @@ import {
   effectiveGhTokensForAuthenticatedUserEndpoint,
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
+import { ensureGitAskPassHelper, resolveSandboxGitAskPassPath } from './git-askpass'
 import { analyzeGitCommand, defaultGitResolvers, resolveGhDefaultRepoFromCwd } from './git-command'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
@@ -346,18 +347,54 @@ export default definePlugin({
       return
     }
 
-    const handleGitCommand = async (params: { command: string; agentDir: string }): Promise<HookResult> => {
-      const { command, agentDir } = params
+    const handleGitCommand = async (params: {
+      event: { args: Record<string, unknown> }
+      command: string
+      agentDir: string
+    }): Promise<HookResult> => {
+      const { event, command, agentDir } = params
       const decision = await analyzeGitCommand(command, { cwd: agentDir, resolvers: defaultGitResolvers })
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
-      const token = effectiveProcessToken()
-      if (token === undefined && !hasAppTokenResolver()) return
-      return {
-        block: true,
-        reason:
-          'Authenticated git is unavailable to model-driven bash because git can invoke repository hooks and credential helpers that inherit reusable credentials. Local git commands still work; use a first-class GitHub action or run network git host-side.',
+
+      // Only a per-repo GitHub App token is brokered to git — never a PAT (git,
+      // unlike gh, runs repo-local hooks/helpers, and a PAT is not repo-confined).
+      // With no App minter, pass through so git fails honestly.
+      if (!hasAppTokenResolver()) return
+      const result = await resolveTokenForRepo(decision.repoSlug)
+      if (result.kind === 'unavailable') return { block: true, reason: result.reason }
+
+      // Deliver the token via GIT_ASKPASS (env, never argv/config). The analyzer
+      // already constrained this to a single bare github git command, so the token
+      // env reaches only this git. hooksPath=/dev/null + credential.helper= stop the
+      // two highest-value ways a repo could capture the token; insteadOf folds
+      // ssh/scp remotes to https so the credential applies. This is defense-in-depth
+      // WITHIN one trust domain, not a wall against a hostile repo — untrusted repos
+      // belong in a separate agent (see docs/internals/sandbox.mdx).
+      // Sandboxed bash: the helper must be on a sandbox-visible path (baked /usr),
+      // not the unsandboxed /tmp default the tmpfs would hide.
+      const askpass = await ensureGitAskPassHelper(resolveSandboxGitAskPassPath())
+      const existing = event.args[TYPECLAW_INTERNAL_BASH_ENV]
+      const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
+      event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
+        ...overlay,
+        GIT_ASKPASS: askpass,
+        TYPECLAW_GIT_TOKEN: result.token,
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_CONFIG_COUNT: '4',
+        GIT_CONFIG_KEY_0: 'core.hooksPath',
+        GIT_CONFIG_VALUE_0: '/dev/null',
+        GIT_CONFIG_KEY_1: 'credential.helper',
+        GIT_CONFIG_VALUE_1: '',
+        // Both ssh remote spellings fold to https so the askpass credential applies:
+        // the scp short form (git@github.com:owner/repo) and the ssh:// URL form.
+        GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf',
+        GIT_CONFIG_VALUE_2: 'git@github.com:',
+        GIT_CONFIG_KEY_3: 'url.https://github.com/.insteadOf',
+        GIT_CONFIG_VALUE_3: 'ssh://git@github.com/',
       }
+      if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
+      return
     }
 
     return {
@@ -373,7 +410,7 @@ export default definePlugin({
           }
 
           if (command.includes('git')) {
-            return await handleGitCommand({ command, agentDir: ctx.agentDir })
+            return await handleGitCommand({ event, command, agentDir: ctx.agentDir })
           }
           return
         },

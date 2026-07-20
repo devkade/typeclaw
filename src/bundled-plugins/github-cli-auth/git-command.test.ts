@@ -30,8 +30,8 @@ describe('parseGithubRepoFromGitUrl', () => {
   test('parses ssh url', () => {
     expect(parseGithubRepoFromGitUrl('ssh://git@github.com/acme/widgets.git')).toBe('acme/widgets')
   })
-  test('parses ssh url with port', () => {
-    expect(parseGithubRepoFromGitUrl('ssh://git@github.com:22/acme/widgets.git')).toBe('acme/widgets')
+  test('rejects an ssh url with explicit port (insteadOf rewrites only the port-less form)', () => {
+    expect(parseGithubRepoFromGitUrl('ssh://git@github.com:22/acme/widgets.git')).toBeNull()
   })
   test('rejects scp-like url with #/? suffix (would yield a malformed slug)', () => {
     expect(parseGithubRepoFromGitUrl('git@github.com:acme/widgets.git#main')).toBeNull()
@@ -247,15 +247,72 @@ describe('analyzeGitCommand — multi-remote resolution', () => {
     expect((await analyze('git fetch --multiple origin upstream', r)).kind).toBe('block')
   })
 
-  test('fetch --multiple across one owner injects', async () => {
+  test('fetch --multiple across two distinct repos blocks (one minted token is repo-scoped)', async () => {
     const r = resolvers({
       resolveRemoteUrl: async (_cwd, remote) =>
         remote === 'origin' ? 'https://github.com/acme/widgets.git' : 'https://github.com/acme/tools.git',
     })
-    expect(await analyze('git fetch --multiple origin upstream', r)).toEqual({
-      kind: 'inject',
-      repoSlug: 'acme/widgets',
+    expect((await analyze('git fetch --multiple origin upstream', r)).kind).toBe('block')
+  })
+
+  test('fetch --multiple with two explicit URLs enumerates BOTH and blocks (not just the first)', async () => {
+    const result = await analyze(
+      'git fetch --multiple https://github.com/acme/widgets.git https://github.com/acme/tools.git',
+    )
+    expect(result.kind).toBe('block')
+  })
+
+  test('fetch --multiple with a mixed named-remote + URL blocks when they resolve to distinct repos', async () => {
+    const r = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
+    const result = await analyze('git fetch --multiple origin https://github.com/acme/tools.git', r)
+    expect(result.kind).toBe('block')
+  })
+
+  test('fetch --multiple where every target resolves to the same repo still injects', async () => {
+    const r = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
+    const result = await analyze('git fetch --multiple origin https://github.com/acme/widgets.git', r)
+    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+  })
+
+  test('repeated -C is cumulative: a relative second -C resolves under the first (git semantics)', async () => {
+    const seen: string[] = []
+    const r = resolvers({
+      resolveRemoteUrl: async (cwd) => {
+        seen.push(cwd)
+        return 'https://github.com/acme/widgets.git'
+      },
     })
+    await analyze('git -C /trusted -C child fetch origin main', r)
+    expect(seen).toContain('/trusted/child')
+    expect(seen).not.toContain('/agent/child')
+  })
+
+  test('an absolute later -C resets the cumulative base', async () => {
+    const seen: string[] = []
+    const r = resolvers({
+      resolveRemoteUrl: async (cwd) => {
+        seen.push(cwd)
+        return 'https://github.com/acme/widgets.git'
+      },
+    })
+    await analyze('git -C /trusted -C /elsewhere fetch origin main', r)
+    expect(seen).toContain('/elsewhere')
+    expect(seen).not.toContain('/trusted')
+  })
+
+  test('fetch --multiple fails closed (pass-through, no mint) when any target is unresolvable', async () => {
+    const r = resolvers({
+      resolveRemoteUrl: async (_cwd, remote) => (remote === 'origin' ? 'https://github.com/acme/widgets.git' : null),
+    })
+    // `bogusgroup` resolves to no url (e.g. a remotes.<group> we can't expand) →
+    // we must NOT mint for `origin` alone while git contacts the group's remotes.
+    expect((await analyze('git fetch --multiple origin bogusgroup', r)).kind).toBe('pass-through')
+  })
+
+  test('an explicit-port ssh URL is not recognized as github (no mint; would bypass https askpass)', async () => {
+    expect(parseGithubRepoFromGitUrl('ssh://git@github.com:22/acme/widgets.git')).toBeNull()
+    expect(parseGithubRepoFromGitUrl('ssh://git@github.com/acme/widgets.git')).toBe('acme/widgets')
+    expect((await analyze('git clone ssh://git@github.com:22/acme/widgets.git')).kind).toBe('pass-through')
   })
 
   test('push origin main treats main as a refspec, not a second remote', async () => {
@@ -346,19 +403,19 @@ describe('analyzeGitCommand — resolver errors fail safe', () => {
 describe('analyzeGitCommand — &&-joined git chains', () => {
   const ghRemote = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
 
-  test('REGRESSION: clone && fetch (same owner) injects instead of passing through tokenless', async () => {
-    // given: a compound clone+fetch that previously ran in the sandbox with no
-    // credential because the multi-git chain silently passed through.
+  test('token-bearing clone && fetch (same owner) BLOCKS: a later git segment would inherit the token', async () => {
+    // A repo could alias a git subcommand to `!<shell>` and read TYPECLAW_GIT_TOKEN
+    // from the shared chain env — so a minted chain must be a single bare git.
     const result = await analyze(
       'git clone --depth 1 https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x fetch origin main',
       ghRemote,
     )
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result.kind).toBe('block')
   })
 
-  test('clone && checkout (only first targets a remote) injects for the remote owner', async () => {
+  test('token-bearing clone && checkout blocks (single bare git only, even if segment 2 is local)', async () => {
     const result = await analyze('git clone https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x checkout main')
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result.kind).toBe('block')
   })
 
   test('non-remote chain (status && log) passes through (nothing to authenticate)', async () => {
@@ -411,13 +468,13 @@ describe('analyzeGitCommand — &&-joined git chains', () => {
     ).toBe('block')
   })
 
-  test('two single-owner remotes across the chain inject', async () => {
+  test('two remotes across the chain block (multi-segment token-bearing git)', async () => {
     const r = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/tools.git' })
     const result = await analyze(
       'git clone https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x fetch upstream',
       r,
     )
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result.kind).toBe('block')
   })
 
   test('non-github chain passes through (no token to mint)', async () => {

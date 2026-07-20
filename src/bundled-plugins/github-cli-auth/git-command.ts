@@ -57,9 +57,9 @@ export const defaultGitResolvers: GitResolvers = {
 const REMOTE_SUBCOMMANDS = new Set(['push', 'fetch', 'pull', 'clone', 'ls-remote'])
 
 const MULTI_OWNER_REASON =
-  'This git command targets repos under more than one owner; a single minted ' +
-  'GitHub App token cannot authenticate all of them. Split it into separate ' +
-  'commands, one owner each.'
+  'This git command targets more than one repository; a single minted GitHub App ' +
+  'token is scoped to one repo and cannot authenticate all of them. Split it into ' +
+  'separate commands, one repository each.'
 
 const COMPOSITION_REASON =
   'A repo-targeting `git` command receives a minted GitHub App token via ' +
@@ -119,9 +119,8 @@ export async function analyzeGitCommand(
   // authenticate, so pass through and let git run with no token.
   if (remoteSegments.length === 0) return { kind: 'pass-through' }
 
-  // Every segment — even non-remote ones like `git status` that ride along in
-  // the chain — must pass the redirect screen: a token lives in the shared env
-  // the whole chain inherits, so a `-c`/env-assignment on ANY git could steer
+  // Every segment must pass the redirect screen: a token would live in the shared
+  // env the whole chain inherits, so a `-c`/env-assignment on ANY git could steer
   // auth or destination.
   for (const seg of chain) {
     if (seg.hasLeadingEnvAssignment || hasDangerousGitConfig(seg.args)) {
@@ -133,11 +132,10 @@ export async function analyzeGitCommand(
     }
   }
 
-  const owners = new Set<string>()
-  let representativeSlug: string | null = null
+  const repos = new Set<string>()
   for (const seg of remoteSegments) {
     const sub = findSubcommand(seg.args) as string
-    const effectiveCwd = resolveCwd(options.cwd, extractDashCDir(seg.args))
+    const effectiveCwd = resolveEffectiveCwd(options.cwd, seg.args)
     // A resolver that throws is treated as "couldn't resolve" → pass-through, so
     // a git/subprocess failure never crashes the hook or guesses a repo.
     let slugs: string[]
@@ -146,19 +144,23 @@ export async function analyzeGitCommand(
     } catch {
       return { kind: 'pass-through' }
     }
-    for (const slug of slugs) {
-      owners.add(slug.split('/')[0] as string)
-      representativeSlug ??= slug
-    }
+    for (const slug of slugs) repos.add(slug)
   }
 
-  // A GitHub remote subcommand whose target owner we could not resolve: we must
-  // not mint a possibly-wrong-owner token, and silently passing through would
-  // reproduce the credential-less failure. Block with an actionable reason.
-  if (representativeSlug === null) return { kind: 'pass-through' }
-  if (owners.size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
+  // No github remote resolved (e.g. a gitlab chain): no token to mint, so pass
+  // through and let git run tokenless — do NOT block a legitimate non-github chain.
+  if (repos.size === 0) return { kind: 'pass-through' }
 
-  return { kind: 'inject', repoSlug: representativeSlug }
+  // A token WILL be minted. It must ride a SINGLE bare git: the shared chain env
+  // means a later segment — even `git leak` where the repo aliased `leak` to a
+  // shell command — would read it. The only multi-segment token-bearing form is
+  // `cd <path> && git …`, handled by analyzeSingleCdGit (rewritten to one git -C).
+  if (chain.length > 1) return { kind: 'block', reason: COMPOSITION_REASON }
+  // One minted token is repo-scoped, so more than one distinct repo (e.g.
+  // `fetch --multiple origin upstream`) can't authenticate.
+  if (repos.size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
+
+  return { kind: 'inject', repoSlug: [...repos][0] as string }
 }
 
 // The single-git `cd <path> && git …` shortcut. Kept separate (and single-git
@@ -180,8 +182,8 @@ async function analyzeSingleCdGit(
   if ((subcommand === 'fetch' || subcommand === 'pull') && args.includes('--all')) {
     return { kind: 'block', reason: FETCH_ALL_REASON }
   }
-  const dashCDir = extractDashCDir(args)
-  const effectiveCwd = resolveCwd(resolveCwd(options.cwd, stripped.cdDir), dashCDir)
+  const hasDashC = args.includes('-C')
+  const effectiveCwd = resolveEffectiveCwd(resolveCwd(options.cwd, stripped.cdDir), args)
   let slugs: string[]
   try {
     slugs = await resolveRepoSlugs(subcommand, args, effectiveCwd, options.resolvers)
@@ -189,12 +191,11 @@ async function analyzeSingleCdGit(
     return { kind: 'pass-through' }
   }
   if (slugs.length === 0) return { kind: 'pass-through' }
-  const owners = new Set(slugs.map((s) => s.split('/')[0]))
-  if (owners.size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
+  if (new Set(slugs).size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
   const repoSlug = slugs[0] as string
   // The rewrite cannot stack two `-C` (the git part must not already carry one)
   // and the rest must be a single bare git (no further composition).
-  if (containsShellActiveMetachar(stripped.rest) || dashCDir !== null) {
+  if (containsShellActiveMetachar(stripped.rest) || hasDashC) {
     return { kind: 'block', reason: COMPOSITION_REASON }
   }
   return { kind: 'inject', repoSlug, rewrittenCommand: rewriteCdToDashC(effectiveCwd, stripped.rest) }
@@ -225,6 +226,25 @@ async function resolveRepoSlugs(
   cwd: string,
   resolvers: GitResolvers,
 ): Promise<string[]> {
+  // `fetch --multiple` contacts EVERY positional target — remotes AND raw URLs,
+  // mixed, and a target may even be a `remotes.<group>` that expands to several.
+  // Enumerate them all (not just the first URL) so the distinct-repo guard sees
+  // the full set. FAIL CLOSED: if ANY target can't be resolved to a github slug
+  // (an unknown remote, a config remote-group we can't expand, a non-github URL),
+  // throw so the caller passes through tokenless — never mint for a subset while
+  // git contacts the rest. Non-`--multiple` keeps the single-target path.
+  const forPush = subcommand === 'push'
+  if (subcommand === 'fetch' && args.includes('--multiple')) {
+    const slugs: string[] = []
+    for (const pos of positionalsAfterSubcommand('fetch', args)) {
+      const url = looksLikeUrl(pos) ? pos : await resolvers.resolveRemoteUrl(cwd, pos, forPush)
+      const slug = url === null ? null : parseGithubRepoFromGitUrl(url)
+      if (slug === null) throw new Error('unresolved --multiple target')
+      slugs.push(slug)
+    }
+    return slugs
+  }
+
   const explicitUrl = extractExplicitUrl(subcommand, args)
   if (explicitUrl !== null) {
     const slug = parseGithubRepoFromGitUrl(explicitUrl)
@@ -234,12 +254,6 @@ async function resolveRepoSlugs(
   // clone needs an explicit URL; it has no configured-remote fallback.
   if (subcommand === 'clone') return []
 
-  // Only `push` consults the push url; fetch/pull/ls-remote use the fetch url.
-  const forPush = subcommand === 'push'
-
-  // EVERY named remote must be resolved, not just the first: `git fetch
-  // --multiple origin upstream` touches both, and feeding only one to the
-  // multi-owner guard would let a second-owner remote slip past and still mint.
   const remoteNames = extractRemoteNames(args)
   // The branch.pushRemote/pushDefault/origin chain is a PUSH default; applying it
   // to a bare `fetch`/`pull`/`ls-remote` could mint for the wrong (push) remote,
@@ -284,7 +298,11 @@ export async function resolveGhDefaultRepoFromCwd(cwd: string, resolvers: GitRes
 
 const HTTPS_GITHUB_RE = /^https:\/\/github\.com\/([^/\s:@]+)\/([^/\s?#]+?)(?:\.git)?\/?(?:[?#].*)?$/i
 const SCP_GITHUB_RE = /^git@github\.com:([^/\s:?#]+)\/([^/\s?#]+?)(?:\.git)?$/i
-const SSH_GITHUB_RE = /^ssh:\/\/git@github\.com(?::\d+)?\/([^/\s]+)\/([^/\s?#]+?)(?:\.git)?\/?(?:[?#].*)?$/i
+// No explicit port: the forced insteadOf only rewrites `ssh://git@github.com/`, so
+// a ported form (`ssh://git@github.com:22/…`) would keep ssh transport and bypass
+// the https askpass. We therefore do NOT recognize the ported spelling as github —
+// it resolves to no slug, so no token is minted and git fails honestly.
+const SSH_GITHUB_RE = /^ssh:\/\/git@github\.com\/([^/\s]+)\/([^/\s?#]+?)(?:\.git)?\/?(?:[?#].*)?$/i
 
 // Parses a github.com remote URL into an `owner/name` slug. Returns null for
 // non-github.com hosts, credential-bearing https URLs (https://tok@github.com/…
@@ -392,15 +410,20 @@ function positionalsAfterSubcommand(subcommand: string, args: readonly string[])
   return out
 }
 
-function extractDashCDir(args: readonly string[]): string | null {
+// git applies repeated `-C` CUMULATIVELY: each value is resolved relative to the
+// result of the previous one, and an absolute value resets the base. So `-C
+// /trusted -C child` operates in `/trusted/child`, not `child`. We fold them the
+// same way from `base` so we resolve the repo of the checkout git actually uses —
+// resolving only the last `-C` from cwd would mint against a different tree.
+function resolveEffectiveCwd(base: string, args: readonly string[]): string {
+  let cwd = base
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i]
-    if (arg === '-C') {
+    if (args[i] === '-C') {
       const v = args[i + 1]
-      if (v !== undefined) return stripQuotes(v)
+      if (v !== undefined) cwd = resolveCwd(cwd, stripQuotes(v))
     }
   }
-  return null
+  return cwd
 }
 
 type GitInvocation = { args: string[]; hasLeadingEnvAssignment: boolean }
