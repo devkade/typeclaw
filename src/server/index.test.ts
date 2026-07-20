@@ -453,8 +453,11 @@ describe('createServer todo continuation (drain re-entrancy)', () => {
     // The continuation must be consumed by the SAME drain loop — a second
     // prompt() call lands without any further user input. If the old
     // publish-through-stream path were still in place, draining would already
-    // be true and this would hang until timeout.
-    await waitForState(() => session.promptCalls.length === 2, { timeoutMs: 2000 })
+    // be true and this would hang until timeout: the stranded item generates
+    // no further wake-up, so no tight deadline is needed to prove the fix.
+    // Use the shared contention-tolerant default (30s) rather than a fixed
+    // short timeout, which starves and false-fails under oversubscription.
+    await waitForState(() => session.promptCalls.length === 2)
     expect(session.promptCalls[1]).toContain('Incomplete todo items remain')
     session.resolvePrompt()
     ws.close()
