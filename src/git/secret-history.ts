@@ -2,7 +2,7 @@ import { type Dirent, type Stats } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 
-import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
+import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_GIT_HISTORY_SECRET_FILES } from '@/sandbox/canonical-secrets'
 
 import { hooklessGitArgs } from './hookless'
 import { resolveAgentGit } from './resolve-agent-git'
@@ -370,7 +370,7 @@ function normalizeGitPath(raw: string): string {
 
 function matchesKnownRootPath(raw: string): boolean {
   const path = normalizeGitPath(raw)
-  if (CANONICAL_AGENT_SECRET_FILES.some((secret) => path === secret)) return true
+  if (CANONICAL_GIT_HISTORY_SECRET_FILES.some((secret) => path === secret)) return true
   return CANONICAL_AGENT_SECRET_DIRS.some((dir) => path.startsWith(`${dir}/`))
 }
 
