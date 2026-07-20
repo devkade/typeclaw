@@ -67,6 +67,7 @@ import {
   type ThreadCommandInput,
 } from './slack-bot-slash-commands'
 import { slackTsToMillis } from './slack-bot-time'
+import { toSlackMrkdwn } from './slack-format'
 
 // One slash command per logical agent gesture. Mirrors the discord-bot
 // SLASH_COMMANDS constant so the cross-platform set stays consistent — when
@@ -1027,7 +1028,11 @@ export function createOutboundCallback(deps: {
       const isFirst = index === 0
       const uploadOptions: { thread_ts?: string; initial_comment?: string } = {}
       if (threadTs !== undefined) uploadOptions.thread_ts = threadTs
-      if (isFirst && text !== '') uploadOptions.initial_comment = text
+      // A file caption cannot carry a `markdown` block (files.uploadV2 has no
+      // `blocks` param), so it is parsed as Slack mrkdwn. Convert the agent's
+      // GFM (`**bold**`) to mrkdwn (`*bold*`) here — the text-only path above
+      // relies on the native markdown block and needs no conversion.
+      if (isFirst && text !== '') uploadOptions.initial_comment = toSlackMrkdwn(text)
       try {
         const file = await client.uploadFile(msg.chat, buffer, filename, uploadOptions)
         logger.info(`[slack-bot] uploaded id=${file.id} filename=${file.name} size=${file.size} ${tag}`)
@@ -1199,7 +1204,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
 
   const reactionCallback = createSlackReactionCallback({ client })
   const removeReactionCallback = createSlackRemoveReactionCallback({ client })
-  const editMessageCallback = createSlackEditMessageCallback({ client })
+  const editMessageCallback = createSlackEditMessageCallback({ token: options.token, fetchImpl })
 
   const dedupe = createSlackDedupe()
 
