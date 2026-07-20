@@ -1800,6 +1800,23 @@ describe('slack-bot createOutboundCallback', () => {
     expect(uploads).toEqual([{ channel: 'C0', bytes: 10, filename: 'a.png', options: { initial_comment: 'caption' } }])
   })
 
+  test('attachment caption converts GFM to Slack mrkdwn (initial_comment cannot carry a markdown block)', async () => {
+    // given
+    const { client, uploads } = makeFakeClient()
+    const cb = createOutboundCallback({
+      client,
+      logger: silentLogger(),
+      formatChannelTag: tag,
+      readFile: fakeRead,
+    })
+    // when
+    await cb(
+      makeMsg({ text: '**Status Distribution**\n- Planned: 235', attachments: [{ path: '/agent/report.xlsx' }] }),
+    )
+    // then
+    expect(uploads[0]!.options?.initial_comment).toBe('*Status Distribution*\n- Planned: 235')
+  })
+
   test('multi-attachment puts caption only on the FIRST upload; rest are bare', async () => {
     const { client, uploads } = makeFakeClient()
     const cb = createOutboundCallback({
