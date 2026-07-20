@@ -3,6 +3,7 @@ import type { InboundMessage } from '@/channels/types'
 
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
+import { DEFAULT_RECONCILE_COOLDOWN_MS, type ReconcileCooldownStore } from './reconcile-cooldown-store'
 import type { TeamMembershipChecker } from './team-membership'
 
 // Catches up on review work that a live webhook delivery missed. The github
@@ -32,6 +33,12 @@ export type ReconcileOpenPrsOptions = {
   // tests that don't exercise team requests; treated as "not a member".
   isBotInTeam?: TeamMembershipChecker
   fetchImpl?: typeof fetch
+  // When provided, a PR that still needs review is replayed at most once per
+  // `cooldownMs`, keyed durably by `repo#prId` so restarts don't re-trigger it.
+  // Omitted in tests that assert the raw replay decision.
+  cooldownStore?: ReconcileCooldownStore
+  cooldownMs?: number
+  now?: () => number
 }
 
 export type ReconcileOutcome = { repo: string; scanned: number; replayed: number } | { repo: string; error: string }
@@ -79,12 +86,36 @@ async function reconcileRepo(
   const token = await options.token({ repoSlug: repo })
   const prs = await fetchOpenPrs(fetchImpl, token, target)
 
+  const cooldownStore = options.cooldownStore
+  const cooldownMs = options.cooldownMs ?? DEFAULT_RECONCILE_COOLDOWN_MS
+  const now = options.now ?? Date.now
+
   let replayed = 0
   for (const pr of prs) {
     const needs = await prNeedsReview({ pr, options, target, token, selfLogin, decoyLogin, fetchImpl })
     if (!needs) continue
+    if (cooldownStore !== undefined) {
+      if (cooldownStore.isCoolingDown(repo, pr.id, now(), cooldownMs)) continue
+      try {
+        // Persist the marker before routing: if the write fails the marker is
+        // rolled back and this throws, so we skip the route rather than replay a
+        // PR with no durable record (a restart would otherwise replay it again).
+        await cooldownStore.markReplayed(repo, pr.id, now())
+      } catch (err) {
+        options.logger.warn(
+          `[github] reconcile ${repo}: skipping PR #${pr.number} replay, cooldown persist failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        )
+        continue
+      }
+    }
     options.route(buildSyntheticInbound(pr, target))
     replayed += 1
+  }
+
+  if (cooldownStore !== undefined) {
+    await cooldownStore.prune(repo, new Set(prs.map((pr) => pr.id)), now())
   }
   return { repo, scanned: prs.length, replayed }
 }

@@ -21,6 +21,7 @@ import {
   parseListHooksPermissionStatus,
 } from './permission-guidance'
 import { createGithubReactionCallback, createGithubRemoveReactionCallback } from './reactions'
+import { loadReconcileCooldownStore, type ReconcileCooldownStore } from './reconcile-cooldown-store'
 import { reconcileOpenPrs } from './reconcile-open-prs'
 import { createRecoveredGuidLog, recoverFailedGithubDeliveries } from './recover-failed-deliveries'
 import { createGithubReviewStateResolver } from './review-state'
@@ -73,6 +74,11 @@ export type GithubAdapterOptions = {
   // inbound delivery failed (and that GitHub never redelivered), re-injecting
   // them through the live event path. Zero disables the sweep. Default: 5 min.
   deliveryRecoveryIntervalMs?: number
+  // How often to re-run the open-PR reconcile pass after the initial start()
+  // pass, so a genuinely-missed PR recovers without another restart. Per-PR
+  // replay is bounded by the durable cooldown store. Zero disables the periodic
+  // re-run (the start() pass still fires). Default: 30 min.
+  reconcileIntervalMs?: number
   // Write-side of the GithubTokenBridge. On App-auth start the adapter
   // registers a per-repo minter here so plugin hooks can resolve a token for
   // ad-hoc `gh` commands; it unregisters on stop and on start rollback. PAT
@@ -101,6 +107,10 @@ const DEFAULT_DELIVERY_RECOVERY_INTERVAL_MS = 5 * 60 * 1000
 const DELIVERY_RECOVERY_LOOKBACK_MS = 70 * 60 * 60 * 1000
 // Bounds an LLM-session storm if a bad tunnel window drops a large burst.
 const MAX_RECOVERED_PER_SWEEP = 50
+// The reconcile pass reruns on this cadence so a genuinely-missed `opened`
+// recovers without waiting for another restart. Per-PR replay is bounded by the
+// durable cooldown store, so a tick is cheap when nothing new needs review.
+const DEFAULT_RECONCILE_INTERVAL_MS = 30 * 60 * 1000
 
 export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapter {
   const logger = options.logger ?? consoleLogger
@@ -118,6 +128,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   let managedHooks: ReadonlyArray<{ repo: string; hookId: number }> = []
   let tokenRefreshTimer: { clear: () => void } | null = null
   let deliveryRecoveryTimer: { clear: () => void } | null = null
+  let reconcileTimer: { clear: () => void } | null = null
   let unregisterTokenBridge: (() => void) | null = null
   const workspaceByChat = new Map<string, string>()
   const setIntervalFn =
@@ -361,13 +372,21 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       }
       // Catch up on PRs whose opened/ready_for_review/review_requested delivery
       // was missed (tunnel-URL churn, dropped delivery, downtime). Best-effort
-      // and last so a failure here never blocks the adapter from coming up; the
-      // helper swallows per-repo errors internally. Runs on every start(), so a
-      // tunnel-driven restart re-checks too. `off` short-circuits inside.
-      if (repos.length > 0) {
-        await reconcileOpenPrs({
+      // so a failure here never blocks the adapter from coming up; the helper
+      // swallows per-repo errors internally. `off` short-circuits inside. A
+      // durable per-PR cooldown store bounds replay to at most once per window,
+      // so the many restarts a churning tunnel causes don't re-review the same
+      // PRs; the periodic tick below retries genuinely-missed PRs after the
+      // cooldown without needing a restart.
+      const reconcileCooldownStore =
+        repos.length > 0 ? await loadReconcileCooldownStore(options.agentDir, logger) : null
+      // Resolve review.on per call, not from the captured startup cfg: review.on
+      // is live-reloadable, so a periodic tick must honor a change to `off`
+      // (reconcileOpenPrs short-circuits on `off`) instead of scanning forever.
+      const runReconcile = (store: ReconcileCooldownStore): Promise<unknown> =>
+        reconcileOpenPrs({
           repos,
-          reviewOn: cfg.review.on,
+          reviewOn: options.configRef().review.on,
           selfLogin,
           authType: options.secrets.auth.type,
           token: authToken,
@@ -375,9 +394,16 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
           logger,
           isBotInTeam,
           fetchImpl,
+          cooldownStore: store,
         }).catch((err: unknown) => {
           logger.warn(`[github] reconcile pass failed: ${err instanceof Error ? err.message : String(err)}`)
         })
+      if (reconcileCooldownStore !== null) {
+        await runReconcile(reconcileCooldownStore)
+        const reconcileIntervalMs = options.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS
+        if (reconcileIntervalMs > 0) {
+          reconcileTimer = setIntervalFn(() => void runReconcile(reconcileCooldownStore), reconcileIntervalMs)
+        }
       }
       // Periodically recover inbound deliveries that failed at the tunnel and
       // were never redelivered (the cloudflare-quick 502 loss). Registered only
@@ -417,6 +443,10 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       if (deliveryRecoveryTimer !== null) {
         deliveryRecoveryTimer.clear()
         deliveryRecoveryTimer = null
+      }
+      if (reconcileTimer !== null) {
+        reconcileTimer.clear()
+        reconcileTimer = null
       }
       options.router.unregisterOutbound('github', outbound)
       options.router.unregisterReaction('github', reaction)

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import type { InboundMessage } from '@/channels/types'
 
+import { DEFAULT_RECONCILE_COOLDOWN_MS, type ReconcileCooldownStore } from './reconcile-cooldown-store'
 import { reconcileOpenPrs, type ReconcileOpenPrsOptions } from './reconcile-open-prs'
 import type { TeamMembershipChecker } from './team-membership'
 
@@ -228,5 +229,143 @@ describe('reconcileOpenPrs', () => {
     const outcomes = await reconcileOpenPrs(baseOptions({ routed, repos: ['not-a-slug'], fetchImpl: spyFetch }))
     expect(fetched).toBe(false)
     expect(outcomes[0]).toMatchObject({ repo: 'not-a-slug', error: 'malformed repo slug' })
+  })
+})
+
+function fakeCooldownStore(initial: ReadonlyArray<{ repo: string; prId: number; lastReplayAt: number }> = []): {
+  store: ReconcileCooldownStore
+  markers: Map<string, number>
+  pruned: Array<{ repo: string; ids: number[] }>
+} {
+  const markers = new Map<string, number>()
+  for (const m of initial) markers.set(`${m.repo}#${m.prId}`, m.lastReplayAt)
+  const pruned: Array<{ repo: string; ids: number[] }> = []
+  const store: ReconcileCooldownStore = {
+    isCoolingDown: (repo, prId, now, cooldownMs) => {
+      const at = markers.get(`${repo}#${prId}`)
+      return at !== undefined && now - at < cooldownMs
+    },
+    markReplayed: async (repo, prId, now) => {
+      markers.set(`${repo}#${prId}`, now)
+    },
+    prune: async (repo, openPrIds) => {
+      pruned.push({ repo, ids: Array.from(openPrIds) })
+    },
+  }
+  return { store, markers, pruned }
+}
+
+describe('reconcileOpenPrs cooldown', () => {
+  test('replays a never-reconciled PR and records the marker before routing', async () => {
+    const routed: InboundMessage[] = []
+    const { store, markers } = fakeCooldownStore()
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: store,
+        now: () => 1_000,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    expect(routed.map((m) => m.chat)).toEqual(['pr:7'])
+    expect(markers.get('acme/widgets#700')).toBe(1_000)
+  })
+
+  test('skips a PR replayed within the cooldown window (restart within cooldown)', async () => {
+    const routed: InboundMessage[] = []
+    const { store } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: store,
+        now: () => 1_000 + DEFAULT_RECONCILE_COOLDOWN_MS - 1,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    expect(routed).toHaveLength(0)
+  })
+
+  test('an updatedAt change within the cooldown does NOT re-trigger a replay', async () => {
+    const routed: InboundMessage[] = []
+    const { store } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: store,
+        now: () => 1_000 + 60_000,
+        fetchImpl: fakeGithub([{ number: 7, id: 700, updatedAt: '2026-02-02T00:00:00Z' }]),
+      }),
+    )
+    expect(routed).toHaveLength(0)
+  })
+
+  test('retries a still-unreviewed PR after the cooldown expires', async () => {
+    const routed: InboundMessage[] = []
+    const { store, markers } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
+    const now = 1_000 + DEFAULT_RECONCILE_COOLDOWN_MS + 1
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: store,
+        now: () => now,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    expect(routed.map((m) => m.chat)).toEqual(['pr:7'])
+    expect(markers.get('acme/widgets#700')).toBe(now)
+  })
+
+  test('a posted review suppresses replay even when the cooldown has expired', async () => {
+    const routed: InboundMessage[] = []
+    const { store } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: store,
+        now: () => 1_000 + DEFAULT_RECONCILE_COOLDOWN_MS + 1,
+        fetchImpl: fakeGithub([{ number: 7, id: 700, selfReviewed: true }]),
+      }),
+    )
+    expect(routed).toHaveLength(0)
+  })
+
+  test('prunes the cooldown store with the currently-open PR ids', async () => {
+    const routed: InboundMessage[] = []
+    const { store, pruned } = fakeCooldownStore()
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: store,
+        now: () => 1_000,
+        fetchImpl: fakeGithub([
+          { number: 7, id: 700 },
+          { number: 8, id: 800, selfReviewed: true },
+        ]),
+      }),
+    )
+    expect(pruned).toEqual([{ repo: 'acme/widgets', ids: [700, 800] }])
+  })
+
+  test('does NOT route when persisting the cooldown marker fails', async () => {
+    const routed: InboundMessage[] = []
+    const { store } = fakeCooldownStore()
+    const failingStore: ReconcileCooldownStore = {
+      ...store,
+      markReplayed: async () => {
+        throw new Error('ENOSPC: disk full')
+      },
+    }
+    const warnings: string[] = []
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: failingStore,
+        now: () => 1_000,
+        logger: { info: () => {}, warn: (m) => warnings.push(m) },
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    expect(routed).toHaveLength(0)
+    expect(warnings.some((w) => w.includes('cooldown persist failed'))).toBe(true)
   })
 })
