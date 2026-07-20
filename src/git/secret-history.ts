@@ -1,3 +1,5 @@
+import { type Dirent, type Stats } from 'node:fs'
+import { readdir, stat } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 
 import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
@@ -44,11 +46,22 @@ export async function scanCanonicalSecretsInGit(agentDir: string): Promise<ScanR
   const replacements = await runGit(agentDir, gitArgs, ['for-each-ref', '--format=%(refname)', 'refs/replace'])
   if (replacements.trim() !== '') return { ok: false, paths: ['replacement refs exist under refs/replace'] }
 
-  const nonCommitRoots = await scanNonCommitRefRoots(agentDir, gitArgs)
+  const otherGitDirs = await collectOtherWorktreeGitDirs(agentDir, gitArgs)
+
+  const nonCommitRoots = await scanNonCommitRefRoots(agentDir, gitArgs, otherGitDirs)
   if (!nonCommitRoots.ok) return nonCommitRoots
 
   const index = await runGit(agentDir, gitArgs, ['ls-files', '--cached', '-z'])
   const reachablePaths = matchingCanonicalPaths(splitNul(index))
+
+  // Every other worktree keeps its own index under its gitdir; a canonical secret staged there (e.g.
+  // `git add -f secrets.json` in a linked worktree whose working dir was later deleted, or in the main
+  // worktree when the caller is a linked one) keeps the blob reachable but is invisible to the caller's
+  // own index and to `fsck`, so scan each one.
+  for (const otherGitDir of otherGitDirs) {
+    const otherIndex = await runGit(agentDir, gitArgs, [`--git-dir=${otherGitDir}`, 'ls-files', '--cached', '-z'])
+    reachablePaths.push(...matchingCanonicalPaths(splitNul(otherIndex)))
+  }
 
   const objects = await runGit(agentDir, gitArgs, ['rev-list', '--objects', '--all', '--reflog'])
   for (const line of objects.split('\n')) {
@@ -89,20 +102,14 @@ const GIT_FALLBACK_ROOT_REFS = [
 // that tree/blob live, so neither fsck mode reports it and rev-list cannot root-anchor its path.
 // Such a live root has no repository path prefix, so it fails closed exactly like an orphan tree.
 // Ordinary commit-ish roots are handled by the reachable/reflog path scans.
-async function scanNonCommitRefRoots(agentDir: string, gitArgs: readonly string[]): Promise<UnreachableScan> {
-  const listing = await runGit(agentDir, gitArgs, ['worktree', 'list', '--porcelain'])
-  const headRefs: string[] = []
-  const linkedWorktrees: string[] = []
-  for (const line of listing.split('\n')) {
-    if (line.startsWith('HEAD ')) headRefs.push(line.slice('HEAD '.length).trim())
-    else if (line.startsWith('worktree ')) {
-      const path = line.slice('worktree '.length).trim()
-      if (path !== '' && path !== agentDir) linkedWorktrees.push(path)
-    }
-  }
+async function scanNonCommitRefRoots(
+  agentDir: string,
+  gitArgs: readonly string[],
+  otherGitDirs: readonly string[],
+): Promise<UnreachableScan> {
   const refs = await runGit(agentDir, gitArgs, ['for-each-ref', '--format=%(objectname)'])
-  const rootRefOids = await collectRootRefOids(agentDir, gitArgs, linkedWorktrees)
-  const roots = [...new Set([...headRefs, ...refs.split('\n'), ...rootRefOids].map((oid) => oid.trim()))].filter(
+  const rootRefOids = await collectRootRefOids(agentDir, gitArgs, otherGitDirs)
+  const roots = [...new Set([...refs.split('\n'), ...rootRefOids].map((oid) => oid.trim()))].filter(
     (oid) => oid !== '' && !/^0+$/.test(oid),
   )
 
@@ -118,11 +125,66 @@ async function scanNonCommitRefRoots(agentDir: string, gitArgs: readonly string[
   return { ok: true, paths: [] }
 }
 
-// Collects every oid pinned by a top-level root ref across the main worktree AND every linked one
-// (each linked worktree owns its own root-ref files under `$GIT_COMMON_DIR/worktrees/<id>/`, so a
-// non-commit pinned only there must be probed too). The main worktree keeps the caller's gitArgs so
-// the .gitstore --git-dir/--work-tree layout still resolves (that layout reports no linked
-// worktrees); linked worktrees are discovered from their own path.
+// Every gitdir that owns per-worktree metadata (HEAD, FETCH_HEAD/MERGE_HEAD, root refs, index) OTHER
+// than the caller's own, so the top-level scan can probe each via `--git-dir` without re-covering the
+// caller. Two coverage gaps are closed here:
+//
+//  - Linked worktrees are enumerated by their admin gitdir (`$GIT_COMMON_DIR/worktrees/<id>`), not by
+//    working-dir path. A worktree whose working dir was deleted out from under Git (e.g. a subagent's
+//    `/tmp/<branch>` checkout that `/tmp` later reaped) is still registered and still owns ref files
+//    and a retained index that can conceal a secret; probing it by path (`git -C <gone path>`) failed
+//    "cannot change to '<path>'" and bricked the scan closed, while dropping it would lose the only
+//    signal that its pseudoref pins a non-commit. The admin gitdir survives the deleted working dir.
+//  - When the CALLER is itself a linked worktree, the main worktree's private HEAD/pseudorefs/index
+//    live directly in the common gitdir (NOT under `worktrees/`), so the common gitdir must be probed
+//    too or a secret staged in the main index would go unseen. It is skipped when the caller already
+//    IS the main worktree (its own gitdir equals the common gitdir), which the top-level scan covers.
+async function collectOtherWorktreeGitDirs(agentDir: string, gitArgs: readonly string[]): Promise<string[]> {
+  const [gitDir, commonDir] = (
+    await runGit(agentDir, gitArgs, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'])
+  )
+    .split('\n')
+    .map((line) => line.trim())
+  if (commonDir === undefined || commonDir === '') return []
+
+  const gitDirs = new Set<string>()
+  if (commonDir !== gitDir) gitDirs.add(commonDir)
+
+  const worktreesDir = join(commonDir, 'worktrees')
+  let entries: Dirent[]
+  try {
+    entries = await readdir(worktreesDir, { withFileTypes: true })
+  } catch (error) {
+    // Only a genuinely absent `worktrees/` dir means "no linked worktrees" and is safe to treat as
+    // empty. A permission/IO/not-a-dir failure means we CANNOT prove no worktree hides a secret, so
+    // fail closed rather than silently skipping every per-worktree ref store and index.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [...gitDirs]
+    throw new GitSecretHistoryError([`Git metadata scan failed (worktrees): ${redactFsError(error)}`])
+  }
+  // Resolve each entry through `stat` (follows symlinks): a real admin gitdir is a directory, and a
+  // symlinked one must still be scanned, but anything that cannot be confirmed a directory is an
+  // unexpected entry under adversarially-treated metadata and fails closed.
+  for (const entry of entries) {
+    const adminDir = join(worktreesDir, entry.name)
+    let info: Stats
+    try {
+      info = await stat(adminDir)
+    } catch (error) {
+      throw new GitSecretHistoryError([`Git metadata scan failed (worktrees): ${redactFsError(error)}`])
+    }
+    if (!info.isDirectory()) {
+      throw new GitSecretHistoryError([`Git metadata scan failed (worktrees): unexpected entry ${entry.name}`])
+    }
+    if (adminDir !== gitDir) gitDirs.add(adminDir)
+  }
+  return [...gitDirs]
+}
+
+// Collects every oid pinned by a top-level root ref across the caller's own worktree AND every other
+// one (each worktree owns its own root-ref files under its gitdir, so a non-commit pinned only there
+// must be probed too). The caller keeps its gitArgs so the .gitstore --git-dir/--work-tree layout
+// still resolves; other worktrees are probed through their gitdir via `--git-dir` so a deleted working
+// dir cannot break the probe.
 //
 // Enumeration is exhaustive rather than a fixed allowlist: `for-each-ref --include-root-refs` lists
 // ALL root refs Git recognizes — including arbitrary `*_HEAD`-style ones like CUSTOM_HEAD — so no
@@ -132,11 +194,11 @@ async function scanNonCommitRefRoots(agentDir: string, gitArgs: readonly string[
 async function collectRootRefOids(
   agentDir: string,
   gitArgs: readonly string[],
-  linkedWorktrees: readonly string[],
+  otherGitDirs: readonly string[],
 ): Promise<string[]> {
   const probes: { cwd: string; args: readonly string[] }[] = [
     { cwd: agentDir, args: gitArgs },
-    ...linkedWorktrees.map((path) => ({ cwd: path, args: [] as readonly string[] })),
+    ...otherGitDirs.map((gitDir) => ({ cwd: agentDir, args: [`--git-dir=${gitDir}`] as readonly string[] })),
   ]
   const oids: string[] = []
   for (const probe of probes) {
@@ -368,4 +430,9 @@ async function tryGit(
 function redactGitError(stderr: string): string {
   const firstLine = stderr.split(/\r?\n/, 1)[0]?.trim()
   return firstLine === undefined || firstLine === '' ? 'unknown Git error' : firstLine.slice(0, 200)
+}
+
+function redactFsError(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code
+  return code !== undefined && code !== '' ? code : 'unknown filesystem error'
 }

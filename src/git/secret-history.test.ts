@@ -350,6 +350,52 @@ describe('canonical Git secret history guard', () => {
     await expect(assertNoCanonicalSecretsInGit(worktree)).resolves.toBeUndefined()
   })
 
+  test("detects a canonical secret staged in the main worktree's index when scanning from a linked worktree", async () => {
+    // The main worktree's private index lives in the common gitdir, NOT under `worktrees/`, so a scan
+    // initiated from a linked checkout must probe the common gitdir too or it would miss a secret
+    // staged in the main index.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    const worktree = `${repo}-linked-caller-index`
+    roots.push(worktree)
+    await git(repo, 'worktree', 'add', worktree)
+
+    await writeFile(join(repo, 'secrets.json'), '{"credential":"placeholder"}')
+    await git(repo, 'add', 'secrets.json')
+
+    expect(await scanCanonicalSecretsInGit(worktree)).toEqual({ ok: false, paths: ['secrets.json'] })
+  })
+
+  test("rejects a non-commit pinned by the main worktree's FETCH_HEAD when scanning from a linked worktree", async () => {
+    // The main worktree's private FETCH_HEAD lives in the common gitdir; scanning from a linked
+    // checkout must probe it or a non-commit it pins would go unseen.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    const worktree = `${repo}-linked-caller-fetchhead`
+    roots.push(worktree)
+    await git(repo, 'worktree', 'add', worktree)
+
+    const blob = await gitStdin(repo, 'notes', 'hash-object', '-w', '--stdin')
+    const tree = await gitStdin(repo, `100644 blob ${blob}\tNOTES.md\n`, 'mktree')
+    const tag = await gitStdin(
+      repo,
+      `object ${tree}\ntype tree\ntag treetag\ntagger t <test@example.com> 0 +0000\n\nx\n`,
+      'hash-object',
+      '-w',
+      '-t',
+      'tag',
+      '--stdin',
+    )
+    const mainFetchHead = await gitOutput(repo, 'rev-parse', '--git-path', 'FETCH_HEAD')
+    const fetchHeadPath = isAbsolute(mainFetchHead) ? mainFetchHead : join(repo, mainFetchHead)
+    await writeFile(fetchHeadPath, `${tag}\t\tbranch x of somewhere\n`)
+
+    expect(await scanCanonicalSecretsInGit(worktree)).toEqual({
+      ok: false,
+      paths: ['unattributable dangling Git objects'],
+    })
+  })
+
   test("rejects a non-commit pinned only by a linked worktree's FETCH_HEAD, scanning from the main worktree", async () => {
     const repo = await makeRepo()
     await commitFile(repo, 'README.md', 'safe')
@@ -378,6 +424,102 @@ describe('canonical Git secret history guard', () => {
       ok: false,
       paths: ['unattributable dangling Git objects'],
     })
+  })
+
+  test('allows a prunable linked worktree with a commit-only HEAD whose working directory was deleted', async () => {
+    // Real-world regression: a subagent added a worktree under /tmp, then /tmp reaped the directory.
+    // `worktree list` still lists it as prunable, so the old path-based probe (`git -C <gone path>`)
+    // failed "cannot change to '<path>'" and bricked the whole scan closed. A commit-only HEAD hides
+    // nothing, so it must now be allowed rather than failing closed on the deleted working dir.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    const worktree = `${repo}-prunable`
+    await git(repo, 'worktree', 'add', worktree)
+    await rm(worktree, { recursive: true, force: true })
+
+    const listing = await gitOutput(repo, 'worktree', 'list', '--porcelain')
+    expect(listing).toContain('prunable')
+    await expect(assertNoCanonicalSecretsInGit(repo)).resolves.toBeUndefined()
+  })
+
+  test("rejects a non-commit pinned by a prunable worktree's FETCH_HEAD after its working dir is deleted", async () => {
+    // The concealment path Oracle flagged: a prunable worktree's per-worktree FETCH_HEAD can pin a
+    // tag peeling to a tree that `fsck`/`rev-list` deliberately ignore, so the admin-gitdir probe is
+    // the only signal. It must survive the deleted working dir and still block.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    const worktree = `${repo}-prunable-fetchhead`
+    await git(repo, 'worktree', 'add', worktree)
+    const adminDir = await worktreeAdminDir(repo, worktree)
+
+    const blob = await gitStdin(repo, '{"credential":"placeholder"}', 'hash-object', '-w', '--stdin')
+    const tree = await gitStdin(repo, `100644 blob ${blob}\tsecrets.json\n`, 'mktree')
+    const tag = await gitStdin(
+      repo,
+      `object ${tree}\ntype tree\ntag treetag\ntagger t <test@example.com> 0 +0000\n\nx\n`,
+      'hash-object',
+      '-w',
+      '-t',
+      'tag',
+      '--stdin',
+    )
+    await writeFile(join(adminDir, 'FETCH_HEAD'), `${tag}\t\tbranch x of somewhere\n`)
+    await rm(worktree, { recursive: true, force: true })
+
+    expect(await scanCanonicalSecretsInGit(repo)).toEqual({
+      ok: false,
+      paths: ['unattributable dangling Git objects'],
+    })
+  })
+
+  test("detects a canonical secret staged in a prunable worktree's retained index", async () => {
+    // The second concealment path Oracle flagged: a linked worktree's own index keeps a staged
+    // canonical blob reachable while remaining invisible to the main index and to `fsck`, even after
+    // the working dir is deleted. The per-worktree index must be scanned via its admin gitdir.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    const worktree = `${repo}-prunable-index`
+    await git(repo, 'worktree', 'add', worktree)
+    const adminDir = await worktreeAdminDir(repo, worktree)
+
+    await writeFile(join(worktree, 'secrets.json'), '{"credential":"placeholder"}')
+    await git(worktree, 'add', 'secrets.json')
+    const staged = await gitOutput(repo, `--git-dir=${adminDir}`, 'ls-files', '--cached')
+    expect(staged).toContain('secrets.json')
+    await rm(worktree, { recursive: true, force: true })
+
+    expect(await scanCanonicalSecretsInGit(repo)).toEqual({ ok: false, paths: ['secrets.json'] })
+  })
+
+  // Skipped on Windows: `chmod 0o000` does not remove directory read permission there, so `readdir`
+  // still succeeds and the unreadable-directory path this test exercises never triggers.
+  test.skipIf(isWindows())('fails closed when the worktrees admin directory cannot be enumerated', async () => {
+    // A permission/IO failure on `worktrees/` means the scan cannot prove no linked worktree hides a
+    // secret, so it must block rather than silently skip every per-worktree ref store and index.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    await git(repo, 'worktree', 'add', `${repo}-wt`)
+    roots.push(`${repo}-wt`)
+    const worktreesDir = join(repo, '.git', 'worktrees')
+    await chmod(worktreesDir, 0o000)
+
+    try {
+      await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow(GitSecretHistoryError)
+    } finally {
+      await chmod(worktreesDir, 0o755)
+    }
+  })
+
+  test('fails closed on an unexpected non-directory entry under the worktrees admin directory', async () => {
+    // The scanner treats Git metadata as adversarial; an entry under `worktrees/` that is not a valid
+    // admin directory cannot be classified and must block rather than be silently ignored.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    await git(repo, 'worktree', 'add', `${repo}-wt`)
+    roots.push(`${repo}-wt`)
+    await writeFile(join(repo, '.git', 'worktrees', 'stray-file'), 'not a worktree admin dir')
+
+    await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow(GitSecretHistoryError)
   })
 
   test('rejects an arbitrary unlisted root ref (CUSTOM_HEAD) whose tag peels to a tree', async () => {
@@ -483,6 +625,14 @@ async function resolveGitBinary(): Promise<string> {
   const stdout = await new Response(proc.stdout).text()
   if ((await proc.exited) !== 0) throw new Error('git binary not found')
   return stdout.trim()
+}
+
+async function worktreeAdminDir(repo: string, worktree: string): Promise<string> {
+  const commonDir = await gitOutput(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+  const gitFile = await Bun.file(join(worktree, '.git')).text()
+  const id = gitFile.replace('gitdir:', '').trim().split('/worktrees/')[1]?.split('/')[0]
+  if (id === undefined) throw new Error('could not resolve worktree admin dir')
+  return join(commonDir, 'worktrees', id)
 }
 
 async function makeRepo(): Promise<string> {
