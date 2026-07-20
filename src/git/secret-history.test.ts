@@ -1,20 +1,14 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { appendFile, chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
 
 import { isWindows } from '@/shared'
 
-import {
-  GitSecretHistoryError,
-  assertNoCanonicalSecretsInGit,
-  resetGitSecretHistoryCacheForTests,
-  scanCanonicalSecretsInGit,
-} from './secret-history'
+import { GitSecretHistoryError, assertNoCanonicalSecretsInGit, scanCanonicalSecretsInGit } from './secret-history'
 
 let roots: string[] = []
 
-beforeEach(() => resetGitSecretHistoryCacheForTests())
 afterEach(async () => {
   await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })))
   roots = []
@@ -579,14 +573,30 @@ describe('canonical Git secret history guard', () => {
     await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow(GitSecretHistoryError)
   })
 
-  test('caches contamination fail-closed for the process lifetime', async () => {
+  test('lifts the block on the next call once the operator purges the contaminated history', async () => {
+    // The guard runs before every bash call and must re-scan the live repo, not latch a verdict: a
+    // cached failure trapped bash until process restart even after the prescribed purge, and the
+    // remediation itself runs through the blocked bash. A real purge rewinds past the secret commit
+    // then expires reflogs and prunes, so the offending objects are unreachable AND deleted — the
+    // full path a ref/index-only cache signature would miss.
     const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
     await commitFile(repo, 'secrets.json', '{"token":"example-placeholder"}')
-    await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow()
-    await git(repo, 'rm', 'secrets.json')
-    await git(repo, 'commit', '-m', 'remove example credential')
+    await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow(GitSecretHistoryError)
+
+    await git(repo, 'reset', '--hard', 'HEAD^')
     await git(repo, 'reflog', 'expire', '--expire=now', '--all')
     await git(repo, 'gc', '--prune=now')
+
+    await expect(assertNoCanonicalSecretsInGit(repo)).resolves.toBeUndefined()
+  })
+
+  test('re-detects contamination introduced after an earlier clean scan', async () => {
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    await expect(assertNoCanonicalSecretsInGit(repo)).resolves.toBeUndefined()
+
+    await commitFile(repo, 'auth.json', '{"credential":"placeholder"}')
 
     await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow(GitSecretHistoryError)
   })

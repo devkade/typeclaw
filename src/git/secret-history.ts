@@ -9,15 +9,13 @@ import { resolveAgentGit } from './resolve-agent-git'
 
 type ScanResult = { ok: true } | { ok: false; paths: string[] }
 
-const contaminatedCache = new Map<string, string[]>()
-
 export class GitSecretHistoryError extends Error {
   constructor(paths: readonly string[]) {
     super(
       [
         `Model-driven Git/bash is disabled because Git metadata is contaminated or can conceal objects: ${paths.join(', ')}.`,
         'Assume credentials in the repository were exposed and rotate them first. Purge canonical secret paths and every refs/replace entry, expire all reflogs, and run Git garbage collection to remove unreachable objects before retrying.',
-        'Suggested operator sequence: rewrite/purge the affected history and replacement refs, run `git reflog expire --expire=now --all`, then `git gc --prune=now`, and restart TypeClaw before retrying.',
+        'Suggested operator sequence: rewrite/purge the affected history and replacement refs, run `git reflog expire --expire=now --all`, then `git gc --prune=now`; the next bash call re-scans and lifts the block automatically once the repository is clean.',
         'TypeClaw inspects path names and object reachability without reading blob contents. Reachable, reflog-referenced, and unreachable commits are path-attributable via their root tree and block only when a canonical secret path is present; standalone dangling trees and blobs are not path-attributable and are ignored; a live ref, worktree HEAD, or pseudoref (including FETCH_HEAD) pointing at a non-commit still fails closed.',
       ].join(' '),
     )
@@ -25,15 +23,13 @@ export class GitSecretHistoryError extends Error {
   }
 }
 
+// Never cache the verdict. A cached failure trapped bash until process restart even after the
+// operator purged the history the error prescribes purging; a cached success would silently bypass
+// the guard after a new secret appears. The clean path is uncached either way, so re-scanning every
+// call costs nothing on success and correctly re-checks the repo while blocked.
 export async function assertNoCanonicalSecretsInGit(agentDir: string): Promise<void> {
-  const contaminated = contaminatedCache.get(agentDir)
-  if (contaminated !== undefined) throw new GitSecretHistoryError(contaminated)
-
   const scan = await scanCanonicalSecretsInGit(agentDir)
-  if (!scan.ok) {
-    contaminatedCache.set(agentDir, scan.paths)
-    throw new GitSecretHistoryError(scan.paths)
-  }
+  if (!scan.ok) throw new GitSecretHistoryError(scan.paths)
 }
 
 export async function scanCanonicalSecretsInGit(agentDir: string): Promise<ScanResult> {
@@ -354,10 +350,6 @@ function decodeGitPath(raw: string): string {
     bytes.push(...encoder.encode(next))
   }
   return new TextDecoder().decode(Uint8Array.from(bytes))
-}
-
-export function resetGitSecretHistoryCacheForTests(): void {
-  contaminatedCache.clear()
 }
 
 function matchingCanonicalPaths(paths: readonly string[]): string[] {
