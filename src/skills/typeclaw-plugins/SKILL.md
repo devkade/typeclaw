@@ -204,6 +204,43 @@ tools: {
 - `ToolContext` is **stripped down** to `{ signal, sessionId, agentDir, logger }`. It does NOT expose the engine's `ExtensionContext`. If your tool wants `read`/`bash`/etc., it cannot call them — declare a subagent with `tools: [readTool, ...]` instead.
 - `ToolResult.content` uses TypeClaw's `ContentPart` union: `{ type: 'text'; text }` or `{ type: 'image'; mimeType; data }`.
 
+#### Declare every filesystem operand
+
+Tools that accept local paths must declare them with `fileOperands`. Entries are dotted argument paths; array indexes are omitted, so `attachments.path` covers every `args.attachments[].path`.
+
+```ts
+defineTool({
+  description: 'Transform a local file.',
+  parameters: z.object({
+    source: z.string(),
+    destination: z.string(),
+    newArtifact: z.string(),
+    removeAfterward: z.string().optional(),
+    remoteObjectId: z.string(),
+  }),
+  fileOperands: {
+    input: ['source'],
+    output: ['destination'],
+    create: ['newArtifact'],
+    destructive: ['removeAfterward'],
+    nonFile: ['remoteObjectId'],
+  },
+  async execute(args, toolCtx) {
+    // ...
+  },
+})
+```
+
+- `input` — a local file or directory the tool reads. TypeClaw authorizes it and executes the tool against a bounded immutable snapshot.
+- `output` — a local destination the tool creates or replaces. TypeClaw authorizes and descriptor-anchors it before dispatch, atomically reserving a missing target as a single-link regular file. Write the rewritten path passed to `execute`; the tool does not need to anchor it again.
+- `create` — a local destination that must not exist. TypeClaw verifies absence and descriptor-anchors the parent; create the rewritten path with `O_CREAT | O_EXCL`. Cleanup verifies the new file is a single-link regular file under that anchored parent.
+- `destructive` — a local path the tool deletes, moves, or otherwise mutates destructively. It is not treated as an input; the destructive primitive remains responsible for authorization and anchoring.
+- `nonFile` — a remote identifier or control token that is never dereferenced locally. Use this narrowly, even when the value looks path-like or collides with an existing agent entry; never place a possible local input here.
+
+The categories may be combined in one tool. TypeClaw snapshots declared inputs and anchors declared output/create destinations before dispatch, restores destination and input paths in inverse order in the result, and releases those resources in reverse order. If either setup phase fails, resources acquired by the earlier phase are cleaned before the error propagates.
+
+The boundary is fail-closed: declare **every** argument path that can carry a local filesystem operand. Undeclared filesystem-capable strings can be rejected before `execute`, including explicit paths, file-shaped keys, canonical credential names, and values that resolve to existing entries. Existing-local detection runs before semantic exemptions. A `file:` URI explicitly opts an otherwise undeclared value into input authorization and snapshotting, but it is not a substitute for a stable `fileOperands.input` contract.
+
 ### 5.2 `subagents` — declarative
 
 ```ts
