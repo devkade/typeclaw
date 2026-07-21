@@ -62,7 +62,7 @@ export type GithubAdapterOptions = {
   // Test-only: replaces the wall-clock sleep used for the registration
   // delay above. Production leaves it undefined and we use `setTimeout`.
   sleep?: (ms: number) => Promise<void>
-  // How often to proactively refresh the token and update GH_TOKEN
+  // How often to proactively refresh a PAT and update GH_TOKEN
   // when the adapter is running but has not made an outbound API call
   // recently. Zero disables the background refresh entirely.
   // Default: 30 minutes.
@@ -80,9 +80,9 @@ export type GithubAdapterOptions = {
   // re-run (the start() pass still fires). Default: 30 min.
   reconcileIntervalMs?: number
   // Write-side of the GithubTokenBridge. On App-auth start the adapter
-  // registers a per-repo minter here so plugin hooks can resolve a token for
-  // ad-hoc `gh` commands; it unregisters on stop and on start rollback. PAT
-  // auth does not register (the seeded GH_TOKEN already covers every repo a
+  // registers a per-repo minter here so runtime consumers can resolve a token
+  // for validated `gh` commands and backup; it unregisters on stop. PAT auth
+  // does not register (the seeded GH_TOKEN already covers every repo a
   // classic PAT can reach, and a fine-grained PAT cannot be re-minted per repo).
   githubTokenBridge?: GithubTokenBridge
 }
@@ -145,8 +145,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   // Repo/owner-aware token resolver. A single GitHub App can span multiple
   // installations (one per owner); each consumer passes its repo/owner so the
   // right installation token is minted. Unlike the old single-token path, this
-  // does NOT mutate process.env.GH_TOKEN — that global is seeded separately and
-  // only when exactly one installation applies (see seedGhTokenIfSingle).
+  // does NOT mutate process.env.GH_TOKEN. App credentials stay behind this
+  // repo-scoped resolver instead of entering the ambient process environment.
   const authToken = (context?: GithubAuthContext) => auth.token(context)
   const outbound = createGithubOutboundCallback({
     token: authToken,
@@ -264,20 +264,17 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         options.router.unregisterReviewSubmitter('github', reviewSubmitter)
         options.router.unregisterFetchAttachment('github', fetchAttachment)
         await auth.dispose()
-        delete process.env.GH_TOKEN
+        if (options.secrets.auth.type === 'pat') delete process.env.GH_TOKEN
         selfId = null
         selfLogin = null
         throw err
       }
       started = true
-      // Seed the process-wide GH_TOKEN when it's unambiguous; skip otherwise.
-      // See ghTokenSeedDecision for why one owner is required. On skip, authToken
-      // still resolves a repo-scoped token per call for the adapter's own traffic.
-      const seed = ghTokenSeedDecision(options.secrets.auth.type, options.configRef().repos ?? [])
-      if (seed.kind === 'seed') {
-        const seedContext = seed.context
+      // PAT mode retains its process-wide token behavior. App credentials never
+      // enter process.env; App consumers mint through the repo-scoped bridge.
+      if (options.secrets.auth.type === 'pat') {
         const seedGhToken = async (): Promise<void> => {
-          process.env.GH_TOKEN = await auth.token(seedContext)
+          process.env.GH_TOKEN = await auth.token()
         }
         await seedGhToken()
         const tokenRefreshIntervalMs = options.tokenRefreshIntervalMs ?? DEFAULT_TOKEN_REFRESH_INTERVAL_MS
@@ -291,10 +288,6 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
           }
           tokenRefreshTimer = setIntervalFn(refresh, tokenRefreshIntervalMs)
         }
-      } else {
-        logger.info(
-          `${GH_TOKEN_SKIP_LOG[seed.reason]} Ad-hoc \`gh\` commands should set a repo-scoped token explicitly.`,
-        )
       }
       if (options.secrets.auth.type === 'app' && options.githubTokenBridge !== undefined) {
         // Gate ad-hoc `gh` minting on the configured repos[]. The slug arrives
@@ -483,7 +476,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         unregisterTokenBridge = null
       }
       await auth.dispose()
-      delete process.env.GH_TOKEN
+      if (options.secrets.auth.type === 'pat') delete process.env.GH_TOKEN
       server = null
       selfId = null
       selfLogin = null
@@ -616,35 +609,6 @@ function logDeregistrationOutcome(
     else if (h.action === 'missing') logger.info(`[github] webhook ${h.hookId} on ${h.repo} already gone`)
     else logger.warn(`[github] webhook detach failed for ${h.repo}#${h.hookId}: ${h.error ?? 'unknown error'}`)
   }
-}
-
-type GhTokenSeedDecision =
-  | { kind: 'seed'; context?: GithubAuthContext }
-  | { kind: 'skip'; reason: 'no-repos' | 'multiple-owners' }
-
-const GH_TOKEN_SKIP_LOG: Record<'no-repos' | 'multiple-owners', string> = {
-  'no-repos':
-    '[github] no repos[] configured; GH_TOKEN not seeded globally (cannot prove which App installation to use).',
-  'multiple-owners': '[github] repos span multiple owners (multiple App installations); GH_TOKEN not seeded globally.',
-}
-
-// Decides how to seed the process-wide GH_TOKEN. PATs aren't installation-scoped
-// (seed context-free). For App auth we seed from a configured repo slug, which
-// resolves the installation via repos/{owner}/{repo}/installation — the only
-// lookup that works for both org- and user-owned repos. One owner is required:
-// no-repos can't prove an installation, multi-owner needs >1 token.
-function ghTokenSeedDecision(authType: 'pat' | 'app', repos: readonly string[]): GhTokenSeedDecision {
-  if (authType === 'pat') return { kind: 'seed' }
-  const slugs = [...new Set(repos.filter(isWellFormedSlug))].sort()
-  if (slugs.length === 0) return { kind: 'skip', reason: 'no-repos' }
-  const owners = new Set(slugs.map((slug) => slug.split('/')[0]))
-  if (owners.size > 1) return { kind: 'skip', reason: 'multiple-owners' }
-  return { kind: 'seed', context: { repoSlug: slugs[0] } }
-}
-
-function isWellFormedSlug(repo: string): boolean {
-  const [owner, name, ...rest] = repo.split('/')
-  return owner !== undefined && owner !== '' && name !== undefined && name !== '' && rest.length === 0
 }
 
 // Canonical form for repos[] allowlist comparison so the gate can't be bypassed

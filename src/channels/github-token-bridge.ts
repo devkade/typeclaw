@@ -11,9 +11,8 @@ export type GithubTokenBridge = {
   resolveTokenForRepo: ResolveGithubTokenForRepo
   // True when a per-repo App-token minter is registered (only the GitHub App
   // adapter registers one). This is the non-secret "App auth with per-repo
-  // minting is available" signal: it stays true for multi-owner / no-repos App
-  // configs where the process-wide GH_TOKEN is intentionally NOT seeded, so the
-  // git/gh mint paths can no longer rely on GH_TOKEN's prefix to detect App auth.
+  // minting is available" signal. App credentials are never seeded into the
+  // process-wide GH_TOKEN, so brokered gh paths cannot rely on its prefix.
   hasAppTokenResolver: () => boolean
   getAppSelfLogin: () => string | null
   registerResolver: (resolver: (repoSlug: string) => Promise<string>, selfLogin?: () => string | null) => () => void
