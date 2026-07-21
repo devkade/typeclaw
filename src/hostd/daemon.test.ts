@@ -546,14 +546,17 @@ describe('startDaemon', () => {
       const url = `http://127.0.0.1:${(info.result as HttpInfoResult).port}`
       await send({ kind: 'register', containerName: 'coder', cwd: agentDir, restartToken: 'secret' })
 
+      // Bumped off sendHttp's 3s default: under an oversubscribed CI runner the
+      // starved event loop can abort a still-in-flight serialized patch,
+      // spuriously failing the ok-every-reply assertion below.
       const replies = await Promise.all([
         sendHttp(
           { kind: 'secrets-patch', containerName: 'coder', patch: { channels: { kakaotalk: kakaoBlock('user-1') } } },
-          { url, token: 'secret' },
+          { url, token: 'secret', timeoutMs: 30_000 },
         ),
         sendHttp(
           { kind: 'secrets-patch', containerName: 'coder', patch: { channels: { kakaotalk: kakaoBlock('user-2') } } },
-          { url, token: 'secret' },
+          { url, token: 'secret', timeoutMs: 30_000 },
         ),
       ])
 
