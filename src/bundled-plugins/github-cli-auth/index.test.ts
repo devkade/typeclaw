@@ -1204,16 +1204,37 @@ describe('github-cli-auth plugin — git path', () => {
     expect(env.GIT_TERMINAL_PROMPT).toBe('0')
   })
 
-  test('composition blocks before minting (no sibling inherits the token env)', async () => {
+  test('non-git composition still blocks before minting (only clone-then-inspect is rewritten)', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const hook = await hookFor(tokenResolver('ghs_minted'))
-    const event = bashEvent('git clone https://github.com/acme/widgets.git && cat .env')
+    const event = bashEvent('git fetch https://github.com/acme/widgets.git main && cat .env')
 
     const result = await hook(event, hookCtx)
 
     expect(result).toMatchObject({ block: true })
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
     expect(JSON.stringify(event.args.command)).not.toContain('ghs_minted')
+  })
+
+  test('clone-then-inspect mints for the clone and re-execs the tail token-stripped', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('git clone https://github.com/acme/widgets.git /tmp/x && cat /tmp/x/README.md')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    const env = gitEnv(event)
+    expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+    const command = event.args.command as string
+    // The tail is re-exec'd under an env-strip that unsets EVERY key this overlay
+    // injects — otherwise the tail's shell would inherit the git token.
+    for (const key of Object.keys(env)) {
+      expect(command).toContain(`-u ${key}`)
+    }
+    expect(command).toContain("/bin/bash -c 'cat /tmp/x/README.md'")
+    // The secret never reaches the command string.
+    expect(command).not.toContain('ghs_minted')
   })
 
   test('multi-owner git blocks rather than minting a single-repo token', async () => {

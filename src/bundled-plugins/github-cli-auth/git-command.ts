@@ -82,6 +82,20 @@ const FETCH_ALL_REASON =
   'cannot be enumerated safely here — a minted token scoped to one remote could ' +
   'be sent to another. Fetch a specific remote instead.'
 
+// The exec prefix a `clone && <tail>` tail is re-executed under. Every key here
+// MUST mirror the overlay index.ts injects for a token-bearing git (the two
+// secrets TYPECLAW_GIT_TOKEN/GIT_ASKPASS, the operator PATs GH_TOKEN/GITHUB_TOKEN
+// that live in bash env, and the forced GIT_CONFIG_* + GIT_TERMINAL_PROMPT) so
+// the fresh tokenless shell inherits none of them. Absolute `/usr/bin/env` and
+// `/bin/bash` so a PATH-shadowed shim cannot defeat the strip; a missing binary
+// exits non-zero, failing closed. Drift here is a token leak — keep in lockstep
+// with index.ts's git overlay (guarded by a test in index.test.ts).
+const TAIL_STRIP_PREFIX =
+  'exec /usr/bin/env -u TYPECLAW_GIT_TOKEN -u GIT_ASKPASS -u GH_TOKEN -u GITHUB_TOKEN ' +
+  '-u GIT_TERMINAL_PROMPT -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 ' +
+  '-u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 -u GIT_CONFIG_KEY_2 -u GIT_CONFIG_VALUE_2 ' +
+  '-u GIT_CONFIG_KEY_3 -u GIT_CONFIG_VALUE_3 /bin/bash -c'
+
 // OUTSIDE single quotes these spawn a sibling process (which would inherit the
 // askpass token) or expand shell state. `$`/backtick stay active inside double
 // quotes too, so they are screened separately. Mirrors gh-command.ts.
@@ -98,6 +112,9 @@ export async function analyzeGitCommand(
   const stripped = stripSafeCdPrefix(command)
   if (stripped.unsafe) return { kind: 'pass-through' }
   if (stripped.cdDir !== null) return analyzeSingleCdGit(stripped, options)
+
+  const cloneThenInspect = await analyzeCloneThenInspect(command, options)
+  if (cloneThenInspect !== null) return cloneThenInspect
 
   // Split the command into `&&`-joined git segments. null = not a pure
   // git-only `&&` chain (a non-git segment, a forbidden shell operator, a
@@ -199,6 +216,89 @@ async function analyzeSingleCdGit(
     return { kind: 'block', reason: COMPOSITION_REASON }
   }
   return { kind: 'inject', repoSlug, rewrittenCommand: rewriteCdToDashC(effectiveCwd, stripped.rest) }
+}
+
+// The `git clone <url> <dir> && <tail>` shape: acquire a repo, then inspect it.
+// A naive `env -u TOKEN <tail>` is UNSOUND — shell substitution in the tail runs
+// in the still-token-bearing parent shell before `env`, and a stripped child can
+// still read the parent's env via /proc/$PPID/environ. So instead the git head
+// runs first (token reaches only the clone), then `exec` REPLACES the token-
+// bearing shell with `/usr/bin/env -u <keys> /bin/bash -c '<tail>'`: exec removes
+// that /proc target, the unset drops every injected key, and the tail rides as an
+// opaque single-quoted argument the fresh tokenless shell alone parses/expands.
+// Scoped to `clone` (the op that creates the tree to inspect); fetch/pull/push
+// stay on the single-bare path. Returns null when the shape does not match, so
+// the caller falls through to the normal chain analysis (which blocks or passes).
+async function analyzeCloneThenInspect(
+  command: string,
+  options: { cwd: string; resolvers: GitResolvers },
+): Promise<GitCommandDecision | null> {
+  const split = splitCloneHeadAndTail(command)
+  if (split === null) return null
+  const { head, tail } = split
+  if (tail === '') return { kind: 'block', reason: COMPOSITION_REASON }
+
+  // A git in the tail is NOT inspection — it either wants the token (so it must
+  // ride the single-bare path or an explicit `git -C`) or is an exfil sibling.
+  // Fall through so the strict chain analysis keeps its existing block/pass rules
+  // for every `clone && git …` shape.
+  if (containsGitInvocation(tail)) return null
+
+  const invocation = extractSingleGitInvocation(head)
+  if (invocation === null) return null
+  if (findSubcommand(invocation.args) !== 'clone') return null
+  if (invocation.hasLeadingEnvAssignment || hasDangerousGitConfig(invocation.args)) {
+    return { kind: 'block', reason: DANGEROUS_CONFIG_REASON }
+  }
+  if (containsShellActiveMetachar(head)) return { kind: 'block', reason: COMPOSITION_REASON }
+
+  let slugs: string[]
+  try {
+    slugs = await resolveRepoSlugs('clone', invocation.args, options.cwd, options.resolvers)
+  } catch {
+    return { kind: 'pass-through' }
+  }
+  if (slugs.length === 0) return { kind: 'pass-through' }
+  if (new Set(slugs).size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
+
+  return {
+    kind: 'inject',
+    repoSlug: slugs[0] as string,
+    rewrittenCommand: `${head.trimEnd()} && ${TAIL_STRIP_PREFIX} ${posixSingleQuote(tail)}`,
+  }
+}
+
+// Splits on the FIRST top-level `&&`, quote-aware. Rejects (null) when any other
+// top-level operator (`;`, `|`, `||`, single `&`, newline) precedes it — those
+// don't guarantee the clone finished before the tail, so the token could still be
+// live in a concurrent sibling. head keeps the raw text up to the `&&`; tail is
+// everything after, treated as opaque.
+function splitCloneHeadAndTail(command: string): { head: string; tail: string } | null {
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i] as string
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    if (ch === '&' && command[i + 1] === '&') {
+      return { head: command.slice(0, i), tail: command.slice(i + 2).trim() }
+    }
+    if (ch === ';' || ch === '|' || ch === '&' || ch === '\n' || ch === '\r') return null
+  }
+  return null
+}
+
+// Wraps a string in single quotes with POSIX-safe escaping: each embedded single
+// quote becomes '\'' (close-quote, escaped literal quote, reopen). The result is
+// inert — no shell metacharacter inside can act — so the tail cannot break out of
+// the `bash -c` argument.
+function posixSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
 }
 
 // Global flags that can redirect git's auth or destination. `-c`/`--config-env`
