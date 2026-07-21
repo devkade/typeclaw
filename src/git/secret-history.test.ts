@@ -30,13 +30,9 @@ describe('canonical Git secret history guard', () => {
     expect(await scanCanonicalSecretsInGit(repo)).toEqual({ ok: false, paths: ['secrets.json'] })
   })
 
-  test('allows a .env reachable in history because its values are already exposed to model bash', async () => {
-    // Per the expose-to-agent policy (PR #1244) every declared `.env` var is inherited into model
-    // bash, so recovering a historical `.env` via `git show` discloses nothing the operator did not
-    // already hand the agent — blocking all git/bash over it is pure disruption. secrets.json stays
-    // blocking (never inherited). The live-file mask still covers `.env`; only the history scan skips it.
+  test('allows a .env reachable in history because knowing values does not grant runtime policy authority', async () => {
     const repo = await makeRepo()
-    await commitFile(repo, '.env', 'EXAMPLE_TOKEN=placeholder')
+    await commitFile(repo, '.env', 'TYPECLAW_MODEL_HTTP_ALLOW_INTERNAL_HOSTS=private.corp')
     await rm(join(repo, '.env'))
     await git(repo, 'add', '.env')
     await git(repo, 'commit', '-m', 'remove env')

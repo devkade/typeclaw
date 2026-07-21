@@ -1,7 +1,16 @@
 import { isIP } from 'node:net'
 
+import {
+  addressMatchesPolicy,
+  extractEmbeddedIpv4Address,
+  extractRfc6052Ipv4Addresses,
+  getBootInternalDestinationPolicy,
+  hostnameMatchesPolicy,
+  type InternalDestinationPolicy,
+} from '@/network/internal-destinations'
+
 import type { SecuritySeverity } from '../permissions'
-import { ACKNOWLEDGE_GUARDS, type SecurityBlock, isGuardAcknowledged } from '../policy'
+import type { SecurityBlock } from '../policy'
 
 export const GUARD_SSRF = 'ssrf'
 // Classified `medium` (silent-attack axis): bypass lets `curl
@@ -10,14 +19,13 @@ export const GUARD_SSRF = 'ssrf'
 // Catastrophic on follow-up because the model now has live cloud creds.
 export const GUARD_SSRF_SEVERITY: SecuritySeverity = 'medium'
 
-const ALWAYS_BLOCKED_HOSTS = new Set([
-  'localhost',
-  'localhost.localdomain',
-  'ip6-localhost',
-  'ip6-loopback',
+const ALWAYS_BLOCKED_HOSTS = new Set(['localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback'])
+
+const CLOUD_METADATA_HOSTS = new Set([
   'metadata.google.internal',
   'metadata',
   'metadata.aws.internal',
+  'metadata.azure.internal',
   'instance-data',
   'instance-data.ec2.internal',
 ])
@@ -39,7 +47,7 @@ export type SsrfClassification = {
   reason?: string
 }
 
-export function classifyUrl(rawUrl: string): SsrfClassification {
+export function classifyUrl(rawUrl: string, internalDestinationPolicy?: InternalDestinationPolicy): SsrfClassification {
   let parsed: URL
   try {
     parsed = new URL(rawUrl)
@@ -67,27 +75,48 @@ export function classifyUrl(rawUrl: string): SsrfClassification {
   }
 
   const host = parsed.hostname.toLowerCase()
-  const decoded = decodeBracketedIpv6(host)
+  const decoded = decodeBracketedIpv6(host).replace(/\.$/, '')
+
+  if (isCloudMetadataHostname(decoded)) {
+    return {
+      blocked: true,
+      category: 'cloud_metadata',
+      reason: `cloud metadata hostname "${decoded}" is never allowed`,
+    }
+  }
 
   if (ALWAYS_BLOCKED_HOSTS.has(decoded)) {
-    return {
+    const classification: SsrfClassification = {
       blocked: true,
       category: 'reserved_internal_host',
       reason: `host "${decoded}" resolves to internal/loopback infrastructure`,
     }
+    return internalDestinationPolicy !== undefined &&
+      allowsInternalDestination(decoded, undefined, internalDestinationPolicy)
+      ? { blocked: false }
+      : classification
   }
   for (const suffix of ALWAYS_BLOCKED_HOST_SUFFIXES) {
     if (decoded.endsWith(suffix)) {
-      return {
+      const classification: SsrfClassification = {
         blocked: true,
         category: 'reserved_internal_host',
         reason: `host suffix "${suffix}" is reserved for internal networks`,
       }
+      return internalDestinationPolicy !== undefined &&
+        allowsInternalDestination(decoded, undefined, internalDestinationPolicy)
+        ? { blocked: false }
+        : classification
     }
   }
 
   const addressClassification = classifyIpAddress(decoded)
-  if (addressClassification.blocked) return addressClassification
+  if (addressClassification.blocked) {
+    return internalDestinationPolicy !== undefined &&
+      allowsInternalDestination(decoded, decoded, internalDestinationPolicy)
+      ? { blocked: false }
+      : addressClassification
+  }
 
   return { blocked: false }
 }
@@ -108,6 +137,20 @@ export function classifyIpAddress(address: string): SsrfClassification {
   return { blocked: false }
 }
 
+export function allowsInternalDestination(
+  hostname: string,
+  address: string | undefined,
+  policy: InternalDestinationPolicy,
+): boolean {
+  const normalizedHostname = decodeBracketedIpv6(hostname.toLowerCase()).replace(/\.$/, '')
+  if (isCloudMetadataHostname(normalizedHostname)) return false
+  if (address !== undefined && isCloudMetadataAddress(address)) return false
+  return (
+    hostnameMatchesPolicy(normalizedHostname, policy) ||
+    (address !== undefined && addressMatchesPolicy(address, policy))
+  )
+}
+
 function normalizeIpv6(address: string): string | undefined {
   if (isIP(address) !== 6) return undefined
   try {
@@ -117,14 +160,17 @@ function normalizeIpv6(address: string): string | undefined {
   }
 }
 
-export function checkSsrfGuard(options: { tool: string; args: Record<string, unknown> }): SecurityBlock | undefined {
+export function checkSsrfGuard(options: {
+  tool: string
+  args: Record<string, unknown>
+  internalDestinationPolicy?: InternalDestinationPolicy
+}): SecurityBlock | undefined {
   const { tool, args } = options
   if (tool !== 'web_fetch') return undefined
   const url = args.url
   if (typeof url !== 'string') return undefined
-  if (isGuardAcknowledged(args, GUARD_SSRF)) return undefined
 
-  const result = classifyUrl(url)
+  const result = classifyUrl(url, options.internalDestinationPolicy ?? getBootInternalDestinationPolicy())
   if (!result.blocked) return undefined
 
   return {
@@ -132,7 +178,7 @@ export function checkSsrfGuard(options: { tool: string; args: Record<string, unk
     reason: [
       `Guard \`${GUARD_SSRF}\` blocked web_fetch to a non-public destination (${result.category ?? 'unknown'}): ${result.reason ?? 'classified as internal'}.`,
       'This protects against SSRF, cloud metadata exfiltration, and accidental fetches against internal services.',
-      `If this is genuinely intentional and you trust the URL, retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_SSRF}: true\` in the web_fetch arguments.`,
+      'Intentional internal destinations must be configured by the operator through the boot-only model HTTP environment policy; model-authored acknowledgements cannot bypass this guard.',
     ].join(' '),
   }
 }
@@ -171,6 +217,8 @@ function classifyIpv4(
   ip: [number, number, number, number],
 ): { category: SsrfClassification['category']; reason: string } | undefined {
   const [a, b] = ip
+  if (isCloudMetadataIpv4(ip))
+    return { category: 'cloud_metadata', reason: `cloud metadata endpoint (${ip.join('.')})` }
   if (a === 127) return { category: 'loopback', reason: `IPv4 loopback (${ip.join('.')})` }
   if (a === 10) return { category: 'private_ipv4', reason: `private RFC1918 10.0.0.0/8 (${ip.join('.')})` }
   if (a === 172 && b >= 16 && b <= 31)
@@ -178,7 +226,7 @@ function classifyIpv4(
   if (a === 192 && b === 168)
     return { category: 'private_ipv4', reason: `private RFC1918 192.168.0.0/16 (${ip.join('.')})` }
   if (a === 169 && b === 254)
-    return { category: 'cloud_metadata', reason: `link-local / cloud metadata 169.254.0.0/16 (${ip.join('.')})` }
+    return { category: 'link_local', reason: `IPv4 link-local 169.254.0.0/16 (${ip.join('.')})` }
   if (a === 100 && b >= 64 && b <= 127)
     return { category: 'shared_cgnat', reason: `CGNAT 100.64.0.0/10 (${ip.join('.')})` }
   if (a === 198 && (b === 18 || b === 19))
@@ -190,6 +238,39 @@ function classifyIpv4(
 
 function classifyIpv6(host: string): { category: SsrfClassification['category']; reason: string } | undefined {
   const lower = host.toLowerCase()
+  if (lower === 'fd00:ec2::254' || lower === 'fd20:ce::254') {
+    return { category: 'cloud_metadata', reason: `cloud IPv6 metadata endpoint (${lower})` }
+  }
+  if (lower.startsWith('64:ff9b:1:')) {
+    return {
+      category: 'cloud_metadata',
+      reason: `RFC8215 local-use translation prefix has no safely inferable IPv4 field (${lower})`,
+    }
+  }
+  const internalClassification = classifyInternalIpv6(lower)
+  if (internalClassification !== undefined) {
+    const translatedMetadata = extractRfc6052Ipv4Addresses(lower).find((candidate) => {
+      const ipv4 = parseIpv4Loose(candidate)
+      return ipv4 !== undefined && isCloudMetadataIpv4(ipv4)
+    })
+    if (translatedMetadata !== undefined) {
+      return {
+        category: 'cloud_metadata',
+        reason: `RFC6052 network-specific translation of cloud metadata endpoint (${translatedMetadata})`,
+      }
+    }
+    return internalClassification
+  }
+  const embeddedIpv4 = extractEmbeddedIpv4Address(lower)
+  if (embeddedIpv4 !== undefined) {
+    const parsed = parseIpv4Loose(embeddedIpv4)
+    const cls = parsed === undefined ? undefined : classifyIpv4(parsed)
+    if (cls) return { category: cls.category, reason: `IPv4-embedded IPv6: ${cls.reason}` }
+  }
+  return undefined
+}
+
+function classifyInternalIpv6(lower: string): { category: SsrfClassification['category']; reason: string } | undefined {
   if (lower === '::1' || lower === '0:0:0:0:0:0:0:1') return { category: 'loopback', reason: 'IPv6 loopback ::1' }
   if (lower === '::' || lower === '0:0:0:0:0:0:0:0') return { category: 'unspecified', reason: 'IPv6 unspecified ::' }
   const firstHextet = Number.parseInt(lower.split(':')[0] ?? '', 16)
@@ -200,23 +281,27 @@ function classifyIpv6(host: string): { category: SsrfClassification['category'];
   if (lower.startsWith('fc') || lower.startsWith('fd'))
     return { category: 'ipv6_internal', reason: 'IPv6 unique-local fc00::/7' }
   if (lower.startsWith('ff')) return { category: 'ipv6_internal', reason: 'IPv6 multicast ff00::/8' }
-  if (lower.startsWith('::ffff:')) {
-    const tail = lower.slice('::ffff:'.length)
-    const dotted = parseIpv4Loose(tail)
-    if (dotted) {
-      const cls = classifyIpv4(dotted)
-      if (cls) return { category: cls.category, reason: `IPv4-mapped IPv6: ${cls.reason}` }
-    }
-    const hexPair = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
-    if (hexPair && hexPair[1] && hexPair[2]) {
-      const hi = parseInt(hexPair[1], 16)
-      const lo = parseInt(hexPair[2], 16)
-      if (Number.isFinite(hi) && Number.isFinite(lo)) {
-        const ip: [number, number, number, number] = [(hi >>> 8) & 0xff, hi & 0xff, (lo >>> 8) & 0xff, lo & 0xff]
-        const cls = classifyIpv4(ip)
-        if (cls) return { category: cls.category, reason: `IPv4-mapped IPv6: ${cls.reason}` }
-      }
-    }
-  }
   return undefined
+}
+
+function isCloudMetadataHostname(hostname: string): boolean {
+  return CLOUD_METADATA_HOSTS.has(hostname) || hostname.endsWith('.metadata.google.internal')
+}
+
+function isCloudMetadataAddress(address: string): boolean {
+  return classifyIpAddress(address).category === 'cloud_metadata'
+}
+
+function isCloudMetadataIpv4(ip: [number, number, number, number]): boolean {
+  const value = ip.join('.')
+  return (
+    value === '169.254.169.254' ||
+    value === '169.254.170.2' ||
+    value === '169.254.170.23' ||
+    value === '169.254.0.23' ||
+    value === '169.254.0.24' ||
+    value === '100.100.100.200' ||
+    value === '192.0.0.192' ||
+    value === '168.63.129.16'
+  )
 }

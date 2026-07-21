@@ -33,7 +33,7 @@
 ## Web & research — reads the web like a person
 
 - 🔍 **Live web search & fetch** — pull a page as a readable article, a JSON query, a selected slice, a grep, or raw
-- 🛡️ **Rebinding-safe page fetching** — validates every A/AAAA answer on the socket lookup and every redirect hop; private and mixed-address targets fail closed
+- 🛡️ **Rebinding-safe page fetching** — validates every A/AAAA answer on the socket lookup and every redirect hop; private and mixed-address targets fail closed unless the operator supplies a boot-only, model-hidden application-layer exception, while cloud metadata and control-plane endpoints stay blocked
 - 🌐 **Interactive browser sessions** — drives a browser on live pages, with a dashboard you can step into for logins, 2FA, or CAPTCHA
 
 ## Security — defense-in-depth for risky actions

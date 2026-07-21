@@ -13,6 +13,7 @@ import {
   type PublicHttpRequestOptions,
   type PublicHttpResponse,
 } from '@/agent/network/safe-http'
+import type { InternalDestinationPolicy } from '@/network/internal-destinations'
 
 const SUPPORTED_MIME_TYPES = {
   '.png': 'image/png',
@@ -99,6 +100,7 @@ export async function resolveImagesBounded(
   inputs: ImageInput[],
   signal?: AbortSignal,
   network: LookAtNetworkDependencies = defaultLookAtNetwork,
+  internalDestinationPolicy?: InternalDestinationPolicy,
 ): Promise<ResolvedImage[]> {
   if (inputs.length > LOOK_AT_MAX_IMAGES) {
     throw new Error(`look_at: image count exceeds limit (${inputs.length} > ${LOOK_AT_MAX_IMAGES})`)
@@ -123,7 +125,13 @@ export async function resolveImagesBounded(
     try {
       while (next < inputs.length) {
         const index = next++
-        results[index] = await resolveImage(inputs[index] as ImageInput, workerSignal, budget, network)
+        results[index] = await resolveImage(
+          inputs[index] as ImageInput,
+          workerSignal,
+          budget,
+          network,
+          internalDestinationPolicy,
+        )
       }
     } catch (error) {
       if (!failed) firstError = error
@@ -149,6 +157,7 @@ export async function resolveImage(
   signal?: AbortSignal,
   aggregateBudget?: ImageByteBudget,
   network: LookAtNetworkDependencies = defaultLookAtNetwork,
+  internalDestinationPolicy?: InternalDestinationPolicy,
 ): Promise<ResolvedImage> {
   if (input.kind === 'base64') {
     if (!input.mimeType.startsWith('image/')) {
@@ -207,6 +216,7 @@ export async function resolveImage(
     headers: { Accept: 'image/*' },
     maxRedirects: LOOK_AT_MAX_REDIRECTS,
     dependencies: network,
+    ...(internalDestinationPolicy === undefined ? {} : { internalDestinationPolicy }),
   })
   try {
     if (res.statusCode < 200 || res.statusCode >= 300) {
