@@ -1,6 +1,5 @@
 import { randomBytes } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, rename, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 // A GIT_ASKPASS helper git invokes for username/password prompts. The token
@@ -42,17 +41,24 @@ esac
 // writable+readable — it does NOT need to sit under a sandbox-visible mount. The
 // old default `/usr/local/bin` assumed a root-writable /usr and EACCES'd whenever
 // the runtime ran as a non-root user, breaking the checkout with an opaque
-// permission-denied. A process-private temp dir (mode 0700) under os.tmpdir() is
-// always runtime-writable and keeps the helper out of any model-writable tree
-// (agentDir / session /tmp), so a tool can't plant a script that captures a later
-// runtime-issued token. TYPECLAW_GIT_ASKPASS_PATH still overrides for tests/CI or
-// a future sandbox consumer that binds an exact path in; the override is used
-// verbatim with NO fallback, so an unusable configured path surfaces loudly
-// rather than silently degrading to a path the caller didn't ask for.
+// permission-denied.
+//
+// The base is the FIXED real `/tmp`, NOT `os.tmpdir()`: os.tmpdir() honors
+// TMPDIR/TMP/TEMP, so an env pointing it at a model-writable location (e.g. a
+// workspace path) would let a sandboxed tool replace the cached helper before a
+// later reviewer checkout / backup push executes it UNSANDBOXED with
+// TYPECLAW_GIT_TOKEN in env. bwrap binds a fresh tmpfs over `/tmp` per session
+// (see SESSION_TMP_ROOT), so the runtime's real `/tmp/typeclaw-git-askpass-*` is
+// NOT visible to model bash and cannot be pre-planted. A random `mkdtemp` subdir
+// (mode 0700) keeps the name unpredictable. TYPECLAW_GIT_ASKPASS_PATH remains the
+// trusted operator/CI/sandbox-consumer override, used verbatim with NO fallback
+// so an unusable configured path surfaces loudly.
+const ASKPASS_DIR_BASE = '/tmp/typeclaw-git-askpass-'
+
 let defaultDirPromise: Promise<string> | null = null
 
 function resolveDefaultDir(): Promise<string> {
-  if (defaultDirPromise === null) defaultDirPromise = mkdtemp(join(tmpdir(), 'typeclaw-git-askpass-'))
+  if (defaultDirPromise === null) defaultDirPromise = mkdtemp(ASKPASS_DIR_BASE)
   return defaultDirPromise.catch((err) => {
     defaultDirPromise = null
     throw err

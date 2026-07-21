@@ -49,17 +49,39 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper', () => {
     expect(mode).not.toBe(0)
   })
 
-  test('defaults to a runtime-writable path outside /usr so a read-only /usr does not EACCES', async () => {
-    const original = process.env.TYPECLAW_GIT_ASKPASS_PATH
+  test('defaults under the fixed real /tmp (writable, executable), not read-only /usr', async () => {
+    const originalOverride = process.env.TYPECLAW_GIT_ASKPASS_PATH
     delete process.env.TYPECLAW_GIT_ASKPASS_PATH
     try {
       const path = await ensureGitAskPassHelper()
       expect(path.startsWith('/usr')).toBe(false)
+      expect(path.startsWith('/tmp/typeclaw-git-askpass-')).toBe(true)
       expect((await stat(path)).isFile()).toBe(true)
       expect((await stat(path)).mode & 0o111).not.toBe(0)
     } finally {
-      if (original === undefined) delete process.env.TYPECLAW_GIT_ASKPASS_PATH
-      else process.env.TYPECLAW_GIT_ASKPASS_PATH = original
+      if (originalOverride === undefined) delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+      else process.env.TYPECLAW_GIT_ASKPASS_PATH = originalOverride
+    }
+  })
+
+  test('ignores a model-writable TMPDIR: the default base stays on the fixed real /tmp', async () => {
+    // os.tmpdir() honors TMPDIR/TMP/TEMP; if the default were derived from it, a tool
+    // that controls TMPDIR could plant the helper in a model-writable tree and swap it
+    // before an unsandboxed consumer runs it with TYPECLAW_GIT_TOKEN. The base must be fixed.
+    const originalOverride = process.env.TYPECLAW_GIT_ASKPASS_PATH
+    const originalTmpdir = process.env.TMPDIR
+    delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+    const modelWritable = await mkdtemp(join(tmpdir(), 'model-writable-'))
+    process.env.TMPDIR = modelWritable
+    try {
+      const path = await ensureGitAskPassHelper()
+      expect(path.startsWith(modelWritable)).toBe(false)
+      expect(path.startsWith('/tmp/typeclaw-git-askpass-')).toBe(true)
+    } finally {
+      if (originalOverride === undefined) delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+      else process.env.TYPECLAW_GIT_ASKPASS_PATH = originalOverride
+      if (originalTmpdir === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = originalTmpdir
     }
   })
 
