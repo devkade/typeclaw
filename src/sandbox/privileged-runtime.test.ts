@@ -208,6 +208,19 @@ describe('resolvePrivilegedSandboxRuntime', () => {
     expect(runtime.env.GIT_CONFIG_NOSYSTEM).toBe('1')
   })
 
+  test('supplies sanitized identity for local git stash operations', async () => {
+    const runtime = await resolvePrivilegedSandboxRuntime({
+      agentDir,
+      homeDir: home,
+      env: {},
+      command: 'git stash push',
+    })
+
+    expect(runtime.mounts.some((mount) => mount.type === 'ro-bind')).toBe(true)
+    expect(runtime.env.GIT_CONFIG_GLOBAL).toBe('/tmp/.gitconfig')
+    await cleanupPrivilegedSandboxRuntime(runtime)
+  })
+
   test('removes every generated identity directory across repeated calls', async () => {
     const generated: string[] = []
     for (let i = 0; i < 32; i++) {

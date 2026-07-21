@@ -20,6 +20,7 @@ const SAFE_GIT_SUBCOMMANDS = new Set([
   'restore',
   'rev-parse',
   'show',
+  'stash',
   'status',
   'switch',
   'symbolic-ref',
