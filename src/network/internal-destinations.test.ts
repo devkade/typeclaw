@@ -143,4 +143,53 @@ describe('internal destination exceptions', () => {
       else process.env[MODEL_HTTP_ALLOW_INTERNAL_HOSTS_ENV] = previous
     }
   })
+
+  test('web_fetch and look_at use the boot policy for initial URLs and redirects', async () => {
+    const source = `
+      import { fetchWithLimits } from './src/agent/tools/webfetch/fetch.ts'
+      import { resolveImagesBounded } from './src/agent/multimodal/looker.ts'
+      const connected = []
+      const network = {
+        resolveAddresses: async (hostname) => hostname.endsWith('.corp') || hostname.endsWith('.home')
+          ? [{ address: '10.20.1.7', family: 4 }]
+          : [{ address: 'fd12:3456::9', family: 6 }],
+        request: async (options) => {
+          const address = await new Promise((resolve, reject) => options.lookup(options.hostname, {}, (error, value, family) => {
+            if (error) reject(error)
+            else resolve({ address: Array.isArray(value) ? value[0].address : value, family })
+          }))
+          connected.push(address.address)
+          const redirect = options.hostname.endsWith('.corp') || options.hostname.endsWith('.home')
+          return {
+            statusCode: redirect ? 302 : 200,
+            headers: redirect
+              ? { location: options.hostname.endsWith('.corp') ? 'https://report.example/final' : 'https://image.example/final.png' }
+              : { 'content-type': options.path.endsWith('.png') ? 'image/png' : 'text/plain' },
+            body: { async *[Symbol.asyncIterator]() { if (!redirect) yield new Uint8Array([1]) } },
+            cancel() {},
+          }
+        },
+      }
+      await fetchWithLimits('https://reports.corp/start', 5, undefined, 'off', network)
+      await resolveImagesBounded([{ kind: 'url', url: 'https://camera.home/start.png' }], undefined, network)
+      process.stdout.write(JSON.stringify(connected))
+    `
+    const child = Bun.spawn([process.execPath, '-e', source], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        [MODEL_HTTP_ALLOW_INTERNAL_HOSTS_ENV]: 'reports.corp,camera.home',
+        [MODEL_HTTP_ALLOW_INTERNAL_CIDRS_ENV]: '10.20.0.0/16,fd12:3456::/48',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    expect(exitCode, stderr).toBe(0)
+    expect(JSON.parse(stdout)).toEqual(['10.20.1.7', 'fd12:3456::9', '10.20.1.7', 'fd12:3456::9'])
+  })
 })

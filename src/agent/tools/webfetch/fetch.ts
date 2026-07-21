@@ -7,6 +7,7 @@ import {
   type PublicHttpDependencies,
   type PublicHttpResponse,
 } from '@/agent/network/safe-http'
+import type { InternalDestinationPolicy } from '@/network/internal-destinations'
 
 import { MAX_RESPONSE_BYTES } from './types'
 
@@ -69,6 +70,7 @@ export async function fetchWithLimits(
   parentSignal?: AbortSignal,
   antibotWarmup: AntibotWarmup = 'auto',
   network: WebFetchNetworkDependencies = forceFallbackForTest ? testFetchDependencies : defaultPublicHttpDependencies,
+  internalDestinationPolicy?: InternalDestinationPolicy,
 ): Promise<FetchResult> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(new Error('timeout')), timeoutSeconds * 1000)
@@ -78,7 +80,15 @@ export async function fetchWithLimits(
   try {
     const cookieJar = new WarmupCookieJar()
     const visitedUrls = new Set<string>()
-    const first = await fetchOnce(url, controller.signal, network, REQUEST_HEADERS, cookieJar, visitedUrls)
+    const first = await fetchOnce(
+      url,
+      controller.signal,
+      network,
+      REQUEST_HEADERS,
+      cookieJar,
+      visitedUrls,
+      internalDestinationPolicy,
+    )
     const cookieNames = cookieJar.names()
     const warmup =
       antibotWarmup === 'auto' &&
@@ -97,7 +107,15 @@ export async function fetchWithLimits(
         initialSetCookieNames: cookieNames,
       })
     }
-    const replay = await fetchOnce(url, controller.signal, network, REQUEST_HEADERS, cookieJar)
+    const replay = await fetchOnce(
+      url,
+      controller.signal,
+      network,
+      REQUEST_HEADERS,
+      cookieJar,
+      undefined,
+      internalDestinationPolicy,
+    )
     return toFetchResult(replay, {
       attempted: true,
       triggered: true,
@@ -152,11 +170,13 @@ async function fetchOnce(
   headers: Record<string, string>,
   cookieJar?: WarmupCookieJar,
   visitedUrls?: Set<string>,
+  internalDestinationPolicy?: InternalDestinationPolicy,
 ): Promise<BufferedResponse> {
   const { response, finalUrl } = await requestPublicHttpUrl(url, {
     signal,
     headers,
     dependencies: network,
+    ...(internalDestinationPolicy === undefined ? {} : { internalDestinationPolicy }),
     headersForUrl(currentUrl): Record<string, string> {
       visitedUrls?.add(currentUrl)
       const cookie = cookieJar?.header(currentUrl)

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { LookupAddress } from 'node:dns'
 
 import type { PublicHttpRequestOptions, PublicHttpResponse } from '@/agent/network/safe-http'
+import { createInternalDestinationPolicy } from '@/network/internal-destinations'
 
 import { fetchWithLimits, normalizeUrl, parseMimeType, type WebFetchNetworkDependencies, WebFetchError } from './fetch'
 import { MAX_RESPONSE_BYTES } from './types'
@@ -75,6 +76,78 @@ describe('fetchWithLimits safe transport', () => {
     })
     await expect(fetchWithLimits('https://public.example', 30, undefined, 'off', network)).rejects.toThrow(/non-public/)
     expect(hosts).toEqual(['public.example', 'rebound.example'])
+  })
+
+  test('permits configured private DNS answers on the initial URL and redirects while keeping them pinned', async () => {
+    const connected: string[] = []
+    const network = fixture({
+      resolveAddresses: async (hostname) =>
+        hostname === 'reports.corp' ? [{ address: '10.20.1.7', family: 4 }] : [{ address: 'fd12:3456::9', family: 6 }],
+      request: async (options) => {
+        connected.push((await socketAddress(options)).address)
+        return options.hostname === 'reports.corp'
+          ? response({ statusCode: 302, headers: { location: 'https://images.example/chart.png' } })
+          : response({ chunks: [new TextEncoder().encode('ok')] })
+      },
+    })
+    const result = await fetchWithLimits(
+      'https://reports.corp',
+      30,
+      undefined,
+      'off',
+      network,
+      createInternalDestinationPolicy({
+        allowInternalHosts: ['reports.corp'],
+        allowInternalCidrs: ['fd12:3456::/48'],
+      }),
+    )
+    expect(result.body).toBe('ok')
+    expect(connected).toEqual(['10.20.1.7', 'fd12:3456::9'])
+  })
+
+  test('rejects a mixed DNS set unless every blocked answer is covered by an exception', async () => {
+    const network = fixture({
+      resolveAddresses: async () => [
+        { address: '10.20.1.7', family: 4 },
+        { address: 'fd12:9999::1', family: 6 },
+      ],
+      request: async (options) => (await socketAddress(options), response({})),
+    })
+    await expect(
+      fetchWithLimits(
+        'https://reports.example',
+        30,
+        undefined,
+        'off',
+        network,
+        createInternalDestinationPolicy({ allowInternalCidrs: ['10.20.0.0/16'] }),
+      ),
+    ).rejects.toThrow(/non-public|DNS/)
+  })
+
+  test.each([
+    ['cloud IMDS', '169.254.169.254', 4 as const],
+    ['AWS ECS credentials', '169.254.170.2', 4 as const],
+    ['AWS EKS credentials', '169.254.170.23', 4 as const],
+    ['GCP IPv6 metadata', 'fd20:ce::254', 6 as const],
+  ])('keeps %s blocked even when a hostname or broad CIDR exception matches', async (_label, address, family) => {
+    const network = fixture({
+      resolveAddresses: async () => [{ address, family }],
+      request: async (options) => (await socketAddress(options), response({})),
+    })
+    await expect(
+      fetchWithLimits(
+        'https://reports.corp',
+        30,
+        undefined,
+        'off',
+        network,
+        createInternalDestinationPolicy({
+          allowInternalHosts: ['reports.corp'],
+          allowInternalCidrs: ['0.0.0.0/0', '::/0'],
+        }),
+      ),
+    ).rejects.toThrow(/metadata|non-public|DNS/)
   })
 
   test('rejects a redirect to a literal 198.19.x benchmarking address before requesting it', async () => {

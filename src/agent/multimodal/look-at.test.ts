@@ -4,6 +4,8 @@ import { mkdtemp, rm, truncate } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { createInternalDestinationPolicy } from '@/network/internal-destinations'
+
 import {
   buildGlmVisionMessages,
   extractGlmVisionText,
@@ -222,6 +224,33 @@ describe('resolveImagesBounded — aggregate resource boundary', () => {
       resolveImagesBounded([{ kind: 'url', url: 'https://example.com/image.png' }], undefined, network),
     ).rejects.toThrow(/public|SSRF|redirect/i)
     expect(requested).toEqual(['https://example.com/image.png'])
+  })
+
+  test('applies configured internal exceptions to URL images and every redirect hop', async () => {
+    const connected: string[] = []
+    const network = networkFixture({
+      resolveAddresses: async (hostname) =>
+        hostname === 'xn--oi2by7cuz0a.home'
+          ? [{ address: '192.168.5.10', family: 4 }]
+          : [{ address: 'fd00::20', family: 6 }],
+      request: async (options) => {
+        connected.push((await resolveSocketAddress(options)).address)
+        return options.hostname === 'xn--oi2by7cuz0a.home'
+          ? imageResponse({ statusCode: 302, headers: { location: 'http://[fd00::20]/frame.png' } })
+          : imageResponse({ chunks: [new Uint8Array([1])] })
+      },
+    })
+    const [image] = await resolveImagesBounded(
+      [{ kind: 'url', url: 'http://카메라.home/frame.png' }],
+      undefined,
+      network,
+      createInternalDestinationPolicy({
+        allowInternalHosts: ['xn--oi2by7cuz0a.home'],
+        allowInternalCidrs: ['fd00::20/128'],
+      }),
+    )
+    expect(image?.data).toBe('AQ==')
+    expect(connected).toEqual(['192.168.5.10', 'fd00::20'])
   })
 
   test('preserves normal public HTTP image fetching', async () => {
