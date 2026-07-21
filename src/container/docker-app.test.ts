@@ -161,9 +161,35 @@ describe('renderDockerUnavailableGuidance', () => {
       { ok: false, reason: 'daemon-down', detail: 'unix:///home/user/.orbstack/run/docker.sock' },
       { platform: 'darwin', nudge: 'orbstack', installed: ['orbstack'] },
     )
-    expect(result.summary).toBe('Docker is not running. OrbStack is installed but not started.')
+    expect(result.summary).toBe(
+      "Docker daemon is not reachable. Start OrbStack, or check its connection if it's already running.",
+    )
     expect(result.lines.join('\n')).toContain('Open OrbStack')
     expect(result.lines.join('\n')).toContain('orb start')
+  })
+
+  // The dead-end this PR fixes: OrbStack IS running but `docker info` fails
+  // because the CLI is pointed at a stale context / DOCKER_HOST (the SSH case).
+  // The message must NOT claim the app is stopped, and must surface the
+  // context/endpoint recovery path plus the sanitized Docker error.
+  test('daemon-down never claims the runtime is stopped and offers a context recovery path', () => {
+    const detail = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'
+    const result = renderDockerUnavailableGuidance(
+      { ok: false, reason: 'daemon-down', detail },
+      { platform: 'darwin', nudge: 'orbstack', installed: ['orbstack'] },
+    )
+    const body = result.lines.join('\n')
+    expect(result.summary).not.toContain('not started')
+    expect(result.summary).not.toContain('is not running')
+    // The summary must itself tell the user how to reach the desired state,
+    // not just diagnose — it names the start action AND the already-running fork.
+    expect(result.summary).toContain('Start OrbStack')
+    expect(result.summary).toContain('already running')
+    expect(body).toContain('already running')
+    expect(body).toContain('docker context ls')
+    expect(body).toContain('DOCKER_HOST')
+    expect(body).toContain('DOCKER_CONTEXT')
+    expect(body).toContain('Cannot connect to the Docker daemon')
   })
 
   test('daemon-down with docker-desktop nudge on macOS', () => {
@@ -171,7 +197,9 @@ describe('renderDockerUnavailableGuidance', () => {
       { ok: false, reason: 'daemon-down', detail: '' },
       { platform: 'darwin', nudge: 'docker-desktop', installed: ['docker-desktop'] },
     )
-    expect(result.summary).toBe('Docker is not running. Docker Desktop is installed but not started.')
+    expect(result.summary).toBe(
+      "Docker daemon is not reachable. Start Docker Desktop, or check its connection if it's already running.",
+    )
     expect(result.lines.join('\n')).toContain('open -a Docker')
   })
 
@@ -180,7 +208,9 @@ describe('renderDockerUnavailableGuidance', () => {
       { ok: false, reason: 'daemon-down', detail: 'npipe:////./pipe/docker_engine' },
       { platform: 'win32', nudge: 'docker-desktop', installed: ['docker-desktop'] },
     )
-    expect(result.summary).toBe('Docker is not running. Docker Desktop is installed but not started.')
+    expect(result.summary).toBe(
+      "Docker daemon is not reachable. Start Docker Desktop, or check its connection if it's already running.",
+    )
     expect(result.lines.join('\n')).toContain('Start menu')
   })
 
@@ -197,7 +227,9 @@ describe('renderDockerUnavailableGuidance', () => {
       { ok: false, reason: 'daemon-down', detail: '' },
       { platform: 'darwin', nudge: null, installed: ['docker-desktop', 'orbstack'] },
     )
-    expect(result.summary).toBe('Docker is not running.')
+    expect(result.summary).toBe(
+      "Docker daemon is not reachable. Start Docker Desktop, OrbStack, or check your docker connection if it's already running.",
+    )
     expect(result.lines.join('\n')).toContain('Docker Desktop, OrbStack')
   })
 
@@ -207,6 +239,14 @@ describe('renderDockerUnavailableGuidance', () => {
       { platform: 'linux', nudge: null, installed: [] },
     )
     expect(result.lines.join('\n')).toContain('sudo systemctl start docker')
+  })
+
+  test('daemon-down omits the "Docker reported" line when the detail is empty', () => {
+    const result = renderDockerUnavailableGuidance(
+      { ok: false, reason: 'daemon-down', detail: '' },
+      { platform: 'darwin', nudge: 'orbstack', installed: ['orbstack'] },
+    )
+    expect(result.lines.join('\n')).not.toContain('Docker reported:')
   })
 
   test('retryHint is appended when provided', () => {

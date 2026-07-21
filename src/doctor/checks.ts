@@ -61,12 +61,15 @@ function dockerDaemon(exec: DockerExec): DoctorCheck {
       if (result.ok) return { status: 'ok', message: 'docker info responded' }
       return {
         status: 'error',
-        message: result.reason === 'binary-missing' ? 'docker binary missing on $PATH' : 'docker daemon down',
+        message: result.reason === 'binary-missing' ? 'docker binary missing on $PATH' : 'docker daemon not reachable',
         details: [result.detail],
         fix:
           result.reason === 'binary-missing'
             ? { description: 'Install Docker (Docker Desktop, OrbStack, or docker-ce).' }
-            : { description: 'Start the Docker daemon (Docker Desktop, OrbStack, or `systemctl start docker`).' },
+            : {
+                description:
+                  'Start the Docker runtime (Docker Desktop, OrbStack, or `systemctl start docker`). If it is already running, check `docker context ls`, `DOCKER_CONTEXT`, and `DOCKER_HOST`.',
+              },
       }
     },
   }

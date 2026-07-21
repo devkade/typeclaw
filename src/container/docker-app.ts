@@ -1,18 +1,22 @@
 import { existsSync } from 'node:fs'
 
-import { getBun } from './shared'
+import { getBun, sanitizeDockerStderr } from './shared'
 import type { DockerAvailability } from './shared'
 
 // Detection + friendly guidance for "Docker is not reachable".
 //
 // `checkDockerAvailable` (in ./shared) already tells us WHETHER docker works and
 // discriminates `binary-missing` (no `docker` on PATH) from `daemon-down` (CLI
-// present, daemon refused the connection — the common "Docker Desktop / OrbStack
-// installed but not started" case on macOS). What it does NOT do is tell the
-// user WHICH runtime to nudge. This module fills that gap: it classifies the
-// likely runtime and renders a short, copy-pasteable instruction instead of
-// leaking the raw daemon error (which on OrbStack embeds a per-user socket path
-// under the user's home dir — noise the user can't act on).
+// present, the selected Docker endpoint refused the connection). That covers the
+// common "Docker Desktop / OrbStack installed but not started" case on macOS —
+// but `docker info` failing proves only that the CONFIGURED ENDPOINT is
+// unreachable, NOT that the runtime process is stopped: a running OrbStack whose
+// CLI is pointed at a stale `desktop-linux` context (or an SSH session missing
+// the interactive shell's DOCKER_HOST) produces the exact same connection error.
+// So this module must not assert the app is "not started" — it nudges the likely
+// runtime to start AND surfaces the context/endpoint recovery path plus the raw
+// (sanitized) Docker error, so a user who knows the runtime is already up isn't
+// sent into a dead-end "start it" loop.
 //
 // Classification priority (most → least authoritative):
 //   1. The configured socket: `DOCKER_HOST` or the socket path inside the raw
@@ -121,8 +125,8 @@ export function detectInstalledDockerApps(probes: DockerAppProbes = {}): DockerA
 // Docker Desktop's GUI launcher (`Docker Desktop.exe`) across the MSI, 32-bit,
 // and per-user install layouts confirmed by the Docker Desktop installer and
 // PowerShell's own probing scripts. Probing the exe (not just `docker` on PATH)
-// is what lets us say "Docker Desktop is installed but not started" when the
-// daemon is down — a stale PATH can hide the CLI even when Desktop is present.
+// is what lets us name Docker Desktop as the runtime to nudge when the daemon is
+// unreachable — a stale PATH can hide the CLI even when Desktop is present.
 function windowsDockerDesktopInstalled(env: NodeJS.ProcessEnv, exists: (path: string) => boolean): boolean {
   const programFiles = env.ProgramW6432 ?? env.ProgramFiles ?? 'C:\\Program Files'
   const programFilesX86 = env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)'
@@ -231,23 +235,48 @@ export function renderDockerUnavailableGuidance(
     return { summary: 'Docker is not installed.', lines }
   }
 
-  // daemon-down
+  // daemon-down: the configured Docker endpoint refused the connection. We can
+  // nudge the likely runtime to start, but must NOT claim it's stopped — the
+  // same error fires when the runtime is up and the CLI is on the wrong context.
   const lines: string[] = []
   let summary: string
   if (nudge !== null) {
-    summary = `Docker is not running. ${dockerAppLabel(nudge)} is installed but not started.`
+    const label = dockerAppLabel(nudge)
+    summary = `Docker daemon is not reachable. Start ${label}, or check its connection if it's already running.`
     lines.push(...startInstructions(nudge, platform))
   } else if (installed.length > 1) {
     const names = installed.map(dockerAppLabel).join(', ')
-    summary = 'Docker is not running.'
+    summary = `Docker daemon is not reachable. Start ${names}, or check your docker connection if it's already running.`
     lines.push(`Detected: ${names}. Start whichever one you use, then retry.`)
   } else {
-    summary = 'Docker is installed but the daemon is not reachable.'
+    summary =
+      "Docker daemon is not reachable. Start your Docker runtime, or check your docker connection if it's already running."
     lines.push(...genericStartInstructions(platform))
   }
+
+  lines.push('', ...alreadyRunningRecovery(availability.detail))
 
   if (retryHint) {
     lines.push('', retryHint)
   }
   return { summary, lines }
+}
+
+// The recovery path for the case the start-instructions can't fix: the runtime
+// is already running but `docker info` still fails because the CLI is pointed at
+// an unreachable endpoint (stale `docker context`, a leftover `DOCKER_HOST`, or
+// a non-interactive/SSH shell missing the interactive env). We surface the
+// configuration knobs to check plus the sanitized Docker error so the endpoint
+// stays visible instead of being hidden as "noise".
+function alreadyRunningRecovery(detail: string): string[] {
+  const lines = [
+    'If it is already running, your docker CLI may be pointed at the wrong endpoint',
+    '(common over SSH or in non-interactive shells).',
+    'Check `docker context ls`, `DOCKER_CONTEXT`, and `DOCKER_HOST`.',
+  ]
+  const reported = sanitizeDockerStderr(detail)
+  if (reported !== '') {
+    lines.push(`Docker reported: ${reported}`)
+  }
+  return lines
 }
