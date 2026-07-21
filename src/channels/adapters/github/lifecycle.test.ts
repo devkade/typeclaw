@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { generateKeyPairSync } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { createChannelRouter, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig, GithubAdapterConfig } from '@/channels/schema'
@@ -928,13 +931,16 @@ describe('createGithubAdapter lifecycle', () => {
       httpListenImpl: () => ({ stop: async () => {} }),
       webhookRegistrationDelayMs: 0,
       tokenRefreshIntervalMs: 100,
+      reconcileIntervalMs: 0,
       setInterval: fakeInterval,
     })
 
     await adapter.start()
     // Two timers register through the injected setInterval: the token refresh
     // (index 0, registered first in the seed block) and the delivery-recovery
-    // sweep (index 1, registered last once managedHooks is populated).
+    // sweep (index 1, registered last once managedHooks is populated). The
+    // periodic reconcile tick is disabled here (reconcileIntervalMs: 0) to keep
+    // this assertion about the token-refresh + sweep timers only.
     expect(refreshHandlers.length).toBe(2)
     expect(process.env.GH_TOKEN).toBe('ghs_fresh')
 
@@ -995,12 +1001,14 @@ describe('createGithubAdapter lifecycle', () => {
       httpListenImpl: () => ({ stop: async () => {} }),
       webhookRegistrationDelayMs: 0,
       tokenRefreshIntervalMs: 0,
+      reconcileIntervalMs: 0,
       setInterval: fakeInterval,
     })
 
     await adapter.start()
-    // tokenRefreshIntervalMs: 0 disables the refresh timer, so the only timer is
-    // the recovery sweep — proving it registers independently of token refresh.
+    // tokenRefreshIntervalMs: 0 and reconcileIntervalMs: 0 disable those timers,
+    // so the only timer is the recovery sweep — proving it registers
+    // independently of the token refresh and reconcile ticks.
     expect(handlers.length).toBe(1)
 
     handlers[0]!()
@@ -1345,6 +1353,163 @@ describe('createGithubAdapter lifecycle', () => {
       await adapter.stop()
 
       expect(calls.some((c) => c.url.includes('/pulls'))).toBe(false)
+    })
+
+    function unreviewedPrFetch(): { fetch: typeof fetch; routedPrs: () => number } {
+      let routed = 0
+      const { fetch: fetchImpl } = fakeFetchRecording(({ url, method }) => {
+        if (url.endsWith('/user') && method === 'GET') return Response.json({ login: 'bot', id: 1 })
+        const hooks = url.match(/\/repos\/[^/]+\/[^/]+\/hooks\b/)
+        if (hooks) {
+          if (method === 'GET') return Response.json([])
+          if (method === 'POST') return Response.json({ id: 1 }, { status: 201 })
+        }
+        if (url.match(/\/pulls\/7\/reviews/)) return Response.json([])
+        if (url.includes('/pulls?')) {
+          routed += 1
+          return Response.json([
+            {
+              number: 7,
+              id: 700,
+              title: 'Add thing',
+              draft: false,
+              updated_at: '2026-01-01T00:00:00Z',
+              user: { login: 'alice', id: 10, type: 'User' },
+              head: { ref: 'feature' },
+              base: { ref: 'main' },
+              requested_reviewers: [],
+            },
+          ])
+        }
+        return new Response('unexpected', { status: 500 })
+      })
+      return { fetch: fetchImpl, routedPrs: () => routed }
+    }
+
+    test('a restart within the cooldown does NOT replay the same unreviewed PR twice', async () => {
+      const agentDir = await mkdtemp(join(tmpdir(), 'gh-reconcile-lifecycle-'))
+      try {
+        const routes: string[] = []
+        const router = freshRouter()
+        const originalRoute = router.route.bind(router)
+        router.route = (m) => {
+          routes.push(m.chat)
+          return originalRoute(m)
+        }
+
+        const build = () => {
+          const { fetch: fetchImpl } = unreviewedPrFetch()
+          return createGithubAdapter({
+            router,
+            configRef: reviewConfig('opened'),
+            secrets: patSecrets(),
+            agentDir,
+            logger: silentLogger(),
+            fetchImpl,
+            httpListenImpl: () => ({ stop: async () => {} }),
+            webhookRegistrationDelayMs: 0,
+            tokenRefreshIntervalMs: 0,
+            reconcileIntervalMs: 0,
+          })
+        }
+
+        const first = build()
+        await first.start()
+        await first.stop()
+
+        const second = build()
+        await second.start()
+        await second.stop()
+
+        expect(routes.filter((c) => c === 'pr:7')).toHaveLength(1)
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    })
+
+    test('the periodic reconcile tick fires the pass again after start()', async () => {
+      const agentDir = await mkdtemp(join(tmpdir(), 'gh-reconcile-lifecycle-'))
+      try {
+        const { fetch: fetchImpl, routedPrs } = unreviewedPrFetch()
+        const handlers: Array<() => void> = []
+        const fakeInterval = (handler: () => void) => {
+          handlers.push(handler)
+          return { clear: () => {} }
+        }
+
+        const adapter = createGithubAdapter({
+          router: freshRouter(),
+          configRef: reviewConfig('opened'),
+          secrets: patSecrets(),
+          agentDir,
+          logger: silentLogger(),
+          fetchImpl,
+          httpListenImpl: () => ({ stop: async () => {} }),
+          webhookRegistrationDelayMs: 0,
+          tokenRefreshIntervalMs: 0,
+          deliveryRecoveryIntervalMs: 0,
+          setInterval: fakeInterval,
+        })
+
+        await adapter.start()
+        const afterStart = routedPrs()
+        expect(afterStart).toBe(1)
+        expect(handlers).toHaveLength(1)
+
+        handlers[0]!()
+        await Promise.resolve()
+        await Promise.resolve()
+
+        expect(routedPrs()).toBe(2)
+        await adapter.stop()
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    })
+
+    test('a live review.on change to off stops the periodic reconcile tick from scanning', async () => {
+      const agentDir = await mkdtemp(join(tmpdir(), 'gh-reconcile-lifecycle-'))
+      try {
+        const { fetch: fetchImpl, routedPrs } = unreviewedPrFetch()
+        let reviewOn: 'opened' | 'off' = 'opened'
+        const configRef = (): ChannelAdapterConfig & GithubAdapterConfig => {
+          const config = githubConfig(['acme/widgets'])
+          config.review = { on: reviewOn, approve: true }
+          return config
+        }
+        const handlers: Array<() => void> = []
+        const fakeInterval = (handler: () => void) => {
+          handlers.push(handler)
+          return { clear: () => {} }
+        }
+
+        const adapter = createGithubAdapter({
+          router: freshRouter(),
+          configRef,
+          secrets: patSecrets(),
+          agentDir,
+          logger: silentLogger(),
+          fetchImpl,
+          httpListenImpl: () => ({ stop: async () => {} }),
+          webhookRegistrationDelayMs: 0,
+          tokenRefreshIntervalMs: 0,
+          deliveryRecoveryIntervalMs: 0,
+          setInterval: fakeInterval,
+        })
+
+        await adapter.start()
+        expect(routedPrs()).toBe(1)
+
+        reviewOn = 'off'
+        handlers[0]!()
+        await Promise.resolve()
+        await Promise.resolve()
+
+        expect(routedPrs()).toBe(1)
+        await adapter.stop()
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
     })
   })
 })
