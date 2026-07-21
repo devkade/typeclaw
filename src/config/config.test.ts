@@ -845,7 +845,11 @@ describe('portForwardSchema', () => {
 })
 
 describe('networkSchema', () => {
-  const FULL_DEFAULTS = { blockInternal: true, autoAllowResolvers: true, allow: [] as string[] }
+  const FULL_DEFAULTS = {
+    blockInternal: true,
+    autoAllowResolvers: true,
+    allow: [] as string[],
+  }
 
   test('defaults to blockInternal:true, autoAllowResolvers:true, allow:[] when omitted (egress filter on for every agent unless opted out)', () => {
     const parsed = configSchema.parse({ models: { default: VALID_MODEL } })
@@ -928,10 +932,27 @@ describe('networkSchema', () => {
     expect(() => configSchema.parse({ models: { default: VALID_MODEL }, network: { allow: '10.0.0.0/8' } })).toThrow()
   })
 
+  test('does not admit model-authored application HTTP exceptions through typeclaw.json', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      network: {
+        modelHttp: {
+          allowInternalHosts: ['service.corp'],
+          allowInternalCidrs: ['10.20.0.0/16'],
+        },
+      },
+    })
+    expect('modelHttp' in parsed.network).toBe(false)
+  })
+
   test('does not leak into the plugin config map', () => {
     const plugins = extractPluginConfigs({
       models: { default: VALID_MODEL },
-      network: { blockInternal: true, autoAllowResolvers: true, allow: [] },
+      network: {
+        blockInternal: true,
+        autoAllowResolvers: true,
+        allow: [],
+      },
       'my-plugin': { x: 1 },
     })
     expect('network' in plugins).toBe(false)
