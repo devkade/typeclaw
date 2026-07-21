@@ -6,13 +6,12 @@ import { DEFAULT_SANDBOX_ENV } from './policy'
 // safe fixed values — a PATH/loader hijack of the sandbox mechanism itself.
 const RESERVED_SANDBOX_ENV_NAMES = new Set(Object.keys(DEFAULT_SANDBOX_ENV))
 
-// Names host/container startup INJECTS into the container env — never something
-// an operator writes in `.env`. TYPECLAW_TUI_TOKEN / TYPECLAW_HOSTD_TOKEN /
-// TYPECLAW_HOSTD_BROKER_TOKEN are per-container generated auth; letting a matching
-// `.env` line make the live runtime value eligible would hand the sandbox a token
-// the operator never chose to expose. Not a credential-name registry: these are
-// names the runtime CLAIMS, distinct from operator credentials (which belong in
-// secrets.json when they must stay hidden). GH_TOKEN / GITHUB_TOKEN are NOT here:
+// Names the runtime claims for its own control plane. The token values are
+// injected at container start. The model-HTTP policy values are operator-authored
+// in raw-masked `.env`, but are runtime controls rather than model inputs; exposing
+// them to bash would let the model discover the private network exceptions. Not a
+// credential-name registry: ordinary operator credentials still belong in
+// secrets.json when they must stay hidden. GH_TOKEN / GITHUB_TOKEN are NOT here:
 // `.env` is the operator's expose-to-the-agent surface, so an operator who
 // declares a GitHub token there has chosen to hand it to model bash (e.g. so plain
 // `gh` / `git` / `curl` work in agents with no GitHub channel). The github-cli-auth
@@ -22,6 +21,8 @@ const RUNTIME_OWNED_ENV_NAMES = new Set<string>([
   'TYPECLAW_TUI_TOKEN',
   'TYPECLAW_HOSTD_TOKEN',
   'TYPECLAW_HOSTD_BROKER_TOKEN',
+  'TYPECLAW_MODEL_HTTP_ALLOW_INTERNAL_HOSTS',
+  'TYPECLAW_MODEL_HTTP_ALLOW_INTERNAL_CIDRS',
 ])
 
 // Process-hijack vectors: an inherited value here changes how the shell, loader,

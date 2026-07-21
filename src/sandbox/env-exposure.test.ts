@@ -34,6 +34,8 @@ describe('resolveExposableEnvNames', () => {
         TYPECLAW_TUI_TOKEN: 'a',
         TYPECLAW_HOSTD_TOKEN: 'b',
         TYPECLAW_HOSTD_BROKER_TOKEN: 'c',
+        TYPECLAW_MODEL_HTTP_ALLOW_INTERNAL_HOSTS: 'service.corp',
+        TYPECLAW_MODEL_HTTP_ALLOW_INTERNAL_CIDRS: '10.20.0.0/16',
         MY_VAR: 'ok',
       }),
     )
