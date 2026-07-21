@@ -48,6 +48,28 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper', () => {
     const mode = (await stat(path)).mode & 0o111
     expect(mode).not.toBe(0)
   })
+
+  test('defaults to a runtime-writable path outside /usr so a read-only /usr does not EACCES', async () => {
+    const original = process.env.TYPECLAW_GIT_ASKPASS_PATH
+    delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+    try {
+      const path = await ensureGitAskPassHelper()
+      expect(path.startsWith('/usr')).toBe(false)
+      expect((await stat(path)).isFile()).toBe(true)
+      expect((await stat(path)).mode & 0o111).not.toBe(0)
+    } finally {
+      if (original === undefined) delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+      else process.env.TYPECLAW_GIT_ASKPASS_PATH = original
+    }
+  })
+
+  test('caches per path so a second distinct path is ensured independently', async () => {
+    const [pathA, pathB] = [await tmpHelperPath(), await tmpHelperPath()]
+    expect(await ensureGitAskPassHelper(pathA)).toBe(pathA)
+    expect(await ensureGitAskPassHelper(pathB)).toBe(pathB)
+    expect((await stat(pathA)).isFile()).toBe(true)
+    expect((await stat(pathB)).isFile()).toBe(true)
+  })
 })
 
 // POSIX shell helper, #899.
