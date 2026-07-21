@@ -39,36 +39,68 @@ export type ListSessionsOptions = {
 // character so empty-id filenames like `_.jsonl` don't slip through.
 const FILENAME_PATTERN = /^(?:.*_)?([^_/\\\s][^/\\\s]*)\.jsonl$/
 
-export async function listSessions(opts: ListSessionsOptions): Promise<SessionSummary[]> {
-  const entries = await readSessionFiles(opts.sessionsDir, opts.onWarn)
-  const withStats = await Promise.all(
-    entries.map(async (entry) => {
-      const s = await safeStat(entry.path)
-      if (s === null) return null
-      const mtimeMs = s.mtimeMs
-      if (opts.sinceMs !== undefined && mtimeMs < opts.sinceMs) return null
-      return { ...entry, mtimeMs }
-    }),
-  )
-  const valid = withStats.filter(
-    (v): v is { path: string; basename: string; sessionId: string; mtimeMs: number } => v !== null,
-  )
-  valid.sort((a, b) => b.mtimeMs - a.mtimeMs)
-  const limited = opts.limit !== undefined ? valid.slice(0, opts.limit) : valid
+// Bounds concurrent per-file I/O. An agent folder can hold tens of thousands of
+// session files, and an unbounded `Promise.all` over them opens one file
+// descriptor per concurrent stat/stream — enough to blow past a 256 `ulimit -n`
+// and crash the process with EMFILE. 32 keeps throughput high while staying well
+// under any sane FD ceiling.
+const SESSION_IO_CONCURRENCY = 32
 
-  return Promise.all(
-    limited.map(async ({ path, basename, sessionId, mtimeMs }) => {
-      const peek = await peekSession(path, opts.onWarn)
-      return {
-        sessionId,
-        sessionFile: path,
-        basename,
-        mtimeMs,
-        origin: peek.origin,
-        firstPrompt: peek.firstPrompt,
-      }
-    }),
-  )
+// A dependency-free bounded worker pool: `concurrency` workers pull from a shared
+// cursor until the list is drained, preserving input order in the result.
+async function mapConcurrent<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await fn(items[index]!, index)
+    }
+  }
+  const workerCount = Math.min(concurrency, items.length)
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  return results
+}
+
+type StatEntry = { path: string; basename: string; sessionId: string; mtimeMs: number }
+
+// Split from listSessions so resolveSession can match ids first and peek only the
+// candidates, instead of reading every file body on disk. Reads no file content.
+async function statSessionFiles(opts: ListSessionsOptions): Promise<StatEntry[]> {
+  const entries = await readSessionFiles(opts.sessionsDir, opts.onWarn)
+  const withStats = await mapConcurrent(entries, SESSION_IO_CONCURRENCY, async (entry) => {
+    const s = await safeStat(entry.path)
+    if (s === null) return null
+    const mtimeMs = s.mtimeMs
+    if (opts.sinceMs !== undefined && mtimeMs < opts.sinceMs) return null
+    return { ...entry, mtimeMs }
+  })
+  const valid = withStats.filter((v): v is StatEntry => v !== null)
+  valid.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return valid
+}
+
+async function summarizeEntry(entry: StatEntry, onWarn?: (msg: string) => void): Promise<SessionSummary> {
+  const peek = await peekSession(entry.path, onWarn)
+  return {
+    sessionId: entry.sessionId,
+    sessionFile: entry.path,
+    basename: entry.basename,
+    mtimeMs: entry.mtimeMs,
+    origin: peek.origin,
+    firstPrompt: peek.firstPrompt,
+  }
+}
+
+export async function listSessions(opts: ListSessionsOptions): Promise<SessionSummary[]> {
+  const valid = await statSessionFiles(opts)
+  const limited = opts.limit !== undefined ? valid.slice(0, opts.limit) : valid
+  return mapConcurrent(limited, SESSION_IO_CONCURRENCY, (entry) => summarizeEntry(entry, opts.onWarn))
 }
 
 // Overlay container-registry sessions onto the disk listing. A live session
@@ -105,17 +137,23 @@ export async function resolveSession(
   sessionIdOrPrefix: string,
   onWarn?: (msg: string) => void,
 ): Promise<ResolveResult> {
-  const all = await listSessions({ sessionsDir, ...(onWarn !== undefined ? { onWarn } : {}) })
-  const exact = all.find((s) => s.sessionId === sessionIdOrPrefix)
-  if (exact !== undefined) return { ok: true, summary: exact }
+  // Match on stat-only metadata (filename-derived id + mtime) first, then peek
+  // ONLY the matched candidates. Peeking every session to find one by id/prefix
+  // opened a file descriptor per file — tens of thousands at once on a busy agent,
+  // which crashes with EMFILE. Id resolution never needs a file's body.
+  const entries = await statSessionFiles({ sessionsDir, ...(onWarn !== undefined ? { onWarn } : {}) })
+
+  const exact = entries.find((e) => e.sessionId === sessionIdOrPrefix)
+  if (exact !== undefined) return { ok: true, summary: await summarizeEntry(exact, onWarn) }
 
   if (sessionIdOrPrefix.length < MIN_PREFIX_LENGTH || !isSessionIdShape(sessionIdOrPrefix)) {
     return { ok: false, reason: 'not-found', matches: [] }
   }
-  const prefixMatches = all.filter((s) => s.sessionId.startsWith(sessionIdOrPrefix))
+  const prefixMatches = entries.filter((e) => e.sessionId.startsWith(sessionIdOrPrefix))
   if (prefixMatches.length === 0) return { ok: false, reason: 'not-found', matches: [] }
-  if (prefixMatches.length === 1) return { ok: true, summary: prefixMatches[0]! }
-  return { ok: false, reason: 'ambiguous', matches: prefixMatches }
+  if (prefixMatches.length === 1) return { ok: true, summary: await summarizeEntry(prefixMatches[0]!, onWarn) }
+  const matches = await mapConcurrent(prefixMatches, SESSION_IO_CONCURRENCY, (e) => summarizeEntry(e, onWarn))
+  return { ok: false, reason: 'ambiguous', matches }
 }
 
 const SESSION_ID_SHAPE = /^[^_/\\\s][^/\\\s]*$/
