@@ -597,6 +597,21 @@ describe('canonical Git secret history guard', () => {
     await expect(assertNoCanonicalSecretsInGit(repo)).rejects.toThrow(GitSecretHistoryError)
   })
 
+  test('scans past a corrupted blob because blob contents can never carry a canonical secret path', async () => {
+    // Pins the --connectivity-only contract: a full fsck reads and hash-verifies every blob (the
+    // dominant cost on large agent repos, paid before EVERY bash call) and fails closed on benign
+    // corruption, bricking the bash-driven remediation path. Secret paths live in trees, which the
+    // scan still parses, so skipping blob reads loses nothing the guard relies on.
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    const blobOid = await gitOutput(repo, 'rev-parse', 'HEAD:README.md')
+    const looseObject = join(repo, '.git', 'objects', blobOid.slice(0, 2), blobOid.slice(2))
+    await chmod(looseObject, 0o644)
+    await writeFile(looseObject, 'corrupted, not zlib')
+
+    await expect(assertNoCanonicalSecretsInGit(repo)).resolves.toBeUndefined()
+  })
+
   // Skipped on Windows: the old-Git emulation relies on a POSIX `/bin/sh` shim shadowing `git`.
   test.skipIf(isWindows())('denies every transport so a promisor probe never reaches the network', async () => {
     // Emulate unpatched Git <2.45 (silently ignores GIT_NO_LAZY_FETCH) with a `git` shim on PATH

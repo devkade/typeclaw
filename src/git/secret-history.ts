@@ -239,7 +239,21 @@ async function collectRootRefOids(
 // and this unreachable-commit walk still report the path; `--no-reflogs` keeps this a superset that
 // routes benign reflog-reachable commits through commit attribution instead of double-reporting.
 async function scanUnreachableObjects(agentDir: string, gitArgs: readonly string[]): Promise<UnreachableScan> {
-  const fsck = await runGit(agentDir, gitArgs, ['fsck', '--unreachable', '--no-reflogs', '--no-progress'])
+  // --connectivity-only skips per-object sha1/content verification, which dominates fsck cost on
+  // large repos (measured ~102s -> ~2s on an 869k-object agent repo; this guard runs before EVERY
+  // model bash call). The guard only needs unreachable-object ENUMERATION for path attribution —
+  // commits and trees are still parsed and walked, and blob contents were never inspected anyway,
+  // so skipping integrity checking does not weaken the verdict. A side effect is that corrupted
+  // blob data no longer fails the scan closed, which is correct: blob integrity cannot conceal or
+  // reveal a canonical secret path, and blocking all bash on unrelated corruption bricked the
+  // remediation path the same way the removed contamination cache did.
+  const fsck = await runGit(agentDir, gitArgs, [
+    'fsck',
+    '--unreachable',
+    '--no-reflogs',
+    '--no-progress',
+    '--connectivity-only',
+  ])
   const unreachable = parseUnreachableObjects(fsck)
   if (unreachable.length === 0) return { ok: true, paths: [] }
 
