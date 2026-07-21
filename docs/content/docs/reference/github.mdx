@@ -52,7 +52,7 @@ PAT brokerage deliberately excludes shapes where the destination cannot be enfor
 }
 ```
 
-Installations are resolved per repository, and model-driven repository commands receive a short-lived installation token minted for that exact `owner/repo`. A global `GH_TOKEN` may be kept warm only when the configured repositories unambiguously share one installation owner; it is not an authorization shortcut—command analysis still resolves the repository and injects a per-repo token. Multi-owner and empty `repos[]` configurations intentionally leave the global token unset.
+Installations are resolved per repository, and validated model-driven `gh` commands receive a short-lived installation token minted for that exact `owner/repo`. App credentials are never seeded into the ambient process `GH_TOKEN`; validated `gh` calls and runtime-owned consumers mint through the repository-scoped token bridge instead. An operator-authored `GH_TOKEN` remains untouched.
 
 App-backed GraphQL requires an explicit repository mint hint (`gh api graphql -R owner/repo ...`); TypeClaw consumes `-R`, mints that repository's installation token, and removes the unsupported flag before invoking `gh api`. Review-producing mutations are rejected from the shell-normalized query before minting so they cannot bypass the formal-review coordinator.
 
