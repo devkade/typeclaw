@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { SessionOrigin } from '@/agent/session-origin'
 
 import { BUILTIN_ROLES, expandOwnerWildcard } from './builtins'
-import { createPermissionService } from './permissions'
+import { createBoundedCache, createPermissionService } from './permissions'
 import { rolesConfigSchema, type RolesConfig } from './schema'
 
 function parseRoles(raw: unknown): RolesConfig {
@@ -248,6 +248,164 @@ describe('PermissionService — cron/subagent provenance', () => {
       parentSessionId: 'p',
     }
     expect(svc.resolveRole(sub)).toBe('guest')
+  })
+})
+
+describe('PermissionService — role resolution cache', () => {
+  test('repeated resolveRole/has calls for the same origin stay correct', () => {
+    const roles = parseRoles({ trusted: { match: ['slack:T0123 author:U_ME'] } })
+    const svc = createPermissionService({ roles, pluginPermissions: PLUGIN_PERMS })
+    for (let i = 0; i < 5; i++) {
+      expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+      expect(svc.has(slackOwnerChat, 'channel.respond')).toBe(true)
+      expect(svc.resolveRole(slackStrangerChat)).toBe('guest')
+      expect(svc.has(slackStrangerChat, 'channel.respond')).toBe(false)
+    }
+  })
+
+  test('replaceRoles reflects a PROMOTION (no stale under-privileged read)', () => {
+    const svc = createPermissionService({ pluginPermissions: PLUGIN_PERMS })
+    // given: warms the cache with the pre-grant verdict
+    expect(svc.resolveRole(slackOwnerChat)).toBe('guest')
+    // when: the operator grants trusted to this author
+    svc.replaceRoles(parseRoles({ trusted: { match: ['slack:T0123 author:U_ME'] } }))
+    // then: the new grant is visible immediately, not the cached guest
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    expect(svc.has(slackOwnerChat, 'channel.respond')).toBe(true)
+  })
+
+  test('replaceRoles reflects a DEMOTION (no stale OVER-privileged read — the security case)', () => {
+    const svc = createPermissionService({
+      roles: parseRoles({ trusted: { match: ['slack:T0123 author:U_ME'] } }),
+      pluginPermissions: PLUGIN_PERMS,
+    })
+    // given: warms the cache while the author is trusted
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    expect(svc.has(slackOwnerChat, 'security.bypass.low')).toBe(true)
+    // when: the operator revokes the grant
+    svc.replaceRoles(parseRoles({}))
+    // then: the cache must NOT keep handing back trusted
+    expect(svc.resolveRole(slackOwnerChat)).toBe('guest')
+    expect(svc.has(slackOwnerChat, 'channel.respond')).toBe(false)
+    expect(svc.has(slackOwnerChat, 'security.bypass.low')).toBe(false)
+  })
+
+  test('replacePluginPermissions reflects owner-wildcard expansion changes', () => {
+    const svc = createPermissionService({ roles: parseRoles({ owner: { match: ['slack:T0123 author:U_ME'] } }) })
+    // given: no plugin perms yet, so owner has no bypass; warm the cache via has()
+    expect(svc.resolveRole(slackOwnerChat)).toBe('owner')
+    expect(svc.has(slackOwnerChat, 'security.bypass.gitExfil')).toBe(false)
+    // when: a plugin registers a bypass permission the owner wildcard expands to
+    svc.replacePluginPermissions?.({
+      pluginPermissions: ['security.bypass.gitExfil'],
+      ownerWildcardExclusions: [],
+    })
+    // then: the owner now holds it (role name cached OR not, the permission set is fresh)
+    expect(svc.resolveRole(slackOwnerChat)).toBe('owner')
+    expect(svc.has(slackOwnerChat, 'security.bypass.gitExfil')).toBe(true)
+  })
+
+  test('two authors in the same chat resolve independently (key includes authorId — no cross-author leak)', () => {
+    const roles = parseRoles({ trusted: { match: ['slack:T0123 author:U_ME'] } })
+    const svc = createPermissionService({ roles, pluginPermissions: PLUGIN_PERMS })
+    // given: warm the trusted author first
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    // then: a different author in the SAME workspace+chat must not inherit the cached trusted verdict
+    expect(svc.resolveRole(slackStrangerChat)).toBe('guest')
+    // and repeated interleaving stays correct
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    expect(svc.resolveRole(slackStrangerChat)).toBe('guest')
+  })
+
+  test('workspace is part of the key (same author in another workspace is not trusted)', () => {
+    const roles = parseRoles({ trusted: { match: ['slack:T0123 author:U_ME'] } })
+    const svc = createPermissionService({ roles, pluginPermissions: PLUGIN_PERMS })
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    // the rule pins workspace T0123, so the same author in T9999 is NOT trusted;
+    // this fails if `workspace` is dropped from the cache key
+    expect(svc.resolveRole({ ...slackOwnerChat, workspace: 'T9999' })).toBe('guest')
+  })
+
+  test('chat is part of the key (a chat-scoped grant does not leak to a sibling chat)', () => {
+    // A chat-CONSTRAINED rule: only C_GEN is trusted. If `chat` were omitted
+    // from the cache key, the warmed C_GEN verdict would leak to C_OTHER.
+    const roles = parseRoles({ trusted: { match: ['slack:T0123/C_GEN author:U_ME'] } })
+    const svc = createPermissionService({ roles, pluginPermissions: PLUGIN_PERMS })
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    expect(svc.resolveRole({ ...slackOwnerChat, chat: 'C_OTHER' })).toBe('guest')
+  })
+
+  test('adapter is part of the key (identical coordinates under discord-bot do not inherit slack verdict)', () => {
+    // Same workspace/chat/author, different adapter. Only slack is trusted;
+    // if `adapter` were omitted from the key, the discord origin would inherit
+    // the warmed slack `trusted` verdict.
+    const roles = parseRoles({ trusted: { match: ['slack:T0123 author:U_ME'] } })
+    const svc = createPermissionService({ roles, pluginPermissions: PLUGIN_PERMS })
+    const discordSameCoords: SessionOrigin = { ...slackOwnerChat, adapter: 'discord-bot' }
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    expect(svc.resolveRole(discordSameCoords)).toBe('guest')
+  })
+
+  test('cache stays bounded under a flood of distinct external coordinates', () => {
+    // Channel keys come from externally-controlled ids; a flood of distinct
+    // chats must not grow the cache without limit. Resolve far more distinct
+    // origins than the internal cap, then assert the warm hot entry and a fresh
+    // cold entry both still resolve correctly — eviction must not corrupt
+    // verdicts, only bound memory.
+    const roles = parseRoles({ trusted: { match: ['slack:T0123/C_GEN author:U_ME'] } })
+    const svc = createPermissionService({ roles, pluginPermissions: PLUGIN_PERMS })
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    for (let i = 0; i < 10_000; i++) {
+      expect(svc.resolveRole({ ...slackStrangerChat, chat: `C_FLOOD_${i}` })).toBe('guest')
+    }
+    // A chat that was evicted recomputes to the same correct verdict
+    expect(svc.resolveRole(slackOwnerChat)).toBe('trusted')
+    expect(svc.resolveRole({ ...slackOwnerChat, chat: 'C_OTHER' })).toBe('guest')
+  })
+})
+
+describe('createBoundedCache', () => {
+  test('never exceeds the cap, evicting the oldest insertion', () => {
+    const cache = createBoundedCache<number>(3)
+    cache.set('a', 1)
+    cache.set('b', 2)
+    cache.set('c', 3)
+    expect(cache.size).toBe(3)
+    // inserting a 4th key evicts 'a' (oldest), size stays at the cap
+    cache.set('d', 4)
+    expect(cache.size).toBe(3)
+    expect(cache.get('a')).toBeUndefined()
+    expect(cache.get('b')).toBe(2)
+    expect(cache.get('d')).toBe(4)
+  })
+
+  test('stays bounded under a flood far exceeding the cap', () => {
+    const cache = createBoundedCache<number>(8)
+    for (let i = 0; i < 1000; i++) cache.set(`k${i}`, i)
+    expect(cache.size).toBe(8)
+    // only the most-recent `max` insertions survive
+    expect(cache.get('k999')).toBe(999)
+    expect(cache.get('k0')).toBeUndefined()
+  })
+
+  test('re-setting an existing key updates in place without evicting', () => {
+    const cache = createBoundedCache<number>(2)
+    cache.set('a', 1)
+    cache.set('b', 2)
+    cache.set('a', 10)
+    // 'a' was already present, so 'b' must not have been evicted
+    expect(cache.size).toBe(2)
+    expect(cache.get('a')).toBe(10)
+    expect(cache.get('b')).toBe(2)
+  })
+
+  test('clear empties the cache', () => {
+    const cache = createBoundedCache<number>(4)
+    cache.set('a', 1)
+    cache.set('b', 2)
+    cache.clear()
+    expect(cache.size).toBe(0)
+    expect(cache.get('a')).toBeUndefined()
   })
 })
 
