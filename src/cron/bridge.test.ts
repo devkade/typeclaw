@@ -34,11 +34,27 @@ function startFakeAgent(reply: (msg: ClientMessage) => ServerMessage | null): nu
   return bun.port
 }
 
-// Generous bound for happy-path WS round-trips under parallel-test
-// contention. Tests that deliberately exercise the timeout path (e.g.
-// "ignores replies whose requestId does not match") still use a tight
-// bound — those tests' contract IS the timeout, and bumping them would
-// just make the suite slower without making it more reliable.
+// Accepts TCP + HTTP but never completes the WebSocket upgrade (the fetch
+// handler hangs), so the client sees no 'open'/'error' — the deterministic
+// wedged-handshake case the connect timer exists to bound.
+function startStalledUpgradePeer(): number {
+  const bun = Bun.serve({
+    port: 0,
+    async fetch() {
+      await new Promise<Response>(() => {})
+      return new Response('unreachable')
+    },
+  })
+  server = bun
+  if (bun.port === undefined) throw new Error('Bun.serve returned no port')
+  return bun.port
+}
+
+// Generous bound for the WS handshake under parallel-test contention. Used
+// as the whole budget for happy-path round-trips, and as the connect-only
+// budget for the reply-timeout test — that test keeps a tight *reply* budget
+// (its contract IS the reply timeout) but must not let a slow handshake under
+// load trip the connect timeout first and surface as `unreachable`.
 const HAPPY_PATH_TIMEOUT_MS = 10_000
 
 describe('cron list bridge', () => {
@@ -112,8 +128,44 @@ describe('cron list bridge', () => {
       return { type: 'cron_list_result', requestId: 'wrong-id', result: { ok: true, jobs: [], nowMs: 0 } }
     })
 
-    const result = await fetchCronList({ cwd: process.cwd(), url: `ws://127.0.0.1:${port}`, timeoutMs: 300 })
+    const result = await fetchCronList({
+      cwd: process.cwd(),
+      url: `ws://127.0.0.1:${port}`,
+      connectTimeoutMs: HAPPY_PATH_TIMEOUT_MS,
+      timeoutMs: 300,
+    })
     expect(result.kind).toBe('timeout')
+  })
+
+  test('bounds a wedged handshake by connectTimeoutMs, not timeoutMs', async () => {
+    // given: a peer that stalls the upgrade forever, a tight connect budget,
+    // and a reply budget large enough that firing it instead would hang ~30x
+    // longer — so this only passes if the handshake timer uses connectTimeoutMs
+    const port = startStalledUpgradePeer()
+
+    const started = performance.now()
+    const result = await fetchCronList({
+      cwd: process.cwd(),
+      url: `ws://127.0.0.1:${port}`,
+      connectTimeoutMs: 300,
+      timeoutMs: HAPPY_PATH_TIMEOUT_MS,
+    })
+    const elapsedMs = performance.now() - started
+
+    expect(result.kind).toBe('unreachable')
+    if (result.kind !== 'unreachable') throw new Error('expected unreachable result')
+    expect(result.reason).toContain('after 300ms')
+    expect(elapsedMs).toBeLessThan(HAPPY_PATH_TIMEOUT_MS)
+  })
+
+  test('falls back to timeoutMs for the handshake when connectTimeoutMs is omitted', async () => {
+    const port = startStalledUpgradePeer()
+
+    const result = await fetchCronList({ cwd: process.cwd(), url: `ws://127.0.0.1:${port}`, timeoutMs: 300 })
+
+    expect(result.kind).toBe('unreachable')
+    if (result.kind !== 'unreachable') throw new Error('expected unreachable result')
+    expect(result.reason).toContain('after 300ms')
   })
 })
 

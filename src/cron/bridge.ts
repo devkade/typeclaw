@@ -5,6 +5,12 @@ export type CronListBridgeOptions = {
   cwd: string
   url?: string
   timeoutMs?: number
+  // Budget for the WS handshake only. Defaults to timeoutMs so production
+  // behavior is unchanged. Split out so the reply-timeout path can be tested
+  // with a tight reply budget while giving the connect phase enough slack to
+  // survive CPU contention under parallel tests — a slow handshake must not
+  // masquerade as a reply timeout (or, worse, surface as `unreachable`).
+  connectTimeoutMs?: number
   // Injected for tests so the in-container short-circuit can be exercised
   // without polluting process.env. Production callers omit this and the
   // bridge reads from process.env directly.
@@ -35,6 +41,7 @@ type DialResult = { kind: 'ok'; ws: WebSocket; timeoutMs: number } | { kind: 'un
 
 async function dial(opts: CronListBridgeOptions): Promise<DialResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const connectTimeoutMs = opts.connectTimeoutMs ?? timeoutMs
   let url = opts.url
   if (url === undefined) {
     try {
@@ -74,8 +81,8 @@ async function dial(opts: CronListBridgeOptions): Promise<DialResult> {
         try {
           ws.close()
         } catch {}
-        reject(new Error(`timed out connecting to ${displayUrl} after ${timeoutMs}ms`))
-      }, timeoutMs)
+        reject(new Error(`timed out connecting to ${displayUrl} after ${connectTimeoutMs}ms`))
+      }, connectTimeoutMs)
       ws.addEventListener('open', onOpen, { once: true })
       ws.addEventListener('error', onError, { once: true })
       ws.addEventListener('close', onClose, { once: true })
