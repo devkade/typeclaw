@@ -31,8 +31,8 @@ const writtenBySession = new Map<string, true>()
 //   - the parent dir's realpath must equal the real workspace/public dir, which
 //     blocks `workspace -> /agent/.env` style symlink escapes that a lexical
 //     check would follow,
-//   - the file is created with O_EXCL, so an existing file or a planted
-//     final-path symlink is rejected rather than clobbered or followed,
+//   - the runtime descriptor-anchors the parent, then the file is created with
+//     O_EXCL, so an existing file or planted final-path symlink is rejected,
 //   - a second write in the same session is rejected (one report per spawn),
 //   - the schema is strict, so an `acknowledgeGuards` field is rejected, not
 //     silently stripped.
@@ -52,7 +52,7 @@ Write to \`public/\` instead of \`workspace/\` when your resolved role lacks \`f
         .describe('Absolute path: <agent>/workspace/research-<slug>.md or <agent>/public/research-<slug>.md'),
       content: z.string().describe('The full markdown report body.'),
     }),
-    fileOperands: { output: ['path'] },
+    fileOperands: { create: ['path'] },
     async execute(args: WriteReportArgs, ctx: ToolContext) {
       if (writtenBySession.has(ctx.sessionId)) {
         throw new Error('A report has already been written for this session. You may write exactly one report.')

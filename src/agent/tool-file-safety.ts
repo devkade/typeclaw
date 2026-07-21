@@ -1,13 +1,17 @@
 import { constants, createWriteStream, lstatSync, type Stats } from 'node:fs'
-import { chmod, mkdir, mkdtemp, open, readdir, realpath, rm, stat, type FileHandle } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, open, readdir, realpath, rm, stat, unlink, type FileHandle } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
-import type { ToolFileOperands, ToolResult } from '@/plugin'
+import {
+  checkPrivateSurfaceReadGuard,
+  createPrivateSurfaceReadIdentityVerifier,
+  type PrivateSurfaceIdentityVerifier,
+} from '@/bundled-plugins/security/policies/private-surface-read'
+import type { ToolFileOperands, ToolLogger, ToolResult } from '@/plugin'
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
 import type { HiddenPaths } from '@/sandbox/hidden-paths'
 
@@ -17,6 +21,7 @@ export { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS }
 
 type Rewrite = { original: string; pinned: string }
 type FileTarget = { get(): string; original: string; set(value: string): void; uri: boolean }
+type OutputTarget = { target: FileTarget; mode: 'reserved' | 'exclusive-create' }
 type VerifiedInput = {
   target: FileTarget
   original: string
@@ -46,6 +51,7 @@ export const TOOL_INPUT_MAX_COUNT = {
 export const PINNED_SNAPSHOT_GLOBAL_MAX_BYTES = TOOL_INPUT_MAX_BYTES.channel_upload
 export const PINNED_SNAPSHOT_GLOBAL_MAX_COUNT = TOOL_INPUT_MAX_COUNT.channel_upload
 export const PINNED_SNAPSHOT_MAX_WAITERS = 32
+const TOOL_OUTPUT_MAX_COUNT = 32
 const TREE_SNAPSHOT_MAX_ENTRIES = 4096
 const AGENT_ROOT_SNAPSHOT_EXCLUDED_DIRS = new Set(['.git', '.gitstore', 'node_modules'])
 
@@ -54,6 +60,10 @@ export const TOOL_INPUT_TEMP_PREFIX = 'typeclaw-tool-input-'
 export type PinnedToolFiles = {
   restoreResult(result: ToolResult): ToolResult
   cleanup(): Promise<void>
+}
+
+type PinnedOutputTarget = PinnedToolFiles & {
+  rollback(): Promise<void>
 }
 
 // Test-only seam: pauses between budget acquisition and source open/stream so a
@@ -72,6 +82,7 @@ export async function enforceAndPinToolFiles(
     genericInputs?: boolean
     fileOperands?: ToolFileOperands
     hidden?: HiddenPaths
+    logger?: Pick<ToolLogger, 'warn'>
     signal?: AbortSignal
   },
   hooks: EnforceAndPinToolFilesHooks = {},
@@ -85,16 +96,22 @@ export async function enforceAndPinToolFiles(
     options.genericInputs === true,
     options.fileOperands,
     options.agentDir,
+    options.logger,
   )
   enforceCanonicalSecretDenial(options)
-  const outputs = outputTargets(options.tool, options.args, maxCount, options.fileOperands)
-  if (outputs.length > 0) return await pinOutputTargets(options, outputs)
-  if (targets.length === 0) return noPinnedFiles()
+  const outputs = outputTargets(options.tool, options.args, TOOL_OUTPUT_MAX_COUNT, options.fileOperands)
+  if (targets.length === 0) return outputs.length === 0 ? noPinnedFiles() : await pinOutputTargets(options, outputs)
 
   let dir: string | undefined
   const rewrites: Rewrite[] = []
   const verified: VerifiedInput[] = []
   const maxBytes = maxInputBytes(options.tool)
+  const identityOptions = {
+    tool: options.tool,
+    agentDir: options.agentDir,
+    hidden: options.hidden ?? { dirs: [], files: [] },
+  }
+  const initialIdentityVerifier = createPrivateSurfaceReadIdentityVerifier(identityOptions)
   let lease: BudgetLease | undefined
   try {
     let declaredBytes = 0
@@ -113,7 +130,10 @@ export async function enforceAndPinToolFiles(
           ? 'directory'
           : undefined
       if (kind === undefined) throw new Error(`tool input is not a supported regular file or directory: ${original}`)
-      if (kind === 'file') assertSingleLinkRegularFile(inspected, original)
+      if (kind === 'file') {
+        assertRegularInputFile(inspected, original)
+        enforceInputIdentityDenial(initialIdentityVerifier, inspected)
+      }
       if (kind === 'file' && inspected.size > maxBytes) throw inputTooLarge(original, inspected.size, maxBytes)
       declaredBytes += kind === 'file' ? inspected.size : 0
       if (declaredBytes > maxBytes) throw aggregateInputTooLarge(declaredBytes, maxBytes)
@@ -122,6 +142,7 @@ export async function enforceAndPinToolFiles(
 
     lease = await pinnedSnapshotBudget.acquire(declaredBytes, verified.length, options.signal)
     await hooks.afterBudgetAcquire?.()
+    const openedIdentityVerifier = createPrivateSurfaceReadIdentityVerifier(identityOptions)
 
     dir = await mkdtemp(path.join(options.tempRoot ?? tmpdir(), TOOL_INPUT_TEMP_PREFIX))
     let copiedBytes = 0
@@ -132,10 +153,11 @@ export async function enforceAndPinToolFiles(
         const source = await openInput(input.resolved, input.original)
         try {
           const opened = await source.stat()
-          assertSingleLinkRegularFile(opened, input.original)
+          assertRegularInputFile(opened, input.original)
           if (opened.dev !== input.dev || opened.ino !== input.ino) {
             throw new Error(`tool input changed while waiting for snapshot capacity: ${input.original}`)
           }
+          enforceInputIdentityDenial(openedIdentityVerifier, opened)
           copiedBytes += await streamSnapshot(
             source,
             pinned,
@@ -182,7 +204,7 @@ export async function enforceAndPinToolFiles(
 
   let cleaned = false
 
-  return {
+  const inputPinned: PinnedToolFiles = {
     restoreResult(result) {
       let restored = result
       for (const rewrite of rewrites) restored = replaceResultPath(restored, rewrite)
@@ -197,6 +219,15 @@ export async function enforceAndPinToolFiles(
         lease?.release()
       }
     },
+  }
+  if (outputs.length === 0) return inputPinned
+
+  try {
+    const outputPinned = await pinOutputTargets(options, outputs)
+    return composePinnedFiles([inputPinned, outputPinned])
+  } catch (error) {
+    await cleanupPinnedFilesReverse([inputPinned], true)
+    throw error
   }
 }
 
@@ -230,6 +261,7 @@ function fileTargets(
   genericInputs: boolean,
   fileOperands: ToolFileOperands | undefined,
   agentDir: string,
+  logger: Pick<ToolLogger, 'warn'> | undefined,
 ): FileTarget[] {
   if (isOutputTool(tool)) return []
   if (TOOLS_WITHOUT_LOCAL_FILE_OPERANDS.has(tool)) return []
@@ -262,7 +294,7 @@ function fileTargets(
   // generic operands either pins a real-repo anchor into a /tmp file:// path that
   // leaks into the posted review, or throws "ambiguous local file operand".
   if (tool === 'post_github_review') return targets
-  if (genericInputs) collectGenericFileTargets(tool, args, targets, maxCount, fileOperands, agentDir)
+  if (genericInputs) collectGenericFileTargets(tool, args, targets, maxCount, fileOperands, agentDir, logger)
   return targets
 }
 
@@ -270,8 +302,8 @@ function fileTargets(
 // bodies, prompts, queries, regex/CSS/jq strings) that are never a local file.
 // This table is for tools that ALSO have a real file operand and so cannot be
 // whole-tool exempt via TOOLS_WITHOUT_LOCAL_FILE_OPERANDS: web_fetch pins its
-// `url` (a file: URI there still snapshots) while `query`/`selector`/`pattern`
-// are prose. Pure control-token tools (reload, grant_role, stream_snapshot,
+// `url` (non-file URLs are exempt while file: URIs still snapshot) and treats
+// `query`/`selector`/`pattern` as prose. Pure control-token tools (reload, grant_role, stream_snapshot,
 // channel_edit, …) live in that set instead, so they are absent here.
 //
 // Scoped by full operand path, NOT key name — this is the fail-closed invariant:
@@ -282,7 +314,7 @@ function fileTargets(
 const NON_FILE_OPERANDS: Readonly<Record<string, ReadonlySet<string>>> = {
   skip_response: new Set(['reason']),
   web_search: new Set(['query']),
-  web_fetch: new Set(['query', 'selector', 'pattern']),
+  web_fetch: new Set(['url', 'query', 'selector', 'pattern']),
   todo_write: new Set(['todos.content']),
 }
 
@@ -328,19 +360,29 @@ function outputTargets(
   args: Record<string, unknown>,
   maxCount: number,
   operands: ToolFileOperands | undefined,
-): FileTarget[] {
-  if (isOutputTool(tool)) return typeof args.path === 'string' ? [propertyTarget(args, 'path')] : []
-  if (operands?.output === undefined || operands.output.length === 0) return []
-  const targets: FileTarget[] = []
-  collectDeclaredOutputTargets(args, targets, maxCount, new Set(operands.output))
+): OutputTarget[] {
+  if (isOutputTool(tool)) {
+    return typeof args.path === 'string' ? [{ target: propertyTarget(args, 'path'), mode: 'reserved' }] : []
+  }
+  const outputPaths = new Set(operands?.output ?? [])
+  const createPaths = new Set(operands?.create ?? [])
+  for (const operandPath of outputPaths) {
+    if (createPaths.has(operandPath)) {
+      throw new Error(`file operand ${JSON.stringify(operandPath)} cannot be both output and create`)
+    }
+  }
+  const targets: OutputTarget[] = []
+  collectDeclaredOutputTargets(args, targets, maxCount, outputPaths, 'reserved')
+  collectDeclaredOutputTargets(args, targets, maxCount, createPaths, 'exclusive-create')
   return targets
 }
 
 function collectDeclaredOutputTargets(
   value: unknown,
-  out: FileTarget[],
+  out: OutputTarget[],
   maxCount: number,
   declared: ReadonlySet<string>,
+  mode: OutputTarget['mode'],
   parentPath = '',
 ): void {
   if (Array.isArray(value)) {
@@ -348,12 +390,12 @@ function collectDeclaredOutputTargets(
     for (const [index, item] of value.entries()) {
       if (typeof item === 'string') {
         if (declaredOutput) {
-          out.push(arrayTarget(value, index))
-          if (out.length > maxCount) throw inputCountTooLarge(out.length, maxCount)
+          out.push({ target: arrayTarget(value, index), mode })
+          if (out.length > maxCount) throw outputCountTooLarge(out.length, maxCount)
         }
         continue
       }
-      collectDeclaredOutputTargets(item, out, maxCount, declared, parentPath)
+      collectDeclaredOutputTargets(item, out, maxCount, declared, mode, parentPath)
     }
     return
   }
@@ -361,11 +403,11 @@ function collectDeclaredOutputTargets(
   for (const [childKey, item] of Object.entries(value)) {
     const operandPath = parentPath === '' ? childKey : `${parentPath}.${childKey}`
     if (typeof item === 'string' && declared.has(operandPath)) {
-      out.push(propertyTarget(value, childKey))
-      if (out.length > maxCount) throw inputCountTooLarge(out.length, maxCount)
+      out.push({ target: propertyTarget(value, childKey), mode })
+      if (out.length > maxCount) throw outputCountTooLarge(out.length, maxCount)
       continue
     }
-    collectDeclaredOutputTargets(item, out, maxCount, declared, operandPath)
+    collectDeclaredOutputTargets(item, out, maxCount, declared, mode, operandPath)
   }
 }
 
@@ -376,12 +418,15 @@ function collectGenericFileTargets(
   maxCount: number,
   operands: ToolFileOperands | undefined,
   agentDir: string,
+  logger: Pick<ToolLogger, 'warn'> | undefined,
   parentPath = '',
 ): void {
   if (Array.isArray(value)) {
     const declaredInput = operands?.input?.includes(parentPath) === true
     const nonInput =
-      operands?.output?.includes(parentPath) === true || operands?.destructive?.includes(parentPath) === true
+      operands?.output?.includes(parentPath) === true ||
+      operands?.create?.includes(parentPath) === true ||
+      operands?.destructive?.includes(parentPath) === true
     const key = parentPath.split('.').at(-1) ?? parentPath
     // Precedence: declared input pins; declared output/destructive is not an
     // input; a known non-file operand is opaque (skipped, even a file: URI);
@@ -389,26 +434,23 @@ function collectGenericFileTargets(
     // fails closed. Both the static first-party table and a plugin's declared
     // `fileOperands.nonFile` are tool+operand-path scoped, so an unknown tool
     // never inherits an exemption from a common key name.
-    const knownNonFile =
-      !declaredInput && (operands?.nonFile?.includes(parentPath) === true || isKnownNonFileOperand(tool, parentPath))
+    const declaredNonFile = !declaredInput && operands?.nonFile?.includes(parentPath) === true
+    const knownNonFile = !declaredInput && isKnownNonFileOperand(tool, parentPath)
     for (const [index, item] of value.entries()) {
       if (typeof item === 'string') {
-        if (knownNonFile) continue
+        if (declaredNonFile || (knownNonFile && !isFileUri(item))) continue
         if (!nonInput && (isFileUri(item) || declaredInput)) {
           out.push(arrayTarget(value, index))
           if (out.length > maxCount) throw inputCountTooLarge(out.length, maxCount)
-        } else if (
-          !nonInput &&
-          !isSemanticGenericString(key, item) &&
-          isAmbiguousUndeclaredLocalOperand(item, agentDir, key)
-        ) {
+        } else if (!nonInput && isAmbiguousUndeclaredLocalOperand(item, agentDir, key)) {
+          warnForUndeclaredExistingLocalOperand(logger, tool, parentPath, item, agentDir)
           throw new Error(
             `ambiguous local file operand at key ${JSON.stringify(parentPath)}; the tool author must declare fileOperands.input or the caller must use a file: URI`,
           )
         }
         continue
       }
-      collectGenericFileTargets(tool, item, out, maxCount, operands, agentDir, parentPath)
+      collectGenericFileTargets(tool, item, out, maxCount, operands, agentDir, logger, parentPath)
     }
     return
   }
@@ -418,40 +460,59 @@ function collectGenericFileTargets(
     if (typeof item === 'string') {
       const declaredInput = operands?.input?.includes(operandPath) === true
       const nonInput =
-        operands?.output?.includes(operandPath) === true || operands?.destructive?.includes(operandPath) === true
+        operands?.output?.includes(operandPath) === true ||
+        operands?.create?.includes(operandPath) === true ||
+        operands?.destructive?.includes(operandPath) === true
       // Declared input wins; a known non-file operand (web_search.query,
       // web_fetch.selector, a plugin's declared `fileOperands.nonFile`, …) is
       // opaque and skipped even when its value is a file: URI; everything else
       // falls to the file:/heuristic scan below. Scoped by exact tool+operand-
       // path so an undeclared plugin reader using `content`/`prompt` still
       // fails closed.
-      if (
-        !declaredInput &&
-        (operands?.nonFile?.includes(operandPath) === true || isKnownNonFileOperand(tool, operandPath))
-      ) {
-        continue
-      }
+      const declaredNonFile = !declaredInput && operands?.nonFile?.includes(operandPath) === true
+      const knownNonFile = !declaredInput && isKnownNonFileOperand(tool, operandPath)
+      if (declaredNonFile || (knownNonFile && !isFileUri(item))) continue
       if (!nonInput && (isFileUri(item) || declaredInput)) {
         out.push(propertyTarget(value, childKey))
         if (out.length > maxCount) throw inputCountTooLarge(out.length, maxCount)
         continue
       }
-      if (
-        !nonInput &&
-        !isSemanticGenericString(childKey, item) &&
-        isAmbiguousUndeclaredLocalOperand(item, agentDir, childKey)
-      ) {
+      if (!nonInput && isAmbiguousUndeclaredLocalOperand(item, agentDir, childKey)) {
+        warnForUndeclaredExistingLocalOperand(logger, tool, operandPath, item, agentDir)
         throw new Error(
           `ambiguous local file operand at key ${JSON.stringify(operandPath)}; the tool author must declare fileOperands.input or the caller must use a file: URI`,
         )
       }
     }
-    collectGenericFileTargets(tool, item, out, maxCount, operands, agentDir, operandPath)
+    collectGenericFileTargets(tool, item, out, maxCount, operands, agentDir, logger, operandPath)
   }
 }
 
 function noPinnedFiles(): PinnedToolFiles {
   return { restoreResult: (result) => result, cleanup: async () => {} }
+}
+
+function composePinnedFiles(pinned: readonly PinnedToolFiles[]): PinnedToolFiles {
+  return {
+    restoreResult(result) {
+      return pinned.reduceRight((restored, entry) => entry.restoreResult(restored), result)
+    },
+    async cleanup() {
+      await cleanupPinnedFilesReverse(pinned)
+    },
+  }
+}
+
+async function cleanupPinnedFilesReverse(pinned: readonly PinnedToolFiles[], suppressErrors = false): Promise<void> {
+  let firstError: unknown
+  for (let index = pinned.length - 1; index >= 0; index -= 1) {
+    try {
+      await pinned[index]?.cleanup()
+    } catch (error) {
+      firstError ??= error
+    }
+  }
+  if (!suppressErrors && firstError !== undefined) throw firstError
 }
 
 async function openInput(absolute: string, original: string): Promise<FileHandle> {
@@ -472,25 +533,18 @@ async function pinOutputTargets(
     agentDir: string
     signal?: AbortSignal
   },
-  targets: FileTarget[],
+  targets: OutputTarget[],
 ): Promise<PinnedToolFiles> {
-  const pinned: PinnedToolFiles[] = []
+  const pinned: PinnedOutputTarget[] = []
   try {
     for (const target of targets) pinned.push(await pinOutputTarget(options, target))
   } catch (error) {
-    await Promise.allSettled([...pinned].reverse().map(async (entry) => await entry.cleanup()))
+    for (let index = pinned.length - 1; index >= 0; index -= 1) {
+      await pinned[index]?.rollback().catch(() => {})
+    }
     throw error
   }
-  return {
-    restoreResult(result) {
-      return pinned.reduce((restored, entry) => entry.restoreResult(restored), result)
-    },
-    async cleanup() {
-      const outcomes = await Promise.allSettled([...pinned].reverse().map(async (entry) => await entry.cleanup()))
-      const failed = outcomes.find((outcome) => outcome.status === 'rejected')
-      if (failed?.status === 'rejected') throw failed.reason
-    },
-  }
+  return composePinnedFiles(pinned)
 }
 
 async function pinOutputTarget(
@@ -500,8 +554,9 @@ async function pinOutputTarget(
     agentDir: string
     signal?: AbortSignal
   },
-  target: FileTarget,
-): Promise<PinnedToolFiles> {
+  output: OutputTarget,
+): Promise<PinnedOutputTarget> {
+  const { target } = output
   if (options.signal?.aborted === true) throw abortError(options.signal)
   const original = target.get()
   const absolute = path.resolve(options.agentDir, original)
@@ -519,6 +574,8 @@ async function pinOutputTarget(
   })
   let targetHandle: FileHandle | undefined
   let targetIdentity: { dev: number; ino: number } | undefined
+  let created = false
+  let anchored: string | undefined
   try {
     const fdRoot = '/proc/self/fd'
     const resolvedParent = await realpath(`${fdRoot}/${directory.fd}`)
@@ -527,59 +584,173 @@ async function pinOutputTarget(
       args: { path: path.join(resolvedParent, basename) },
       agentDir: options.agentDir,
     })
-    const anchored = `${fdRoot}/${directory.fd}/${basename}`
-    targetHandle = await open(anchored, constants.O_RDWR | noFollow).catch((error) => {
+    const anchoredOutput = `${fdRoot}/${directory.fd}/${basename}`
+    anchored = anchoredOutput
+    if (output.mode === 'exclusive-create') {
+      const existing = await open(anchoredOutput, constants.O_RDONLY | noFollow).catch((error) => {
+        if (isNotFoundError(error)) return undefined
+        throw error
+      })
+      if (existing !== undefined) {
+        await existing.close()
+        throw new Error(`write/edit output must not already exist: ${original}`)
+      }
+      target.set(anchoredOutput)
+      let cleaned = false
+      const finalize = async (verifyCreated: boolean): Promise<void> => {
+        if (cleaned) return
+        cleaned = true
+        let verifyError: unknown
+        if (verifyCreated) {
+          try {
+            await verifyExclusiveCreatedOutput({
+              anchored: anchoredOutput,
+              original,
+              noFollow,
+              tool: options.tool,
+              agentDir: options.agentDir,
+            })
+          } catch (error) {
+            verifyError = error
+          }
+        }
+        const closeError = await directory.close().catch((error) => error)
+        if (verifyError !== undefined) throw verifyError
+        if (closeError !== undefined) throw closeError
+      }
+      return {
+        restoreResult(result) {
+          return replaceResultPath(result, { original, pinned: anchoredOutput })
+        },
+        async cleanup() {
+          await finalize(true)
+        },
+        async rollback() {
+          await finalize(false)
+        },
+      }
+    }
+    targetHandle = await open(anchoredOutput, constants.O_RDWR | noFollow).catch((error) => {
       if (isNotFoundError(error)) return undefined
       throw error
     })
-    let executionPath = anchored
-    if (targetHandle !== undefined) {
-      const inspected = await targetHandle.stat()
-      if (!inspected.isFile() || inspected.nlink !== 1) {
-        throw new Error(`write/edit output is not a single-link regular file: ${original}`)
-      }
-      targetIdentity = { dev: inspected.dev, ino: inspected.ino }
-      const resolved = await realpath(`${fdRoot}/${targetHandle.fd}`)
-      enforceCanonicalSecretDenial({ tool: options.tool, args: { path: resolved }, agentDir: options.agentDir })
-      executionPath = `${fdRoot}/${targetHandle.fd}`
+    if (targetHandle === undefined) {
+      targetHandle = await open(
+        anchoredOutput,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | noFollow,
+        0o666,
+      ).catch((error) => {
+        if (error instanceof Error && 'code' in error && (error.code === 'EEXIST' || error.code === 'ELOOP')) {
+          throw new Error(`write/edit output destination changed while being authorized: ${original}`)
+        }
+        throw error
+      })
+      created = true
     }
+    const inspected = await targetHandle.stat()
+    if (!inspected.isFile() || inspected.nlink !== 1) {
+      throw new Error(`write/edit output is not a single-link regular file: ${original}`)
+    }
+    const authorizedIdentity = { dev: inspected.dev, ino: inspected.ino }
+    targetIdentity = authorizedIdentity
+    const resolved = await realpath(`${fdRoot}/${targetHandle.fd}`)
+    enforceCanonicalSecretDenial({ tool: options.tool, args: { path: resolved }, agentDir: options.agentDir })
+    const executionPath = `${fdRoot}/${targetHandle.fd}`
     target.set(executionPath)
     let cleaned = false
+    const finalize = async (removeCreated: boolean): Promise<void> => {
+      if (cleaned) return
+      cleaned = true
+      let verifyError: unknown
+      try {
+        await verifyOutputEntry({
+          anchored: anchoredOutput,
+          original,
+          identity: authorizedIdentity,
+          noFollow,
+          remove: removeCreated && created,
+          tool: options.tool,
+          agentDir: options.agentDir,
+        })
+      } catch (error) {
+        verifyError = error
+      }
+      const outcomes = await Promise.allSettled([targetHandle?.close(), directory.close()])
+      const failed = outcomes.find((outcome) => outcome.status === 'rejected')
+      if (verifyError !== undefined) throw verifyError
+      if (failed?.status === 'rejected') throw failed.reason
+    }
     return {
       restoreResult(result) {
         return replaceResultPath(result, { original, pinned: executionPath })
       },
       async cleanup() {
-        if (cleaned) return
-        cleaned = true
-        let verified: FileHandle | undefined
-        let verifyError: unknown
-        try {
-          verified = await open(anchored, constants.O_RDONLY | noFollow)
-          const inspected = await verified.stat()
-          if (!inspected.isFile() || inspected.nlink !== 1) {
-            throw new Error(`write/edit output is not a single-link regular file: ${original}`)
-          }
-          if (
-            targetIdentity !== undefined &&
-            (inspected.dev !== targetIdentity.dev || inspected.ino !== targetIdentity.ino)
-          ) {
-            throw new Error(`write/edit output destination changed during execution: ${original}`)
-          }
-          const resolved = await realpath(`${fdRoot}/${verified.fd}`)
-          enforceCanonicalSecretDenial({ tool: options.tool, args: { path: resolved }, agentDir: options.agentDir })
-        } catch (error) {
-          if (!(targetIdentity === undefined && isNotFoundError(error))) verifyError = error
-        }
-        const outcomes = await Promise.allSettled([verified?.close(), targetHandle?.close(), directory.close()])
-        const failed = outcomes.find((outcome) => outcome.status === 'rejected')
-        if (verifyError !== undefined) throw verifyError
-        if (failed?.status === 'rejected') throw failed.reason
+        await finalize(false)
+      },
+      async rollback() {
+        await finalize(true)
       },
     }
   } catch (error) {
+    if (created && anchored !== undefined && targetIdentity !== undefined) {
+      await verifyOutputEntry({
+        anchored,
+        original,
+        identity: targetIdentity,
+        noFollow,
+        remove: true,
+        tool: options.tool,
+        agentDir: options.agentDir,
+      }).catch(() => {})
+    }
     await Promise.allSettled([targetHandle?.close(), directory.close()])
     throw error
+  }
+}
+
+async function verifyExclusiveCreatedOutput(options: {
+  anchored: string
+  original: string
+  noFollow: number
+  tool: string
+  agentDir: string
+}): Promise<void> {
+  const verified = await open(options.anchored, constants.O_RDONLY | options.noFollow)
+  try {
+    const inspected = await verified.stat()
+    if (!inspected.isFile() || inspected.nlink !== 1) {
+      throw new Error(`write/edit output is not a single-link regular file: ${options.original}`)
+    }
+    const resolved = await realpath(`/proc/self/fd/${verified.fd}`)
+    enforceCanonicalSecretDenial({ tool: options.tool, args: { path: resolved }, agentDir: options.agentDir })
+  } finally {
+    await verified.close()
+  }
+}
+
+async function verifyOutputEntry(options: {
+  anchored: string
+  original: string
+  identity: { dev: number; ino: number }
+  noFollow: number
+  remove: boolean
+  tool: string
+  agentDir: string
+}): Promise<void> {
+  const verified = await open(options.anchored, constants.O_RDONLY | options.noFollow)
+  try {
+    const inspected = await verified.stat()
+    if (!inspected.isFile() || inspected.nlink !== 1) {
+      throw new Error(`write/edit output is not a single-link regular file: ${options.original}`)
+    }
+    if (inspected.dev !== options.identity.dev || inspected.ino !== options.identity.ino) {
+      throw new Error(`write/edit output destination changed during execution: ${options.original}`)
+    }
+    const resolved = await realpath(`/proc/self/fd/${verified.fd}`)
+    enforceCanonicalSecretDenial({ tool: options.tool, args: { path: resolved }, agentDir: options.agentDir })
+    if (options.remove) await unlink(options.anchored)
+  } finally {
+    await verified.close()
   }
 }
 
@@ -725,9 +896,21 @@ async function snapshotDirectoryTree(options: {
     }
     await mkdir(options.destination, { mode: 0o700 })
     const state = { copied: 0, entries: 0 }
+    const identityVerifier = createPrivateSurfaceReadIdentityVerifier({
+      tool: options.tool,
+      agentDir: options.agentDir,
+      hidden: options.hidden ?? { dirs: [], files: [] },
+    })
     const openedRoot = await realpath(`/proc/self/fd/${root.fd}`)
     const realAgentDir = await realpath(options.agentDir)
-    await snapshotOpenedDirectory(root, options.destination, options, state, openedRoot === realAgentDir)
+    await snapshotOpenedDirectory(
+      root,
+      options.destination,
+      options,
+      state,
+      identityVerifier,
+      openedRoot === realAgentDir,
+    )
     await chmod(options.destination, 0o500)
     return state.copied
   } finally {
@@ -740,6 +923,7 @@ async function snapshotOpenedDirectory(
   destination: string,
   options: Parameters<typeof snapshotDirectoryTree>[0],
   state: { copied: number; entries: number },
+  identityVerifier: PrivateSurfaceIdentityVerifier,
   isAgentRoot: boolean,
 ): Promise<void> {
   const sourceRoot = `/proc/self/fd/${directory.fd}`
@@ -766,7 +950,7 @@ async function snapshotOpenedDirectory(
         const resolved = await realpath(`/proc/self/fd/${child.fd}`)
         if (isDeniedSnapshotPath(resolved, options)) continue
         await mkdir(target, { mode: 0o700 })
-        await snapshotOpenedDirectory(child, target, options, state, false)
+        await snapshotOpenedDirectory(child, target, options, state, identityVerifier, false)
         await chmod(target, 0o500)
       } finally {
         await child.close()
@@ -780,7 +964,8 @@ async function snapshotOpenedDirectory(
     const source = await open(anchored, constants.O_RDONLY | constants.O_NOFOLLOW)
     try {
       const opened = await source.stat()
-      assertSingleLinkRegularFile(opened, candidate)
+      assertRegularInputFile(opened, candidate)
+      enforceInputIdentityDenial(identityVerifier, opened)
       const resolved = await realpath(`/proc/self/fd/${source.fd}`)
       if (isDeniedSnapshotPath(resolved, options)) continue
       state.copied += await streamSnapshot(
@@ -800,13 +985,8 @@ async function snapshotOpenedDirectory(
   }
 }
 
-function assertSingleLinkRegularFile(stats: Stats, original: string): void {
+function assertRegularInputFile(stats: Stats, original: string): void {
   if (!stats.isFile()) throw new Error(`tool input changed to a non-regular file before snapshot: ${original}`)
-  if (stats.nlink !== 1) {
-    throw new Error(
-      `tool input has ${stats.nlink} hard links and cannot be snapshotted safely; copy it to a unique regular file before retrying: ${original}`,
-    )
-  }
 }
 
 function maxInputBytes(tool: string): number {
@@ -830,25 +1010,31 @@ function isTreeInputTool(tool: string): boolean {
 }
 
 function isAmbiguousUndeclaredLocalOperand(value: string, agentDir: string, key: string): boolean {
-  if (isFileShapedKey(key)) return true
-  if (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^(?:\\\\|\/\/)[^\\/]/.test(value)) return true
-  if (value.startsWith('./') || value.startsWith('../')) return true
-  if (/[\\/]/.test(value)) return true
-  const basename = path.posix.basename(value.replaceAll('\\', '/'))
-  if (CANONICAL_AGENT_SECRET_FILES.includes(basename as (typeof CANONICAL_AGENT_SECRET_FILES)[number])) return true
-  if (/^[^./\\\s][^/\\\s]*\.[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) return true
-
+  // Filesystem reality wins over semantic spelling: an existing entry named
+  // like a repository slug, date, URL, or package coordinate is still a local
+  // operand and must be declared so it is authorized and pinned.
   const resolved = path.resolve(agentDir, value)
   try {
     lstatSync(resolved)
     return true
   } catch (error) {
-    return !isNotFoundError(error)
+    if (!isNotFoundError(error)) return true
   }
+
+  const basename = path.posix.basename(value.replaceAll('\\', '/'))
+  if (CANONICAL_AGENT_SECRET_FILES.includes(basename as (typeof CANONICAL_AGENT_SECRET_FILES)[number])) return true
+
+  if (isFileShapedKey(key)) return !(normalizedKey(key) === 'path' && isSafeApiRoute(value))
+  if (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^(?:\\\\|\/\/)[^\\/]/.test(value)) return true
+  if (value.startsWith('./') || value.startsWith('../')) return true
+  if (isSemanticGenericString(key, value)) return false
+  if (/[\\/]/.test(value)) return true
+  if (/^[^./\\\s][^/\\\s]*\.[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) return true
+  return false
 }
 
 function isFileShapedKey(key: string): boolean {
-  const normalized = key.replaceAll(/[-_]/g, '').toLocaleLowerCase()
+  const normalized = normalizedKey(key)
   return (
     normalized === 'path' ||
     normalized === 'file' ||
@@ -860,16 +1046,24 @@ function isFileShapedKey(key: string): boolean {
   )
 }
 
+function normalizedKey(key: string): string {
+  return key.replaceAll(/[-_]/g, '').toLocaleLowerCase()
+}
+
 function isSemanticGenericString(key: string, value: string): boolean {
   if (isExplicitNonFileUrl(value)) return true
-  if (key === 'path' && isSafeApiRoute(value)) return true
-  return key === 'repository' && isSafeRepositorySlug(value)
+  const normalized = normalizedKey(key)
+  if (
+    (normalized === 'repository' || normalized === 'repositoryslug' || normalized === 'reposlug') &&
+    isSafeRepositorySlug(value)
+  ) {
+    return true
+  }
+  if ((normalized === 'date' || normalized === 'fraction') && isSafeNumericDateOrFraction(value)) return true
+  return isPackageCoordinateKey(normalized) && isSafePackageCoordinate(value)
 }
 
 function isExplicitNonFileUrl(value: string): boolean {
-  // Trim to match the file:/URL detection elsewhere: a leading-whitespace
-  // "  https://…" is still a non-file URL, and a "  file://…" must NOT be
-  // treated as one (it pins). Windows-drive and file: exclusions run on trimmed.
   const trimmed = value.trim()
   if (/^[A-Za-z]:[\\/]/.test(trimmed)) return false
   if (!/^[A-Za-z][A-Za-z0-9+.-]*:/.test(trimmed) || trimmed.toLocaleLowerCase().startsWith('file:')) return false
@@ -882,8 +1076,7 @@ function isExplicitNonFileUrl(value: string): boolean {
 
 function isSafeApiRoute(value: string): boolean {
   if (!/^\/v\d+\//.test(value) || value.includes('\\') || value.includes('//')) return false
-  const segments = value.split('/')
-  for (const segment of segments.slice(1)) {
+  for (const segment of value.split('/').slice(1)) {
     if (segment.length === 0) return false
     let decoded: string
     try {
@@ -901,6 +1094,58 @@ function isSafeRepositorySlug(value: string): boolean {
     value,
   )
   return match !== null && match[1] !== '.' && match[1] !== '..' && match[2] !== '.' && match[2] !== '..'
+}
+
+function isSafeNumericDateOrFraction(value: string): boolean {
+  return /^\d{1,4}([/-])\d{1,2}(?:\1\d{1,4})?$/.test(value)
+}
+
+function isPackageCoordinateKey(normalized: string): boolean {
+  return (
+    normalized === 'package' ||
+    normalized === 'packagename' ||
+    normalized === 'packagespec' ||
+    normalized === 'packagecoordinate'
+  )
+}
+
+function isSafePackageCoordinate(value: string): boolean {
+  if (/^@[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*(?:@[^\s/]+)?$/.test(value)) return true
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]*@[^\s/@]+$/.test(value)) return true
+  if (/^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.+-]+){0,3}$/.test(value)) return true
+  if (/^(?:[A-Za-z_][A-Za-z0-9_-]*\.)+[A-Za-z_][A-Za-z0-9_-]*$/.test(value)) return true
+  const segments = value.split('/')
+  return segments.length > 1 && segments.every((segment) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segment))
+}
+
+function warnForUndeclaredExistingLocalOperand(
+  logger: Pick<ToolLogger, 'warn'> | undefined,
+  tool: string,
+  operandPath: string,
+  value: string,
+  agentDir: string,
+): void {
+  if (logger === undefined) return
+  try {
+    lstatSync(path.resolve(agentDir, value))
+  } catch {
+    return
+  }
+  try {
+    logger.warn(
+      `[tool-file-safety] ${tool} received an undeclared existing local operand at ${JSON.stringify(operandPath)}; declare fileOperands.input to authorize immutable snapshotting`,
+    )
+  } catch {
+    // Diagnostics must never change authorization behavior.
+  }
+}
+
+function enforceInputIdentityDenial(
+  verifier: PrivateSurfaceIdentityVerifier,
+  identity: Pick<Stats, 'dev' | 'ino' | 'nlink'>,
+): void {
+  const blocked = verifier.check(identity)
+  if (blocked !== undefined) throw new Error(`blocked: ${blocked.reason}`)
 }
 
 function isDeniedSnapshotPath(
@@ -941,6 +1186,10 @@ function processBudgetGrowthExceeded(size: number): Error {
 
 function inputCountTooLarge(count: number, maxCount: number): Error {
   return new Error(`tool input count exceeds the per-invocation limit (${count} > ${maxCount})`)
+}
+
+function outputCountTooLarge(count: number, maxCount: number): Error {
+  return new Error(`tool output count exceeds the per-invocation limit (${count} > ${maxCount})`)
 }
 
 function replaceResultPath(result: ToolResult, rewrite: Rewrite): ToolResult {

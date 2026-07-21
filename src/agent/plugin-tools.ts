@@ -365,6 +365,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
         agentDir: opts.agentDir,
         genericInputs: true,
         fileOperands: tool.fileOperands,
+        logger: opts.logger,
         signal,
       })
       try {
