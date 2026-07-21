@@ -16,6 +16,7 @@ import {
 import { getResolvedTransformersVersion } from '@/models/transformers-version'
 
 import { homeRoot } from '../../../hostd/paths'
+import { resolveEmbedThreadCount } from './embed-threads'
 import { type BoundedText, boundEmbeddableText, MAX_MODEL_TOKENS } from './truncation'
 
 // Re-exported for the vector subsystem's existing imports. The canonical
@@ -99,7 +100,24 @@ export class Embedder {
     // miss, or silently loads a stale variant. Fails loudly with a refresh hint.
     await verifyModelCache()
     configureTransformers(env)
-    const extractor = await pipeline('feature-extraction', MODEL_NAME, { local_files_only: true, dtype: MODEL_DTYPE })
+    const extractor = await pipeline('feature-extraction', MODEL_NAME, {
+      local_files_only: true,
+      dtype: MODEL_DTYPE,
+      // onnxruntime-node session tuning (transformers.js forwards session_options
+      // straight into the native InferenceSession). Two memory levers:
+      //  - intraOpNumThreads: capped adaptively instead of ORT's default (0 =
+      //    one worker per visible host core), each of which holds its own
+      //    activation workspace for the singleton's lifetime.
+      //  - enableCpuMemArena: off — ORT's arena never returns memory to the OS,
+      //    so for the intermittent per-turn query embed it inflates steady-state
+      //    RSS with no benefit. Disabling frees per-embed, at a small per-call
+      //    malloc cost that is negligible next to the ~tens-of-ms forward pass.
+      session_options: {
+        intraOpNumThreads: resolveEmbedThreadCount(),
+        interOpNumThreads: 1,
+        enableCpuMemArena: false,
+      },
+    })
     return new Embedder(extractor)
   }
 

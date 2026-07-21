@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 
+import { DEFAULT_MAX_EMBED_THREADS } from './embed-threads'
+
 // Regression guard for the container-boot crash: `@huggingface/transformers`
 // eagerly `import sharp`s at module-evaluation time, and the memory plugin
 // imports the embedder transitively. If embedder.ts ever goes back to a top-level
@@ -84,5 +86,24 @@ describe('embedder lazy transformers load', () => {
 
     expect(lastPipelineOptions?.dtype).toBe('q8')
     expect(lastPipelineOptions?.local_files_only).toBe(true)
+  })
+
+  test('forwards the memory-bounding session_options to the onnxruntime session', async () => {
+    const { getEmbedder } = await freshEmbedderModule()
+
+    await getEmbedder()
+
+    // Regression guard: removing or miswiring this block silently restores the
+    // per-core intra-op thread fan-out and the arena that never frees, which is
+    // the production memory regression this PR fixes.
+    const opts = lastPipelineOptions?.session_options as
+      | { intraOpNumThreads?: unknown; interOpNumThreads?: unknown; enableCpuMemArena?: unknown }
+      | undefined
+    expect(opts).toBeDefined()
+    expect(opts?.interOpNumThreads).toBe(1)
+    expect(opts?.enableCpuMemArena).toBe(false)
+    expect(Number.isInteger(opts?.intraOpNumThreads)).toBe(true)
+    expect(opts?.intraOpNumThreads as number).toBeGreaterThanOrEqual(1)
+    expect(opts?.intraOpNumThreads as number).toBeLessThanOrEqual(DEFAULT_MAX_EMBED_THREADS)
   })
 })
