@@ -8,6 +8,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 
 import { buildMcpDispatcherToolDefinitions } from '@/agent'
 import { wrapSystemTool } from '@/agent/plugin-tools'
+import { enforceAndPinToolFiles } from '@/agent/tool-file-safety'
 import { createHookBus } from '@/plugin'
 import type { ToolContext } from '@/plugin/types'
 
@@ -151,6 +152,46 @@ describe('createMcpDispatcherTools', () => {
     }
   })
 
+  test.skipIf(process.platform !== 'linux')(
+    'an MCP mixed file contract snapshots its input while anchoring its output',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-mixed-files-'))
+      const source = path.join(agentDir, 'source.txt')
+      const secret = path.join(agentDir, '.env')
+      const destination = path.join(agentDir, 'result.txt')
+      await writeFile(source, 'safe input')
+      await writeFile(secret, 'SECRET=never')
+      const args: Record<string, unknown> = { source: pathToFileURL(source).href, destination }
+
+      try {
+        const pinned = await enforceAndPinToolFiles({
+          tool: 'mcp_call',
+          args,
+          agentDir,
+          genericInputs: true,
+          fileOperands: { input: ['source'], output: ['destination'] },
+        })
+        try {
+          await rm(source)
+          await symlink(secret, source)
+          const content = await readFile(new URL(args.source as string), 'utf8')
+          await writeFile(args.destination as string, content)
+          const restored = pinned.restoreResult({
+            content: [{ type: 'text', text: `${String(args.source)}\n${String(args.destination)}` }],
+          })
+
+          expect(await readFile(destination, 'utf8')).toBe('safe input')
+          expect(await readFile(secret, 'utf8')).toBe('SECRET=never')
+          expect(expectText(restored.content[0])).toBe(`${pathToFileURL(source).href}\n${destination}`)
+        } finally {
+          await pinned.cleanup()
+        }
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
   test('mcp_call rejects an undeclared absolute path-like operand before invoking the server', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-absolute-pin-'))
     const safe = path.join(agentDir, 'safe.txt')
@@ -172,7 +213,7 @@ describe('createMcpDispatcherTools', () => {
     }
   })
 
-  test('mcp_call leaves narrow semantic API routes, repository slugs, and opaque ids unchanged', async () => {
+  test('mcp_call leaves clear remote and control strings unchanged', async () => {
     const connection = fakeConnection('files', [])
     let received: Record<string, unknown> | undefined
     connection.callTool = async (_tool, args) => {
@@ -180,15 +221,17 @@ describe('createMcpDispatcherTools', () => {
       return { content: [{ type: 'text', text: 'ok' }] }
     }
     const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
-    await callTool.execute(
-      {
-        server: 'files',
-        tool: 'repository_status',
-        args: { path: '/v1/repos', repository: 'acme/widgets', id: 'opaque-123' },
-      } satisfies McpCallArgs,
-      toolContext(),
-    )
-    expect(received).toEqual({ path: '/v1/repos', repository: 'acme/widgets', id: 'opaque-123' })
+    const args = {
+      path: '/v1/repos',
+      repository: 'acme/widgets',
+      url: 'https://example.com/v1/items',
+      date: '7/16',
+      fraction: '2/3',
+      packageName: '@scope/widgets',
+      packageCoordinate: 'com.example:widgets:1.2.3',
+    }
+    await callTool.execute({ server: 'files', tool: 'repository_status', args }, toolContext())
+    expect(received).toEqual(args)
   })
 
   test.each(['/v1/../../tmp/result.txt', '/v1/%2e%2e/tmp/result.txt', '/v1\\..\\tmp', '/v1//repos'])(
@@ -201,15 +244,14 @@ describe('createMcpDispatcherTools', () => {
         return { content: [{ type: 'text', text: 'unexpected' }] }
       }
       const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
-
       await expect(
         callTool.execute({ server: 'files', tool: 'request', args: { path: route } }, toolContext()),
-      ).rejects.toThrow(/ambiguous.*fileOperands\.input.*file:/i)
+      ).rejects.toThrow(/ambiguous local file operand/i)
       expect(called).toBeFalse()
     },
   )
 
-  test('mcp_call rejects undeclared scalar array paths and non-file-key multi-component paths before dispatch', async () => {
+  test('mcp_call rejects undeclared scalar array paths and non-file-key local paths before dispatch', async () => {
     let called = false
     const connection = fakeConnection('files', [])
     connection.callTool = async () => {
@@ -217,12 +259,30 @@ describe('createMcpDispatcherTools', () => {
       return { content: [{ type: 'text', text: 'unexpected' }] }
     }
     const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
-
     for (const args of [{ files: ['workspace/missing.txt'] }, { value: 'workspace/missing.txt' }]) {
       await expect(callTool.execute({ server: 'files', tool: 'read', args }, toolContext())).rejects.toThrow(
-        /ambiguous.*fileOperands\.input.*file:/i,
+        /ambiguous local file operand/i,
       )
     }
+    expect(called).toBeFalse()
+  })
+
+  test.each([
+    ['outputPath', 'result.txt'],
+    ['filename', 'result.txt'],
+    ['value', 'C:\\temp\\result.txt'],
+    ['value', '\\\\server\\share\\result.txt'],
+  ])('mcp_call rejects undeclared nonexistent local operand %s=%s', async (key, value) => {
+    let called = false
+    const connection = fakeConnection('files', [])
+    connection.callTool = async () => {
+      called = true
+      return { content: [{ type: 'text', text: 'unexpected' }] }
+    }
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    await expect(
+      callTool.execute({ server: 'files', tool: 'write', args: { [key]: value } }, toolContext()),
+    ).rejects.toThrow(/ambiguous local file operand/i)
     expect(called).toBeFalse()
   })
 
@@ -251,25 +311,6 @@ describe('createMcpDispatcherTools', () => {
     }
   })
 
-  test.each([
-    ['outputPath', 'result.txt'],
-    ['filename', 'result.txt'],
-    ['value', 'C:\\temp\\result.txt'],
-    ['value', '\\\\server\\share\\result.txt'],
-  ])('mcp_call rejects undeclared nonexistent local operand %s=%s', async (key, value) => {
-    let called = false
-    const connection = fakeConnection('files', [])
-    connection.callTool = async () => {
-      called = true
-      return { content: [{ type: 'text', text: 'unexpected' }] }
-    }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
-    await expect(
-      callTool.execute({ server: 'files', tool: 'write', args: { [key]: value } }, toolContext()),
-    ).rejects.toThrow(/ambiguous.*fileOperands\.input.*file:/i)
-    expect(called).toBeFalse()
-  })
-
   test('mcp_call rejects undeclared existing local operands with metadata guidance', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-ambiguous-local-'))
     const local = path.join(agentDir, 'input.txt')
@@ -281,42 +322,48 @@ describe('createMcpDispatcherTools', () => {
       return { content: [{ type: 'text', text: 'unexpected' }] }
     }
     const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const warnings: string[] = []
     try {
       for (const value of [local, './input.txt', 'input.txt']) {
         await expect(
           callTool.execute(
             { server: 'files', tool: 'read', args: { filename: value } } satisfies McpCallArgs,
-            toolContext(agentDir),
+            toolContext(agentDir, warnings),
           ),
         ).rejects.toThrow(/ambiguous.*fileOperands\.input.*file:/i)
       }
       expect(called).toBeFalse()
+      expect(warnings).toHaveLength(3)
+      expect(warnings.every((warning) => /fileOperands\.input|existing local/i.test(warning))).toBeTrue()
     } finally {
       await rm(agentDir, { recursive: true, force: true })
     }
   })
 
-  test('mcp_call always denies a canonical bare display filename', async () => {
-    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-canonical-filename-'))
-    let called = false
-    const connection = fakeConnection('files', [])
-    connection.callTool = async () => {
-      called = true
-      return { content: [{ type: 'text', text: 'unexpected' }] }
-    }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
-    try {
-      await expect(
-        callTool.execute(
-          { server: 'files', tool: 'inspect', args: { filename: 'secrets.json' } } satisfies McpCallArgs,
-          toolContext(agentDir),
-        ),
-      ).rejects.toThrow(/not available|canonical|ambiguous/i)
-      expect(called).toBeFalse()
-    } finally {
-      await rm(agentDir, { recursive: true, force: true })
-    }
-  })
+  test.each(['secrets.json', 'workspace/.agent-messenger/credentials.json'])(
+    'mcp_call always denies canonical secret operand %s',
+    async (value) => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-canonical-filename-'))
+      let called = false
+      const connection = fakeConnection('files', [])
+      connection.callTool = async () => {
+        called = true
+        return { content: [{ type: 'text', text: 'unexpected' }] }
+      }
+      const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+      try {
+        await expect(
+          callTool.execute(
+            { server: 'files', tool: 'inspect', args: { filename: value } } satisfies McpCallArgs,
+            toolContext(agentDir),
+          ),
+        ).rejects.toThrow(/not available|canonical|ambiguous/i)
+        expect(called).toBeFalse()
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
 
   test('production system wrapper pins a 52 MiB MCP file exactly once without self-deadlock', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-single-pin-'))
@@ -478,12 +525,12 @@ function fakeConnection(name: string, tools: McpToolInfo[], result?: CallToolRes
   }
 }
 
-function toolContext(agentDir = '/agent'): ToolContext {
+function toolContext(agentDir = '/agent', warnings: string[] = []): ToolContext {
   return {
     signal: undefined,
     sessionId: 'ses_test',
     agentDir,
-    logger: { info() {}, warn() {}, error() {} },
+    logger: { info() {}, warn: (message) => warnings.push(message), error() {} },
   }
 }
 

@@ -1,5 +1,18 @@
 import { describe, expect, test } from 'bun:test'
-import { linkSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  opendirSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+  type Stats,
+} from 'node:fs'
 import { realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { homedir } from 'node:os'
@@ -8,7 +21,7 @@ import path from 'node:path'
 import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from '@/agent/tools-without-local-file-operands'
 import type { HiddenPaths } from '@/sandbox'
 
-import { checkPrivateSurfaceReadGuard } from './private-surface-read'
+import { checkPrivateSurfaceReadGuard, checkPrivateSurfaceReadIdentityGuard } from './private-surface-read'
 
 const AGENT = '/agent'
 const guestHidden: HiddenPaths = {
@@ -19,6 +32,17 @@ const privilegedHidden: HiddenPaths = { dirs: [], files: [] }
 
 function check(tool: string, args: Record<string, unknown>, hidden: HiddenPaths = guestHidden) {
   return checkPrivateSurfaceReadGuard({ tool, args, agentDir: AGENT, hidden })
+}
+
+function localOnlyLstat(agentDir: string): (candidate: string) => Stats {
+  const canonicalAgentDir = realpathSync.native(agentDir)
+  return (candidate) => {
+    const relative = path.relative(canonicalAgentDir, candidate)
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw Object.assign(new Error('not found in isolated test surface'), { code: 'ENOENT' })
+    }
+    return lstatSync(candidate)
+  }
 }
 
 describe('private-surface-read guard — builtin file tools', () => {
@@ -79,6 +103,14 @@ describe('private-surface-read guard — free-text field scoping (no false posit
     expect(check('stream_snapshot', { target_kind: 'session', target_id: 'workspace' })).toBeUndefined()
     expect(check('subagent_output', { task_id: 'memory' })).toBeUndefined()
     expect(check('spawn_subagent', { subagent_type: 'memory', prompt: 'x' })).toBeUndefined()
+    expect(check('channel_fetch_attachment', { attachment_id: 1, filename: 'memory/foo' })).toBeUndefined()
+    expect(
+      check('post_github_review', {
+        event: 'COMMENT',
+        body: 'Review body',
+        comments: [{ path: 'memory/foo', line: 1, body: 'Remote repository path' }],
+      }),
+    ).toBeUndefined()
   })
 
   test('the shared exemption is tool-scoped: an unknown tool with the same key still fails closed', () => {
@@ -368,7 +400,10 @@ describe('private-surface-read guard — symlink bypass defense', () => {
     writeFileSync(source, 'public')
     linkSync(source, alias)
     expect(
-      checkPrivateSurfaceReadGuard({ tool: 'read', args: { path: alias }, agentDir, hidden: privilegedHidden }),
+      checkPrivateSurfaceReadGuard(
+        { tool: 'read', args: { path: alias }, agentDir, hidden: privilegedHidden },
+        { openDirectory: opendirSync, lstat: localOnlyLstat(agentDir) },
+      ),
     ).toBeUndefined()
   })
 
@@ -413,6 +448,421 @@ describe('private-surface-read guard — symlink bypass defense', () => {
     writeFileSync(path.join(agentDir, 'public', 'real.md'), 'shareable')
     const result = checkPrivateSurfaceReadGuard({ tool: 'read', args: { path: 'public/real.md' }, agentDir, hidden })
     expect(result).toBeUndefined()
+  })
+})
+
+describe('private-surface-read guard — bounded hardlink identity proof', () => {
+  function makeHardlinkFixture(): { agentDir: string; source: string; alias: string } {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-proof-')))
+    const source = path.join(agentDir, 'source.txt')
+    const alias = path.join(agentDir, 'alias.txt')
+    writeFileSync(source, 'public')
+    linkSync(source, alias)
+    return { agentDir, source, alias }
+  }
+
+  test('rejects an inode matching a denied file', () => {
+    const { agentDir, source, alias } = makeHardlinkFixture()
+    expect(
+      checkPrivateSurfaceReadIdentityGuard({
+        tool: 'read',
+        agentDir,
+        hidden: { dirs: [], files: [source] },
+        identity: statSync(alias),
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('rejects an inode with an alias below a denied directory', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-denied-dir-')))
+    const hiddenDir = path.join(agentDir, 'memory')
+    const publicDir = path.join(agentDir, 'public')
+    mkdirSync(hiddenDir)
+    mkdirSync(publicDir)
+    const hidden = path.join(hiddenDir, 'secret.txt')
+    const alias = path.join(publicDir, 'alias.txt')
+    writeFileSync(hidden, 'private')
+    linkSync(hidden, alias)
+    expect(
+      checkPrivateSurfaceReadIdentityGuard({
+        tool: 'read',
+        agentDir,
+        hidden: { dirs: [hiddenDir], files: [] },
+        identity: statSync(alias),
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('accepts a fully-accounted ordinary multi-link inode', () => {
+    const { agentDir, alias } = makeHardlinkFixture()
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        {
+          tool: 'read',
+          agentDir,
+          hidden: privilegedHidden,
+          identity: statSync(alias),
+        },
+        { openDirectory: opendirSync, lstat: localOnlyLstat(agentDir) },
+      ),
+    ).toBeUndefined()
+  })
+
+  test('does not count the same visible directory entry twice toward nlink', () => {
+    const externalDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-duplicate-external-')))
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-duplicate-agent-')))
+    const external = path.join(externalDir, 'external.txt')
+    const visible = path.join(agentDir, 'visible.txt')
+    writeFileSync(external, 'shared')
+    linkSync(external, visible)
+    const visibleEntry = readdirSync(agentDir, { withFileTypes: true }).find((entry) => entry.name === 'visible.txt')
+    if (visibleEntry === undefined) throw new Error('test fixture entry missing')
+
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(visible) },
+        {
+          lstat: localOnlyLstat(agentDir),
+          openDirectory() {
+            let reads = 0
+            return {
+              readSync() {
+                reads += 1
+                return reads <= 2 ? visibleEntry : null
+              },
+              closeSync() {},
+            }
+          },
+        },
+      )?.block,
+    ).toBe(true)
+  })
+
+  test('rejects one visible link renamed between observations while an external alias remains unscanned', () => {
+    const externalDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-rename-external-')))
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-rename-agent-')))
+    const external = path.join(externalDir, 'external.txt')
+    const beforeRename = path.join(agentDir, 'before.txt')
+    const afterRename = path.join(agentDir, 'after.txt')
+    writeFileSync(external, 'shared')
+    linkSync(external, beforeRename)
+    const beforeEntry = readdirSync(agentDir, { withFileTypes: true }).find((entry) => entry.name === 'before.txt')
+    if (beforeEntry === undefined) throw new Error('test fixture entry missing')
+
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(beforeRename) },
+        {
+          lstat: localOnlyLstat(agentDir),
+          openDirectory() {
+            let reads = 0
+            return {
+              readSync() {
+                reads += 1
+                if (reads === 1) return beforeEntry
+                if (reads === 2) {
+                  renameSync(beforeRename, afterRename)
+                  return (
+                    readdirSync(agentDir, { withFileTypes: true }).find((entry) => entry.name === 'after.txt') ?? null
+                  )
+                }
+                return null
+              },
+              closeSync() {},
+            }
+          },
+        },
+      )?.block,
+    ).toBe(true)
+  })
+
+  test('rejects one visible link moved from a scanned sibling into a pending sibling', () => {
+    const externalDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-move-external-')))
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-move-agent-')))
+    const scannedDir = path.join(agentDir, 'scanned')
+    const pendingDir = path.join(agentDir, 'pending')
+    const external = path.join(externalDir, 'external.txt')
+    const beforeMove = path.join(scannedDir, 'visible.txt')
+    const afterMove = path.join(pendingDir, 'visible.txt')
+    mkdirSync(scannedDir)
+    mkdirSync(pendingDir)
+    writeFileSync(external, 'shared')
+    linkSync(external, beforeMove)
+    const rootEntries = readdirSync(agentDir, { withFileTypes: true })
+    const scannedEntry = rootEntries.find((entry) => entry.name === 'scanned')
+    const pendingEntry = rootEntries.find((entry) => entry.name === 'pending')
+    const visibleEntry = readdirSync(scannedDir, { withFileTypes: true }).find((entry) => entry.name === 'visible.txt')
+    if (scannedEntry === undefined || pendingEntry === undefined || visibleEntry === undefined) {
+      throw new Error('test fixture entry missing')
+    }
+
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(beforeMove) },
+        {
+          lstat: localOnlyLstat(agentDir),
+          openDirectory(directory) {
+            if (directory === agentDir) {
+              const entries = [pendingEntry, scannedEntry]
+              let index = 0
+              return { readSync: () => entries[index++] ?? null, closeSync() {} }
+            }
+            if (directory === scannedDir) {
+              let read = false
+              return {
+                readSync() {
+                  if (read) return null
+                  read = true
+                  return visibleEntry
+                },
+                closeSync() {
+                  renameSync(beforeMove, afterMove)
+                },
+              }
+            }
+            let read = false
+            return {
+              readSync() {
+                if (read) return null
+                read = true
+                return (
+                  readdirSync(pendingDir, { withFileTypes: true }).find((entry) => entry.name === 'visible.txt') ?? null
+                )
+              },
+              closeSync() {},
+            }
+          },
+        },
+      )?.block,
+    ).toBe(true)
+  })
+
+  test.skipIf(process.platform === 'linux')('fails closed without a descriptor traversal seam off Linux', () => {
+    const { agentDir, alias } = makeHardlinkFixture()
+    expect(
+      checkPrivateSurfaceReadIdentityGuard({
+        tool: 'read',
+        agentDir,
+        hidden: privilegedHidden,
+        identity: statSync(alias),
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('does not count a regular entry swapped to a symlink during the scan', () => {
+    const externalDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-external-')))
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-swap-')))
+    const source = path.join(externalDir, 'source.txt')
+    const alias = path.join(agentDir, 'alias.txt')
+    const decoy = path.join(agentDir, 'decoy.txt')
+    writeFileSync(source, 'outside')
+    linkSync(source, alias)
+    writeFileSync(decoy, 'decoy')
+
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(alias) },
+        {
+          openDirectory(directory) {
+            const entries = readdirSync(directory, { withFileTypes: true })
+            let index = 0
+            return {
+              readSync() {
+                const entry = entries[index++] ?? null
+                if (entry?.name === 'decoy.txt') {
+                  unlinkSync(decoy)
+                  symlinkSync(source, decoy)
+                }
+                return entry
+              },
+              closeSync() {},
+            }
+          },
+        },
+      )?.block,
+    ).toBe(true)
+  })
+
+  test.skipIf(process.platform !== 'linux')('fails closed when a discovered directory is swapped to a symlink', () => {
+    const externalDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-dir-swap-external-')))
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-dir-swap-agent-')))
+    const visibleDir = path.join(agentDir, 'visible')
+    const parkedDir = path.join(externalDir, 'parked')
+    const first = path.join(visibleDir, 'first.txt')
+    const second = path.join(visibleDir, 'second.txt')
+    mkdirSync(visibleDir)
+    writeFileSync(first, 'public')
+    linkSync(first, second)
+    let swapped = false
+
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(first) },
+        {
+          afterEntryLstat(candidate, stats) {
+            if (swapped || candidate !== visibleDir || !stats.isDirectory()) return
+            swapped = true
+            renameSync(visibleDir, parkedDir)
+            symlinkSync(parkedDir, visibleDir)
+          },
+        },
+      )?.block,
+    ).toBe(true)
+  })
+
+  test('scans denied trees before accepting duplicated visible identity counts', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-denied-first-')))
+    const hiddenDir = path.join(agentDir, 'memory')
+    const visible = path.join(agentDir, 'visible.txt')
+    const hidden = path.join(hiddenDir, 'hidden.txt')
+    mkdirSync(hiddenDir)
+    writeFileSync(visible, 'shared')
+    linkSync(visible, hidden)
+
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: { dirs: [hiddenDir], files: [] }, identity: statSync(visible) },
+        {
+          openDirectory(directory) {
+            const entries = readdirSync(directory, { withFileTypes: true })
+            const visibleEntry = entries.find((entry) => entry.name === 'visible.txt')
+            const queued = directory === agentDir && visibleEntry !== undefined ? [...entries, visibleEntry] : entries
+            let index = 0
+            return {
+              readSync() {
+                return queued[index++] ?? null
+              },
+              closeSync() {},
+            }
+          },
+        },
+      )?.block,
+    ).toBe(true)
+  })
+
+  test('shares one entry budget and inventory across every candidate in a guard call', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-hardlink-aggregate-')))
+    const first = path.join(agentDir, 'first.txt')
+    const firstAlias = path.join(agentDir, 'first-alias.txt')
+    const second = path.join(agentDir, 'second.txt')
+    const secondAlias = path.join(agentDir, 'second-alias.txt')
+    writeFileSync(first, 'first')
+    linkSync(first, firstAlias)
+    writeFileSync(second, 'second')
+    linkSync(second, secondAlias)
+
+    let reads = 0
+    const maxEntries = 4
+    const result = checkPrivateSurfaceReadGuard(
+      { tool: 'plugin_reader', args: { first, second }, agentDir, hidden: privilegedHidden },
+      {
+        maxEntries,
+        lstat: localOnlyLstat(agentDir),
+        openDirectory(directory) {
+          const reader = opendirSync(directory)
+          return {
+            readSync() {
+              reads += 1
+              return reader.readSync()
+            },
+            closeSync() {
+              reader.closeSync()
+            },
+          }
+        },
+      },
+    )
+
+    expect(result).toBeUndefined()
+    expect(reads).toBeGreaterThan(0)
+    expect(reads).toBeLessThanOrEqual(maxEntries + 1)
+  })
+
+  test('fails closed when the entry budget is exhausted', () => {
+    const { agentDir, alias } = makeHardlinkFixture()
+    writeFileSync(path.join(agentDir, 'unrelated.txt'), 'x')
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(alias) },
+        { maxEntries: 1 },
+      )?.reason,
+    ).toMatch(/bounded|entry|hardlink/i)
+  })
+
+  test('fails closed when a scanned directory cannot be read', () => {
+    const { agentDir, alias } = makeHardlinkFixture()
+    expect(
+      checkPrivateSurfaceReadIdentityGuard(
+        { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(alias) },
+        {
+          openDirectory() {
+            const error = new Error('denied')
+            Object.assign(error, { code: 'EACCES' })
+            throw error
+          },
+        },
+      )?.reason,
+    ).toMatch(/bounded|read|hardlink/i)
+  })
+
+  test('stops pulling directory entries when the shared budget is exceeded', () => {
+    const { agentDir, alias } = makeHardlinkFixture()
+    const unrelated = path.join(agentDir, 'unrelated.txt')
+    writeFileSync(unrelated, 'x')
+    const unrelatedEntry = readdirSync(agentDir, { withFileTypes: true }).find(
+      (entry) => entry.name === 'unrelated.txt',
+    )
+    if (!unrelatedEntry) throw new Error('test fixture entry missing')
+
+    let reads = 0
+    let closes = 0
+    const maxEntries = 3
+    const fakeEntryCount = 10_000
+    const result = checkPrivateSurfaceReadIdentityGuard(
+      { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(alias) },
+      {
+        maxEntries,
+        openDirectory() {
+          return {
+            readSync() {
+              reads += 1
+              return reads <= fakeEntryCount ? unrelatedEntry : null
+            },
+            closeSync() {
+              closes += 1
+            },
+          }
+        },
+      },
+    )
+
+    expect(result?.reason).toMatch(/bounded|entry|hardlink/i)
+    expect(reads).toBeLessThanOrEqual(maxEntries + 1)
+    expect(closes).toBe(1)
+  })
+
+  test('closes the directory handle when an incremental read fails', () => {
+    const { agentDir, alias } = makeHardlinkFixture()
+    let closes = 0
+
+    const result = checkPrivateSurfaceReadIdentityGuard(
+      { tool: 'read', agentDir, hidden: privilegedHidden, identity: statSync(alias) },
+      {
+        openDirectory() {
+          return {
+            readSync() {
+              throw new Error('read failed')
+            },
+            closeSync() {
+              closes += 1
+            },
+          }
+        },
+      },
+    )
+
+    expect(result?.reason).toMatch(/bounded|read|hardlink/i)
+    expect(closes).toBe(1)
   })
 })
 

@@ -81,7 +81,9 @@ type Tool<P = unknown> = {
   fileOperands?: {
     input?: readonly string[]
     output?: readonly string[]
+    create?: readonly string[]
     destructive?: readonly string[]
+    nonFile?: readonly string[]
   }
   execute: (args: P, ctx: ToolContext) => Promise<ToolResult>
 }
@@ -99,9 +101,11 @@ type ToolResult = {
 }
 ```
 
-`fileOperands` declares which string fields carry local filesystem paths. Entries are dotted operand paths: for example, `source.path` addresses `args.source.path`, while `attachments.path` addresses the `path` field of each object in an `attachments` array (array indexes are not part of the path). `input` operands pass through normal authorization and execute against bounded immutable snapshots. `output` and `destructive` operands are explicitly not treated as reads or snapshotted; the tool's write/delete primitive remains responsible for authorizing and anchoring the operation.
+`fileOperands` declares which string fields carry local filesystem paths. Entries are dotted operand paths: for example, `source.path` addresses `args.source.path`, while `attachments.path` addresses the `path` field of each object in an `attachments` array (array indexes are not part of the path). `input` operands pass through normal authorization and execute against bounded immutable snapshots. `output` operands are authorized and descriptor-anchored by the runtime before dispatch; a missing target is atomically reserved as a new single-link regular file, and the plugin writes the rewritten path it receives without performing its own anchoring. `create` is the exclusive-creation variant: the runtime verifies the destination is absent and descriptor-anchors its parent, while the plugin must create the rewritten path with `O_CREAT | O_EXCL`; cleanup verifies the resulting file is single-link and remains below the authorized parent. `destructive` operands are not treated as reads or snapshotted, so the tool's delete/move primitive remains responsible for their authorization and anchoring. `nonFile` marks a field as a remote identifier or control token even if its value happens to name an existing agent-root entry; use it narrowly and never for a field the tool may open locally.
 
-Declaration is required even when a target does not exist yet. Undeclared file-shaped keys (`path`, `filename`, `inputPath`, `outputPath`, and equivalents) and confidently local values (relative, POSIX absolute, Windows drive/UNC, canonical credential basenames, existing paths, or bare filenames with extensions) are rejected before dispatch. The only semantic exceptions are narrow key-plus-grammar pairs such as `path: "/v1/..."` for API routes and `repository: "owner/repo"`; opaque identifiers in non-file keys remain valid. A `file:` URI explicitly opts an undeclared value into input authorization and immutable snapshotting. Declare every local path a tool accepts so nonexistent outputs cannot become a check/open race.
+Input, output, and create declarations may coexist. The runtime snapshots inputs and anchors destinations before dispatch, restores rewritten paths in inverse order in the result, and cleans their resources in reverse order. A failure while anchoring destinations also removes any input snapshots already acquired.
+
+Undeclared filesystem-capable strings fail closed even when the referenced entry does not exist yet. File-shaped keys, explicit relative or absolute paths, canonical credential names, and values resolving to existing entries are rejected before dispatch; existing-entry detection runs before every semantic exemption and also emits a developer warning naming the operand path. The only spelling-based exemptions are narrow grammars for clear remote/control values: non-`file:` URLs, strict repository slugs under repository-shaped keys, numeric dates/fractions under their matching keys, safe `/vN/...` API routes under `path`, and package coordinates under package-shaped keys. Traversal, malformed variants, and broader keys still fail closed. A `file:` URI explicitly opts an undeclared value into input authorization and immutable snapshotting. Exact first-party exemptions, whole-tool no-local-file declarations, and plugin `fileOperands.nonFile` declarations remain authoritative. Declare every local path a tool accepts; declared inputs stay pinned.
 
 `defineTool(tool)` is an identity helper for type inference. Built-in tools are referenced by tagged ref (`readTool`, `bashTool`, `editTool`, `writeTool`, `grepTool`, `findTool`, `lsTool`, `webSearchTool`, `webFetchTool`) — useful when wiring a subagent's `tools` list.
 
