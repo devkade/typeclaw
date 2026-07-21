@@ -138,6 +138,13 @@ export const TYPECLAW_ENTRYPOINT_PATH = '/usr/local/bin/typeclaw-entrypoint'
 // a path, and resolves `/agent/typeclaw.json` (`Cannot run json files`).
 export const TYPECLAW_CLI_ENTRY = '/agent/node_modules/typeclaw/src/cli/index.ts'
 
+// Perf: `--smol` selects JSC's small-heap profile (grows slower, GCs more often),
+// trading a little CPU for lower resident memory. The agent runtime is a
+// burst-then-idle workload, so temporary allocations get reclaimed instead of
+// settling into a high-water RSS. Flag goes before `run`. Used at every exec site
+// below so the runtime phase inherits it on every network-policy path.
+const RUNTIME_BUN = 'bun --smol run'
+
 // IPv4 networks the container is forbidden to egress to when
 // `network.blockInternal` is true. Loopback (127/8) is NOT here — loopback
 // traffic uses the `lo` interface, which the shim's first ACCEPT rule
@@ -574,7 +581,7 @@ if [ "\${TYPECLAW_ENTRYPOINT_RUNTIME:-0}" = "1" ]; then
   link_persistent_home_files
   link_configured_symlinks
   start_xvfb
-  exec bun run ${TYPECLAW_CLI_ENTRY} "$@"
+  exec ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
 fi
 
 persist_root="\${TYPECLAW_PERSIST_HOME_ROOT:-/agent/.typeclaw/home}"
@@ -602,7 +609,7 @@ if [ "\${TYPECLAW_NETWORK_BLOCK_INTERNAL:-0}" != "1" ]; then
   link_persistent_home_files
   link_configured_symlinks
   start_xvfb
-  exec bun run ${TYPECLAW_CLI_ENTRY} "$@"
+  exec ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
 fi
 
 iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -657,7 +664,7 @@ fi
 link_persistent_home_files
 link_configured_symlinks
 start_xvfb
-exec setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun run ${TYPECLAW_CLI_ENTRY} "$@"
+exec setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
 `
 }
 

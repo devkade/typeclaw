@@ -1486,7 +1486,7 @@ describe('network egress entrypoint shim', () => {
     expect(runtimeBranch).toContain('link_persistent_home_files')
     expect(runtimeBranch).toContain('link_configured_symlinks')
     expect(runtimeBranch).toContain('start_xvfb')
-    expect(runtimeBranch).toContain(`exec bun run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(runtimeBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
   })
 
   test('off-switch path (network.blockInternal=false) installs no iptables rules and reaches the runtime phase before bun starts', () => {
@@ -1501,7 +1501,7 @@ describe('network egress entrypoint shim', () => {
     // then
     expect(offBranch).not.toContain('iptables -A OUTPUT')
     expect(offBranch).toContain('TYPECLAW_ENTRYPOINT_RUNTIME=1')
-    expect(offBranch).toContain(`exec bun run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(offBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
   })
 
   test('shim self-heals on Xvfb presence: spawns Xvfb directly (not xvfb-run, which hangs as PID 1) and exports DISPLAY', () => {
@@ -1591,7 +1591,7 @@ describe('network egress entrypoint shim', () => {
   test('drops NET_ADMIN from bounding+inheritable+ambient sets before exec-ing (matches setpriv(1) warning)', () => {
     const shim = buildEntrypointShim()
     expect(shim).toContain(
-      `exec setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun run ${TYPECLAW_CLI_ENTRY} "$@"`,
+      `exec setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`,
     )
   })
 
@@ -1607,7 +1607,7 @@ describe('network egress entrypoint shim', () => {
 
     // then
     expect(runtimeBranch.indexOf('start_xvfb\n')).toBeLessThan(
-      runtimeBranch.indexOf(`exec bun run ${TYPECLAW_CLI_ENTRY}`),
+      runtimeBranch.indexOf(`exec bun --smol run ${TYPECLAW_CLI_ENTRY}`),
     )
     expect(networkOnTail.indexOf('start_xvfb\n')).toBeLessThan(networkOnTail.indexOf(`exec setpriv --bounding-set`))
   })
@@ -1655,8 +1655,8 @@ describe('network egress entrypoint shim', () => {
     expect(offBranchEnd).toBeGreaterThan(-1)
     const offBranch = shim.slice(0, offBranchEnd)
     expect(offBranch).not.toContain('iptables -A OUTPUT')
-    expect(offBranch).toContain(`exec bun run ${TYPECLAW_CLI_ENTRY} "$@"`)
-    expect(offBranch).not.toMatch(/exec setpriv [^\n]*-- bun run/)
+    expect(offBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(offBranch).not.toMatch(/exec setpriv [^\n]*-- bun --smol run/)
   })
 
   test('per-agent Dockerfile wires ENTRYPOINT to the shim path, not directly to bun run', () => {
@@ -1818,7 +1818,7 @@ describe('network egress entrypoint shim', () => {
 
     // then
     expect(runtimeBranch.indexOf('link_persistent_home_files\n')).toBeLessThan(
-      runtimeBranch.indexOf(`exec bun run ${TYPECLAW_CLI_ENTRY}`),
+      runtimeBranch.indexOf(`exec bun --smol run ${TYPECLAW_CLI_ENTRY}`),
     )
     expect(networkOnTail.indexOf('link_persistent_home_files\n')).toBeLessThan(
       networkOnTail.indexOf(`exec setpriv --bounding-set`),
