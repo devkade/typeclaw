@@ -32,10 +32,26 @@ Edit the four `CURL_IMPERSONATE_*` constants in `src/init/dockerfile.ts`, verify
 
 The separate `web_fetch` page reader does not use curl impersonation. It uses
 `src/agent/network/safe-http.ts`, which installs a validated socket `lookup`,
-rejects the entire DNS answer set when any A/AAAA record is non-public, retains
+rejects the entire DNS answer set when any A/AAAA record is non-public and not
+covered by the operator's exact-host or IPv4/IPv6 CIDR policy parsed from
+raw-masked `.env` at container boot, retains
 the original hostname for Host/SNI/TLS verification, and follows redirects
 manually under the same policy on every hop. Curl impersonation was deliberately
 removed from this path because hostname-only validation plus `--location` cannot
 prevent DNS rebinding. Akamai cookie warmup remains available, but its replay
 travels through the same pinned transport and credentials are stripped if a
 redirect crosses origins.
+
+The exception policy is application-layer only and is constructed once at boot;
+there is no model-triggered reload path. It is applied again to every manual redirect. A permitted
+hostname does not skip DNS resolution or socket pinning, and mixed answer sets
+still fail when any blocked answer is outside the exception. Cloud metadata
+hostnames and known metadata IPs are checked first and cannot be overridden by
+host entries, CIDRs, `acknowledgeGuards.ssrf`, or role-level guard bypasses. The
+same floor recognizes metadata IPv4 carried by standardized compatible, mapped,
+translatable, well-known NAT64, and 6to4 IPv6 forms. It blocks the full RFC 8215
+local-use `64:ff9b:1::/48` range because the technology-agnostic standard does not
+provide a safely inferable IPv4 field location—not because every member maps
+metadata. It does not guess arbitrary operator-specific RFC 6052 prefixes. The
+two `TYPECLAW_MODEL_HTTP_*` values are withheld from model bash, and raw `.env`
+is masked from model-driven file access.
