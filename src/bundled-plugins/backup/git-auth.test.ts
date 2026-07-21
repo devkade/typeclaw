@@ -22,6 +22,19 @@ describe('resolveBackupPushAuthEnv', () => {
     })
   })
 
+  test('live App resolver takes precedence over an ambient classic PAT', async () => {
+    const env = await resolveBackupPushAuthEnv('/agent', {
+      ...baseDeps(),
+      ghToken: 'ghp_operator',
+    })
+
+    expect(env).toMatchObject({
+      GIT_ASKPASS: '/usr/local/bin/typeclaw-git-askpass',
+      TYPECLAW_GIT_TOKEN: 'ghs_minted',
+      GIT_TERMINAL_PROMPT: '0',
+    })
+  })
+
   test('mints for the slug parsed from the origin push url', async () => {
     let requestedSlug: string | undefined
     const env = await resolveBackupPushAuthEnv('/agent', {

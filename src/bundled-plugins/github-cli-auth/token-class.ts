@@ -11,12 +11,10 @@ export function classifyGhToken(token: string | undefined): GhTokenClass {
 }
 
 // Whether the per-repo App minter should fire for a repo-targeting command.
-// App auth is detected via EITHER a seeded App-class GH_TOKEN OR a live App
-// token resolver — the latter is the authority because multi-owner / no-repos
-// App configs intentionally leave GH_TOKEN unseeded (the prefix would read
-// 'none'), yet the per-repo minter is still registered and able to mint. Classic
-// and fine-grained PATs are never re-minted: they pass through with whatever
-// GH_TOKEN is seeded, exactly as before.
+// App auth is detected via EITHER an operator-supplied App-class GH_TOKEN OR a
+// live App token resolver. The resolver is authoritative for channel App auth,
+// whose credentials are never seeded into process.env. Classic and fine-grained
+// PATs are never re-minted: they pass through with the effective process token.
 export function shouldMintAppToken(token: string | undefined, hasAppTokenResolver: boolean): boolean {
   const tokenClass = classifyGhToken(token)
   if (tokenClass === 'cross-owner' || tokenClass === 'fine-grained-pat') return false

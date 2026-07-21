@@ -885,76 +885,6 @@ describe('createGithubAdapter lifecycle', () => {
     expect(events).toEqual(['hooks-list', 'hooks-create'])
   })
 
-  test('App auth: single-repo periodic token refresh keeps GH_TOKEN warm via setInterval', async () => {
-    const { fetch: fetchImpl } = fakeFetchRecording(({ url, method }) => {
-      if (url === 'https://api.github.com/app' && method === 'GET') {
-        return Response.json({ slug: 'typeey-app' })
-      }
-      if (url === 'https://api.github.com/users/typeey-app%5Bbot%5D' && method === 'GET') {
-        return Response.json({ id: 42, login: 'typeey-app[bot]' })
-      }
-      if (url === 'https://api.github.com/repos/acme/widgets/installation' && method === 'GET') {
-        return Response.json({ id: 99 })
-      }
-      if (url === 'https://api.github.com/orgs/acme/installation' && method === 'GET') {
-        return Response.json({ id: 99 })
-      }
-      if (url === 'https://api.github.com/app/installations/99' && method === 'GET') {
-        return Response.json({
-          permissions: { issues: 'write', pull_requests: 'write', metadata: 'read' },
-          events: ['issues', 'issue_comment', 'pull_request'],
-        })
-      }
-      if (url === 'https://api.github.com/app/installations/99/access_tokens' && method === 'POST') {
-        return Response.json({ token: 'ghs_fresh', expires_at: '2099-01-01T00:00:00Z' })
-      }
-      if (url.includes('/repos/acme/widgets/hooks')) {
-        if (method === 'GET') return Response.json([])
-        if (method === 'POST') return Response.json({ id: 7 }, { status: 201 })
-      }
-      return new Response('unexpected', { status: 500 })
-    })
-
-    const refreshHandlers: Array<() => void> = []
-    const fakeInterval = (handler: () => void, _ms: number) => {
-      refreshHandlers.push(handler)
-      return { clear: () => {} }
-    }
-
-    const adapter = createGithubAdapter({
-      router: freshRouter(),
-      configRef: () => githubConfig(['acme/widgets']),
-      secrets: appSecrets(),
-      agentDir: '/tmp/agent',
-      logger: silentLogger(),
-      fetchImpl,
-      httpListenImpl: () => ({ stop: async () => {} }),
-      webhookRegistrationDelayMs: 0,
-      tokenRefreshIntervalMs: 100,
-      reconcileIntervalMs: 0,
-      setInterval: fakeInterval,
-    })
-
-    await adapter.start()
-    // Two timers register through the injected setInterval: the token refresh
-    // (index 0, registered first in the seed block) and the delivery-recovery
-    // sweep (index 1, registered last once managedHooks is populated). The
-    // periodic reconcile tick is disabled here (reconcileIntervalMs: 0) to keep
-    // this assertion about the token-refresh + sweep timers only.
-    expect(refreshHandlers.length).toBe(2)
-    expect(process.env.GH_TOKEN).toBe('ghs_fresh')
-
-    // Fire the refresh handler manually. tokenFn() is called and returns the
-    // cached token (since the fake token expires in 2099). The handler must
-    // not crash and must keep GH_TOKEN set.
-    refreshHandlers[0]!()
-    await new Promise((r) => setTimeout(r, 10))
-    expect(process.env.GH_TOKEN).toBe('ghs_fresh')
-
-    await adapter.stop()
-    expect(process.env.GH_TOKEN).toBeUndefined()
-  })
-
   test('delivery-recovery sweep is registered once hooks exist, queries the delivery log, and is cleared on stop', async () => {
     // Resolve deterministically when the sweep hits the deliveries endpoint,
     // instead of racing a fixed sleep against the token-mint + list round-trips.
@@ -1048,7 +978,7 @@ describe('createGithubAdapter lifecycle', () => {
     await adapter.stop()
   })
 
-  test('App auth: single-owner multi-repo seeds GH_TOKEN via a repo installation lookup', async () => {
+  test('App auth: single-owner multi-repo does not seed GH_TOKEN', async () => {
     const { fetch: fetchImpl, calls } = fakeFetchRecording(({ url, method }) => {
       if (url === 'https://api.github.com/app' && method === 'GET') return Response.json({ slug: 'typeey-app' })
       if (url === 'https://api.github.com/users/typeey-app%5Bbot%5D' && method === 'GET') {
@@ -1080,16 +1010,16 @@ describe('createGithubAdapter lifecycle', () => {
     })
 
     await adapter.start()
-    expect(process.env.GH_TOKEN).toBe('ghs_owner')
-    // Seed must use the repo endpoint (works for org- AND user-owned repos),
-    // never orgs/{owner}/installation (404s on personal accounts).
+    expect(process.env.GH_TOKEN).toBeUndefined()
+    // Runtime-owned API calls resolve installations by repository and never use
+    // the org-only endpoint, which would fail for personal repositories.
     expect(calls.some((c) => c.url === 'https://api.github.com/repos/acme/gadgets/installation')).toBe(true)
     expect(calls.some((c) => c.url.startsWith('https://api.github.com/orgs/'))).toBe(false)
     await adapter.stop()
     expect(process.env.GH_TOKEN).toBeUndefined()
   })
 
-  test('App auth: user-owned (personal account) repo seeds GH_TOKEN via the repo installation', async () => {
+  test('App auth: user-owned repository does not seed GH_TOKEN', async () => {
     const { fetch: fetchImpl, calls } = fakeFetchRecording(({ url, method }) => {
       if (url === 'https://api.github.com/app' && method === 'GET') return Response.json({ slug: 'typeey-app' })
       if (url === 'https://api.github.com/users/typeey-app%5Bbot%5D' && method === 'GET') {
@@ -1128,13 +1058,13 @@ describe('createGithubAdapter lifecycle', () => {
     })
 
     await adapter.start()
-    expect(process.env.GH_TOKEN).toBe('ghs_user')
+    expect(process.env.GH_TOKEN).toBeUndefined()
     expect(calls.some((c) => c.url === 'https://api.github.com/orgs/octocat/installation')).toBe(false)
     await adapter.stop()
     expect(process.env.GH_TOKEN).toBeUndefined()
   })
 
-  test('App auth: repos spanning multiple owners skip the GH_TOKEN seed and log guidance', async () => {
+  test('App auth: repositories spanning multiple owners do not seed GH_TOKEN', async () => {
     const { fetch: fetchImpl } = fakeFetchRecording(({ url, method }) => {
       if (url === 'https://api.github.com/app' && method === 'GET') return Response.json({ slug: 'typeey-app' })
       if (url === 'https://api.github.com/users/typeey-app%5Bbot%5D' && method === 'GET') {
@@ -1154,13 +1084,12 @@ describe('createGithubAdapter lifecycle', () => {
       return new Response('unexpected', { status: 500 })
     })
 
-    const logger = recordingLogger()
     const adapter = createGithubAdapter({
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets', 'globex/gizmos']),
       secrets: appSecrets(),
       agentDir: '/tmp/agent',
-      logger,
+      logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
       webhookRegistrationDelayMs: 0,
@@ -1168,12 +1097,11 @@ describe('createGithubAdapter lifecycle', () => {
 
     await adapter.start()
     expect(process.env.GH_TOKEN).toBeUndefined()
-    expect(logger.messages.some((m) => m.includes('repos span multiple owners'))).toBe(true)
     await adapter.stop()
   })
 
-  test('App auth: no repos configured skips the GH_TOKEN seed and logs guidance', async () => {
-    const { fetch: fetchImpl, calls } = fakeFetchRecording(({ url, method }) => {
+  test('App auth: no repositories configured does not seed GH_TOKEN', async () => {
+    const { fetch: fetchImpl } = fakeFetchRecording(({ url, method }) => {
       if (url === 'https://api.github.com/app' && method === 'GET') return Response.json({ slug: 'typeey-app' })
       if (url === 'https://api.github.com/users/typeey-app%5Bbot%5D' && method === 'GET') {
         return Response.json({ id: 42, login: 'typeey-app[bot]' })
@@ -1188,13 +1116,12 @@ describe('createGithubAdapter lifecycle', () => {
       return new Response('unexpected', { status: 500 })
     })
 
-    const logger = recordingLogger()
     const adapter = createGithubAdapter({
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: appSecrets(),
       agentDir: '/tmp/agent',
-      logger,
+      logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
       webhookRegistrationDelayMs: 0,
@@ -1202,9 +1129,6 @@ describe('createGithubAdapter lifecycle', () => {
 
     await adapter.start()
     expect(process.env.GH_TOKEN).toBeUndefined()
-    expect(logger.messages.some((m) => m.includes('no repos[] configured'))).toBe(true)
-    // No seed attempt means we never POST for an access token.
-    expect(calls.some((c) => c.url.endsWith('/access_tokens'))).toBe(false)
     await adapter.stop()
   })
 
@@ -1221,6 +1145,40 @@ describe('createGithubAdapter lifecycle', () => {
         return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } })
       })
     }
+
+    test('preserves an operator GH_TOKEN through App start and stop while repo-scoped minting remains available', async () => {
+      const { createGithubTokenBridge } = await import('@/channels/github-token-bridge')
+      const bridge = createGithubTokenBridge()
+      const { fetch: fetchImpl } = mintingFetch()
+      const originalToken = process.env.GH_TOKEN
+      process.env.GH_TOKEN = 'ghp_operator'
+      const adapter = createGithubAdapter({
+        router: freshRouter(),
+        configRef: () => githubConfig(['acme/widgets']),
+        secrets: appSecrets(),
+        agentDir: '/tmp/agent',
+        logger: silentLogger(),
+        fetchImpl,
+        httpListenImpl: () => ({ stop: async () => {} }),
+        webhookRegistrationDelayMs: 0,
+        githubTokenBridge: bridge,
+      })
+
+      try {
+        await adapter.start()
+        expect(process.env.GH_TOKEN).toBe('ghp_operator')
+        await expect(bridge.resolveTokenForRepo('acme/widgets')).resolves.toEqual({
+          kind: 'token',
+          token: 'ghs_minted',
+        })
+        await adapter.stop()
+        expect(process.env.GH_TOKEN).toBe('ghp_operator')
+      } finally {
+        await adapter.stop()
+        if (originalToken === undefined) delete process.env.GH_TOKEN
+        else process.env.GH_TOKEN = originalToken
+      }
+    })
 
     test('mints for a repo in repos[]', async () => {
       const { createGithubTokenBridge } = await import('@/channels/github-token-bridge')

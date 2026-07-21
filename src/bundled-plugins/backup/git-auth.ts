@@ -17,14 +17,16 @@ export type BackupPushAuthDeps = {
 // The backup runner spawns git directly (not via the bash tool), so the
 // `github-cli-auth` plugin's `tool.before` credential injection never fires for
 // its push. Without this, App-auth agents push with no credentials and fail.
-// We mirror that plugin exactly: only mint for App auth, only for a github.com
-// origin, scoped to the origin's own repo slug. PAT/SSH/credential-helper setups
-// return null and keep using the runner's inherited process env.
+// A live App resolver is authoritative even when the process also carries an
+// operator PAT: runtime backup always uses the repo-scoped App credential.
+// Without a resolver, PAT/SSH/credential-helper setups keep using the runner's
+// inherited process env.
 export async function resolveBackupPushAuthEnv(
   cwd: string,
   deps: BackupPushAuthDeps,
 ): Promise<BackupGitAuthEnv | null> {
-  if (!shouldMintAppToken(deps.ghToken, deps.hasAppTokenResolver())) return null
+  const hasAppTokenResolver = deps.hasAppTokenResolver()
+  if (!hasAppTokenResolver && !shouldMintAppToken(deps.ghToken, false)) return null
 
   const originUrl = await deps.resolveOriginPushUrl(cwd)
   if (originUrl === null) return null

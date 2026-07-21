@@ -6,12 +6,12 @@ export const GRAPHQL_AUTH_NUDGE_TAG = 'github-cli-auth:graphqlRepoHint'
 
 const NUDGE_TEXT =
   `\n\n[${GRAPHQL_AUTH_NUDGE_TAG}] That looked like a GitHub auth failure on a ` +
-  '`gh api graphql` call. Under a multi-owner GitHub App there is no single ' +
-  '`GH_TOKEN`, and graphql carries its repo inside the query — not an inspectable ' +
-  'path — so TypeClaw cannot tell which installation token to mint. Re-run with an ' +
-  'explicit repo, e.g. `gh api graphql -R owner/repo -f query=...`. `gh api` does ' +
-  'not accept `-R/--repo`; TypeClaw consumes it as the mint hint and strips it ' +
-  'before running the command with the right token injected.'
+  '`gh api graphql` call. GitHub App credentials are not ambient process tokens, ' +
+  'and graphql carries its repo inside the query — not an inspectable path — so ' +
+  'TypeClaw needs a repo hint before it can mint a repo-scoped installation token. ' +
+  'Re-run with an explicit repo, e.g. `gh api graphql -R owner/repo -f query=...`. ' +
+  '`gh api` does not accept `-R/--repo`; TypeClaw consumes it as the mint hint and ' +
+  'strips it before running the command with the right token injected.'
 
 // The shell strips quotes/escapes, so we match the raw `gh ... graphql` substring
 // rather than parse — the nudge is advisory, so a loose match is acceptable and a
@@ -40,9 +40,9 @@ const AUTH_FAILURE_SIGNATURES = [
 export function checkGraphqlAuthNudge(options: { tool: string; result: ToolResult }): void {
   if (options.tool !== 'bash') return
 
-  // Only meaningful when no usable token is seeded — the multi-owner App case.
-  // A seeded global token (single-owner App, classic/fine-grained PAT) means
-  // graphql already authenticates, so the advice would be wrong.
+  // Only meaningful when no usable process token exists. An operator token or a
+  // runtime-seeded PAT means graphql already authenticates, so the advice would
+  // be wrong.
   const tokenClass = classifyGhToken(process.env.GH_TOKEN)
   if (tokenClass !== 'none') return
 

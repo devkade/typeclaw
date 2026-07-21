@@ -23,14 +23,16 @@ function textOf(result: ToolResult): string {
 }
 
 describe('checkGraphqlAuthNudge', () => {
-  test('appends the repo hint when a gh api graphql call fails auth with no seeded token', () => {
+  test('single-owner App auth with no process token explains the repo-scoped mint hint', () => {
     delete process.env.GH_TOKEN
     const result = bashResult('gh api graphql -f query=... \nHTTP 401: Bad credentials')
 
     checkGraphqlAuthNudge({ tool: 'bash', result })
 
     expect(textOf(result)).toContain(GRAPHQL_AUTH_NUDGE_TAG)
+    expect(textOf(result)).toContain('App credentials are not ambient')
     expect(textOf(result)).toContain('-R owner/repo')
+    expect(textOf(result)).not.toContain('multi-owner')
   })
 
   test('matches the "Resource not accessible by integration" App-auth signature', () => {
