@@ -6,6 +6,31 @@ import { type AgentGit, resolveAgentGit } from '@/git/resolve-agent-git'
 
 export const COMMIT_TIMEOUT_MS = 30_000
 export const NETWORK_TIMEOUT_MS = 60_000
+export const MAINTENANCE_TIMEOUT_MS = 120_000
+
+// The two maintenance tasks are gated INDEPENDENTLY because a backup commit with
+// auto-gc disabled (Fix 1) produces LOOSE OBJECTS, not packs:
+//   - loose-objects fires on the loose-object count (`count:` in count-objects),
+//     which is what actually grows every idle backup cycle. Gating this on pack
+//     count would let loose objects accumulate forever while packs stayed ~0.
+//   - incremental-repack fires on the pack count (`packs:`), consolidating the
+//     packs that loose-objects itself produces once they build up.
+// Each task consolidates its own input, so the counts reset and both self-throttle
+// — no wall-clock timer needed.
+const MAINTENANCE_LOOSE_THRESHOLD = 300
+const MAINTENANCE_PACK_THRESHOLD = 12
+
+// Memory caps for the maintenance repack, matching the machine-local config Fix 1
+// writes so the bound holds even on a repo that predates it. Passed as `-c` so
+// they apply to this invocation regardless of the persisted config.
+const BOUNDED_PACK_FLAGS = [
+  '-c',
+  'pack.threads=1',
+  '-c',
+  'pack.windowMemory=64m',
+  '-c',
+  'pack.deltaCacheSize=1',
+] as const
 
 const RUNTIME_OWNED_PREFIXES = ['memory/'] as const
 const FORCE_ADD_PREFIXES = ['sessions/', 'todo/'] as const
@@ -150,6 +175,64 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
   if (plan.kind === 'skip') return { ok: true, kind: 'committed' }
 
   return pushWithRecovery(cwd, deps, repo, plan)
+}
+
+export type MaintenanceResult =
+  | { ok: true; kind: 'no-repo' | 'skipped' | 'ran'; tasks?: readonly string[] }
+  | { ok: false; kind: 'failed'; reason: string }
+
+// Bounded, best-effort git maintenance run on the idle backup path. With auto-gc
+// disabled (Fix 1), nothing reclaims what the backup keeps adding, so this runs
+// the two reclamation tasks — each gated on ITS OWN growing counter (see the
+// threshold comment above): `loose-objects` when loose objects pile up (the
+// steady-state effect of every commit), `incremental-repack` when packs pile up.
+// incremental-repack uses the multi-pack-index, touching only SMALL packs and
+// leaving the big established pack alone, so memory and time stay bounded unlike a
+// full `git gc`. Both tasks run under BOUNDED_PACK_FLAGS. NEVER throws: a
+// maintenance failure must not turn a good commit into a reported backup failure.
+// The caller runs this after a commit, holding the same git lock the commit did.
+export type MaintenanceThresholds = { loose?: number; packs?: number }
+
+export async function runMaintenance(
+  cwd: string,
+  deps: BackupRunnerDeps,
+  thresholds: MaintenanceThresholds = {},
+): Promise<MaintenanceResult> {
+  const repo = resolveAgentGit(cwd)
+  if (!repo) return { ok: true, kind: 'no-repo' }
+
+  const looseThreshold = thresholds.loose ?? MAINTENANCE_LOOSE_THRESHOLD
+  const packThreshold = thresholds.packs ?? MAINTENANCE_PACK_THRESHOLD
+  const counts = await countObjects(cwd, deps, repo)
+  const tasks: string[] = []
+  if (counts.loose > looseThreshold) tasks.push('loose-objects')
+  if (counts.packs > packThreshold) tasks.push('incremental-repack')
+  if (tasks.length === 0) return { ok: true, kind: 'skipped' }
+
+  const run = await deps.gitSpawn(
+    [...repo.gitArgs, ...BOUNDED_PACK_FLAGS, 'maintenance', 'run', ...tasks.map((task) => `--task=${task}`)],
+    { cwd, timeoutMs: MAINTENANCE_TIMEOUT_MS },
+  )
+  if (run.exitCode !== 0) return { ok: false, kind: 'failed', reason: shortErr(run) }
+  return { ok: true, kind: 'ran', tasks }
+}
+
+// Reads the loose-object (`count:`) and pack (`packs:`) counts from
+// `git count-objects -v`. Returns zeroes on any failure so a probe error just
+// skips maintenance rather than aborting it.
+async function countObjects(
+  cwd: string,
+  deps: BackupRunnerDeps,
+  repo: AgentGit,
+): Promise<{ loose: number; packs: number }> {
+  const result = await deps.gitSpawn([...repo.gitArgs, 'count-objects', '-v'], { cwd, timeoutMs: COMMIT_TIMEOUT_MS })
+  if (result.exitCode !== 0) return { loose: 0, packs: 0 }
+  return { loose: readCount(result.stdout, 'count'), packs: readCount(result.stdout, 'packs') }
+}
+
+function readCount(stdout: string, field: 'count' | 'packs'): number {
+  const match = new RegExp(String.raw`^${field}:\s*(\d+)`, 'm').exec(stdout)
+  return match?.[1] !== undefined ? Number.parseInt(match[1], 10) : 0
 }
 
 // `@{upstream}` resolution failing was previously treated as "no push" — but a

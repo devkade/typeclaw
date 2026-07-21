@@ -6,7 +6,14 @@ import { resolveAgentGit } from '@/git/resolve-agent-git'
 import { definePlugin, type PluginContext, type SpawnSubagentOptions, type Subagent } from '@/plugin'
 
 import { type BackupPushAuthDeps, makeDefaultAskPassEnsurer, resolveBackupPushAuthEnv } from './git-auth'
-import { COMMIT_TIMEOUT_MS, makeDefaultGitSpawn, NETWORK_TIMEOUT_MS, runBackup, type BackupResult } from './runner'
+import {
+  COMMIT_TIMEOUT_MS,
+  makeDefaultGitSpawn,
+  NETWORK_TIMEOUT_MS,
+  runBackup,
+  runMaintenance,
+  type BackupResult,
+} from './runner'
 import {
   cleanupMessageFile,
   type CommitMessagePayload,
@@ -36,6 +43,7 @@ const backupConfigSchema = z
     enabled: z.boolean().default(true),
     idleMs: z.number().int().min(MIN_IDLE_MS).default(DEFAULT_IDLE_MS),
     pushToOrigin: z.boolean().default(true),
+    maintenance: z.boolean().default(true),
     commitTimeoutMs: z.number().int().min(1).default(COMMIT_TIMEOUT_MS),
     networkTimeoutMs: z.number().int().min(1).default(NETWORK_TIMEOUT_MS),
   })
@@ -43,6 +51,7 @@ const backupConfigSchema = z
     enabled: true,
     idleMs: DEFAULT_IDLE_MS,
     pushToOrigin: true,
+    maintenance: true,
     commitTimeoutMs: COMMIT_TIMEOUT_MS,
     networkTimeoutMs: NETWORK_TIMEOUT_MS,
   })
@@ -50,6 +59,7 @@ const backupConfigSchema = z
 const runnerPayloadSchema = z.object({
   agentDir: z.string(),
   pushToOrigin: z.boolean(),
+  maintenance: z.boolean(),
 })
 
 type RunnerPayload = z.infer<typeof runnerPayloadSchema>
@@ -60,6 +70,7 @@ export default definePlugin({
     const enabled = ctx.config.enabled
     const idleMs = ctx.config.idleMs
     const pushToOrigin = ctx.config.pushToOrigin
+    const maintenance = ctx.config.maintenance
 
     const activeTurns = new Set<string>()
     let idleTimer: ReturnType<typeof setTimeout> | null = null
@@ -87,6 +98,7 @@ export default definePlugin({
           {
             agentDir: ctx.agentDir,
             pushToOrigin,
+            maintenance,
           } satisfies RunnerPayload,
           // The backup runner is a system-level operation that commits +
           // pushes on the operator's behalf. It runs after every idle
@@ -188,51 +200,79 @@ async function runBackupOnce(
     ? ((await resolveBackupAuthEnv(payload.agentDir, ctx.github, ctx.logger)) ?? undefined)
     : undefined
 
-  const result = await withGitLock(payload.agentDir, () =>
-    runBackup(
-      { cwd: payload.agentDir, pushToOrigin: payload.pushToOrigin },
-      {
-        gitSpawn: makeDefaultGitSpawn(),
-        pushEnv,
-        pickCommitMessage: async ({ status, diffstat }) => {
-          await cleanupMessageFile(messagePath)
-          const messagePayload: CommitMessagePayload = {
-            agentDir: payload.agentDir,
-            status,
-            diffstat,
-            outputPath: messagePath,
-          }
-          try {
-            await ctx.spawnSubagent(SUBAGENT_COMMIT_MESSAGE, messagePayload, inheritOwner)
-          } catch (err) {
-            ctx.logger.warn(
-              `${SUBAGENT_COMMIT_MESSAGE} subagent failed, using fallback: ${err instanceof Error ? err.message : String(err)}`,
-            )
-          }
-          const written = await readMessageFile(messagePath)
-          await cleanupMessageFile(messagePath)
-          return written ?? 'chore: backup'
-        },
-        diagnoseFailure: async (input) => {
-          const diagPayload: DiagnoseFailurePayload = {
-            agentDir: input.cwd,
-            stage: input.stage,
-            exitCode: input.exitCode,
-            stderr: input.stderr,
-            stdout: input.stdout,
-          }
-          try {
-            await ctx.spawnSubagent(SUBAGENT_DIAGNOSE, diagPayload, inheritOwner)
-          } catch (err) {
-            ctx.logger.warn(`${SUBAGENT_DIAGNOSE} subagent failed: ${err instanceof Error ? err.message : String(err)}`)
-          }
-        },
-      },
-    ),
-  )
+  const gitSpawn = makeDefaultGitSpawn()
+  const backupDeps = {
+    gitSpawn,
+    pushEnv,
+    pickCommitMessage: async ({ status, diffstat }: { status: string; diffstat: string }): Promise<string> => {
+      await cleanupMessageFile(messagePath)
+      const messagePayload: CommitMessagePayload = {
+        agentDir: payload.agentDir,
+        status,
+        diffstat,
+        outputPath: messagePath,
+      }
+      try {
+        await ctx.spawnSubagent(SUBAGENT_COMMIT_MESSAGE, messagePayload, inheritOwner)
+      } catch (err) {
+        ctx.logger.warn(
+          `${SUBAGENT_COMMIT_MESSAGE} subagent failed, using fallback: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+      const written = await readMessageFile(messagePath)
+      await cleanupMessageFile(messagePath)
+      return written ?? 'chore: backup'
+    },
+    diagnoseFailure: async (input: {
+      cwd: string
+      stage: 'push' | 'rebase'
+      exitCode: number
+      stderr: string
+      stdout: string
+    }): Promise<void> => {
+      const diagPayload: DiagnoseFailurePayload = {
+        agentDir: input.cwd,
+        stage: input.stage,
+        exitCode: input.exitCode,
+        stderr: input.stderr,
+        stdout: input.stdout,
+      }
+      try {
+        await ctx.spawnSubagent(SUBAGENT_DIAGNOSE, diagPayload, inheritOwner)
+      } catch (err) {
+        ctx.logger.warn(`${SUBAGENT_DIAGNOSE} subagent failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    },
+  }
+
+  // Maintenance runs UNDER THE SAME LOCK as the backup, right after it, so a
+  // concurrent backup can't race the repack's index/pack rewrite. It fires
+  // whenever a LOCAL COMMIT was made — including when the later push failed, since
+  // the loose objects the commit created still need reclaiming (a prolonged remote
+  // outage must not suppress it). Best-effort: its outcome is logged, never folded
+  // into the returned BackupResult.
+  const result = await withGitLock(payload.agentDir, async () => {
+    const backup = await runBackup({ cwd: payload.agentDir, pushToOrigin: payload.pushToOrigin }, backupDeps)
+    if (payload.maintenance && backupCommitted(backup)) {
+      const maint = await runMaintenance(payload.agentDir, backupDeps)
+      if (!maint.ok) ctx.logger.warn(`[backup] maintenance failed: ${maint.reason}`)
+      else if (maint.kind === 'ran') ctx.logger.info(`[backup] maintenance ran (${(maint.tasks ?? []).join(', ')})`)
+    }
+    return backup
+  })
 
   await cleanupMessageFile(messagePath)
   return result
+}
+
+// True when a local commit was created this run, regardless of the push outcome.
+// The commit is made before push recovery, so `push-failed`/`rebase-failed` still
+// grew local history and must trigger reclamation; only `clean`/`no-repo` (no
+// commit) and `commit-failed`/`aborted` (commit never happened) skip it. Exported
+// for direct unit tests of this exact per-kind classification.
+export function backupCommitted(result: BackupResult): boolean {
+  if (result.ok) return result.kind !== 'clean' && result.kind !== 'no-repo'
+  return result.kind === 'push-failed' || result.kind === 'rebase-failed'
 }
 
 async function resolveBackupAuthEnv(

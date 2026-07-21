@@ -5,7 +5,8 @@ import * as FakeTimers from '@sinonjs/fake-timers'
 import { noopPermissionService } from '@/permissions'
 import type { PluginContext, PluginExports } from '@/plugin'
 
-import backupPlugin from './index'
+import backupPlugin, { backupCommitted } from './index'
+import type { BackupResult } from './runner'
 
 type SpawnCall = { name: string; payload: unknown }
 
@@ -112,6 +113,7 @@ describe('backup plugin', () => {
       enabled: true,
       idleMs: 30_000,
       pushToOrigin: true,
+      maintenance: true,
       commitTimeoutMs: 30_000,
       networkTimeoutMs: 60_000,
     })
@@ -212,6 +214,30 @@ describe('backup plugin', () => {
     expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toContain('gitExfil')
     expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toMatch(/only the one push retry|only.*one.*retry/i)
   })
+})
+
+describe('backupCommitted (maintenance gate)', () => {
+  const cases: Array<[BackupResult, boolean]> = [
+    [{ ok: true, kind: 'committed' }, true],
+    [{ ok: true, kind: 'pushed' }, true],
+    [{ ok: true, kind: 'pushed-set-upstream' }, true],
+    [{ ok: true, kind: 'rebased-and-pushed' }, true],
+    // a commit is created BEFORE push recovery, so a failed push/rebase still
+    // grew local history and must trigger reclamation (the reviewer's outage case)
+    [{ ok: false, kind: 'push-failed', reason: 'x' }, true],
+    [{ ok: false, kind: 'rebase-failed', reason: 'x' }, true],
+    // no commit was made in these — nothing to reclaim
+    [{ ok: true, kind: 'clean' }, false],
+    [{ ok: true, kind: 'no-repo' }, false],
+    [{ ok: false, kind: 'commit-failed', reason: 'x' }, false],
+    [{ ok: false, kind: 'aborted', reason: 'x' }, false],
+  ]
+
+  for (const [result, expected] of cases) {
+    test(`${result.kind} -> ${expected}`, () => {
+      expect(backupCommitted(result)).toBe(expected)
+    })
+  }
 })
 
 function hookCtx() {

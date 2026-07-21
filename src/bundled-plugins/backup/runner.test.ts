@@ -10,6 +10,7 @@ import {
   parsePorcelain,
   makeDefaultGitSpawn,
   runBackup,
+  runMaintenance,
   withIndexLockRetry,
 } from './runner'
 
@@ -559,5 +560,201 @@ describe('withIndexLockRetry', () => {
 
     expect(result).toEqual(okResult('done'))
     expect(calls).toHaveLength(3)
+  })
+})
+
+describe('runMaintenance', () => {
+  const countObjects = (loose: number, packs: number): string =>
+    `count: ${loose}\nsize: 0\nin-pack: 0\npacks: ${packs}\nsize-pack: 0\nprune-packable: 0\ngarbage: 0\n`
+
+  const maintenanceSpawn = (
+    counts: { loose: number; packs: number },
+    runResult: GitSpawnResult = okResult(),
+  ): { spawn: GitSpawn; calls: Call[] } =>
+    makeSpawn((args) => {
+      if (args.includes('count-objects')) return okResult(countObjects(counts.loose, counts.packs))
+      if (args.includes('maintenance')) return runResult
+      return okResult()
+    })
+
+  const maintCall = (calls: Call[]): Call => {
+    const maint = calls.find((c) => c.args.includes('maintenance'))
+    if (!maint) throw new Error('expected a maintenance call')
+    return maint
+  }
+
+  test('skips when both loose objects and packs are within thresholds', async () => {
+    const cwd = await makeRepo()
+    try {
+      const { spawn, calls } = maintenanceSpawn({ loose: 300, packs: 12 })
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result).toEqual({ ok: true, kind: 'skipped' })
+      expect(calls.some((c) => c.args.includes('maintenance'))).toBe(false)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('runs ONLY loose-objects when loose objects grow but packs do not', async () => {
+    // the reviewer's case: gc.auto=0 means commits pile up loose objects while
+    // packs stay ~0, so the loose gate must fire independently of pack count
+    const cwd = await makeRepo()
+    try {
+      const { spawn, calls } = maintenanceSpawn({ loose: 5000, packs: 1 })
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result).toEqual({ ok: true, kind: 'ran', tasks: ['loose-objects'] })
+      const maint = maintCall(calls)
+      expect(maint.args).toContain('--task=loose-objects')
+      expect(maint.args).not.toContain('--task=incremental-repack')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('runs ONLY incremental-repack when packs grow but loose objects do not', async () => {
+    const cwd = await makeRepo()
+    try {
+      const { spawn, calls } = maintenanceSpawn({ loose: 0, packs: 40 })
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result).toEqual({ ok: true, kind: 'ran', tasks: ['incremental-repack'] })
+      expect(maintCall(calls).args).not.toContain('--task=loose-objects')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('runs both tasks under bounded flags when both counters are over threshold', async () => {
+    const cwd = await makeRepo()
+    try {
+      const { spawn, calls } = maintenanceSpawn({ loose: 5000, packs: 40 })
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result).toEqual({ ok: true, kind: 'ran', tasks: ['loose-objects', 'incremental-repack'] })
+      const maint = maintCall(calls)
+      // memory bounds are pinned on the invocation, not left to git defaults
+      expect(maint.args).toContain('pack.threads=1')
+      expect(maint.args).toContain('pack.windowMemory=64m')
+      expect(maint.args).toContain('pack.deltaCacheSize=1')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('supports the relocated .gitstore layout', async () => {
+    const cwd = await makeGitstoreRepo()
+    try {
+      const { spawn, calls } = maintenanceSpawn({ loose: 0, packs: 40 })
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result.ok).toBe(true)
+      expect(maintCall(calls).args.slice(0, 2)).toEqual(['--git-dir', join(cwd, '.gitstore')])
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('no-ops on a folder that is not a git repo', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-nonrepo-'))
+    try {
+      const { spawn, calls } = maintenanceSpawn({ loose: 5000, packs: 40 })
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result).toEqual({ ok: true, kind: 'no-repo' })
+      expect(calls).toHaveLength(0)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('surfaces a maintenance failure without throwing', async () => {
+    const cwd = await makeRepo()
+    try {
+      const { spawn } = maintenanceSpawn({ loose: 0, packs: 40 }, failResult('repack exploded'))
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected failure')
+      expect(result.kind).toBe('failed')
+      expect(result.reason).toContain('repack exploded')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('skips maintenance when the count probe fails', async () => {
+    const cwd = await makeRepo()
+    try {
+      const { spawn, calls } = makeSpawn((args) => {
+        if (args.includes('count-objects')) return failResult('probe failed')
+        return okResult()
+      })
+
+      const result = await runMaintenance(cwd, baseDeps(spawn))
+
+      expect(result).toEqual({ ok: true, kind: 'skipped' })
+      expect(calls.some((c) => c.args.includes('maintenance'))).toBe(false)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  // Real-Git lifecycle: prove that with auto-gc disabled, backup-style commits
+  // actually satisfy the loose-object gate and that a real `git maintenance run`
+  // packs them into a pack and leaves a valid repo. The fake-spawn tests above
+  // verify the gating logic; this verifies the gate reflects real git behavior.
+  test('real git: backup commits trip the loose gate and maintenance packs them', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-maint-real-'))
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Test',
+      GIT_AUTHOR_EMAIL: 'test@example.com',
+      GIT_COMMITTER_NAME: 'Test',
+      GIT_COMMITTER_EMAIL: 'test@example.com',
+    }
+    const git = async (args: string[]): Promise<string> => {
+      const proc = Bun.spawn({ cmd: ['git', ...args], cwd, env, stdout: 'pipe', stderr: 'pipe' })
+      const out = await new Response(proc.stdout).text()
+      expect(await proc.exited).toBe(0)
+      return out
+    }
+    const readCount = async (field: 'count' | 'in-pack'): Promise<number> =>
+      Number.parseInt(
+        new RegExp(String.raw`^${field}:\s*(\d+)`, 'm').exec(await git(['count-objects', '-v']))?.[1] ?? '0',
+        10,
+      )
+    try {
+      // auto-gc off, exactly as `typeclaw start` configures the agent repo, so
+      // commits accumulate LOOSE objects instead of being auto-packed
+      await git(['-c', 'init.defaultBranch=main', 'init', '-q'])
+      for (let i = 0; i < 40; i += 1) {
+        await writeFile(join(cwd, `f${i}.txt`), `content ${i}\n`)
+        await git(['-c', 'gc.auto=0', 'add', '-A'])
+        await git(['-c', 'gc.auto=0', 'commit', '-qm', `commit ${i}`])
+      }
+      const looseBefore = await readCount('count')
+      const inPackBefore = await readCount('in-pack')
+      expect(looseBefore).toBeGreaterThan(0)
+
+      // gate the real run on a threshold below the loose count we just produced
+      const deps = baseDeps(makeDefaultGitSpawn())
+      const looseGated = await runMaintenance(cwd, deps, { loose: looseBefore - 1 })
+      expect(looseGated).toEqual({ ok: true, kind: 'ran', tasks: ['loose-objects'] })
+
+      // the loose objects were packed (in-pack grew) and the repo stays valid
+      expect(await readCount('in-pack')).toBeGreaterThan(inPackBefore)
+      await git(['fsck', '--no-progress'])
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
   })
 })
