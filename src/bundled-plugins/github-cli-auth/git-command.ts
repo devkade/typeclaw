@@ -82,15 +82,56 @@ const FETCH_ALL_REASON =
   'cannot be enumerated safely here — a minted token scoped to one remote could ' +
   'be sent to another. Fetch a specific remote instead.'
 
+// The exec prefix a `clone && <tail>` tail is re-executed under. Every key here
+// MUST mirror the overlay index.ts injects for a token-bearing git (the two
+// secrets TYPECLAW_GIT_TOKEN/GIT_ASKPASS, the operator PATs GH_TOKEN/GITHUB_TOKEN
+// that live in bash env, and the forced GIT_CONFIG_* + GIT_TERMINAL_PROMPT) so
+// the fresh tokenless shell inherits none of them. Absolute `/usr/bin/env` and
+// `/bin/bash` so a PATH-shadowed shim cannot defeat the strip; a missing binary
+// exits non-zero, failing closed. Drift here is a token leak — keep in lockstep
+// with index.ts's git overlay (guarded by a test in index.test.ts).
+const TAIL_STRIP_PREFIX =
+  'exec /usr/bin/env -u TYPECLAW_GIT_TOKEN -u GIT_ASKPASS -u GH_TOKEN -u GITHUB_TOKEN ' +
+  '-u GIT_TERMINAL_PROMPT -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 ' +
+  '-u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 -u GIT_CONFIG_KEY_2 -u GIT_CONFIG_VALUE_2 ' +
+  '-u GIT_CONFIG_KEY_3 -u GIT_CONFIG_VALUE_3 /bin/bash -c'
+
 // OUTSIDE single quotes these spawn a sibling process (which would inherit the
 // askpass token) or expand shell state. `$`/backtick stay active inside double
 // quotes too, so they are screened separately. Mirrors gh-command.ts.
 const SHELL_ACTIVE_METACHARS = new Set(['|', ';', '&', '\n', '\r', '(', ')', '{', '}', '<', '>', '`', '$'])
 
+// `\` (Bash escaping) and `#` (comments) are the two constructs our quote-aware
+// scanners do not model. Either can make our view of top-level structure disagree
+// with Bash's — so a command carrying them must never drive a token mint.
+function containsEscapeBlindSyntax(command: string): boolean {
+  return command.includes('\\') || command.includes('#')
+}
+
+// Conservative raw-text probe for a `git` word — NOT the escape-blind tokenizer.
+// Used only to choose block-vs-pass in the fail-closed gate; a miss is harmless
+// (the command runs tokenless), so it never needs to be exhaustive.
+function looksLikePotentialGitCommand(command: string): boolean {
+  return /(^|[^A-Za-z0-9_])git(?=$|[^A-Za-z0-9_-])/.test(command)
+}
+
 export async function analyzeGitCommand(
   command: string,
   options: { cwd: string; resolvers: GitResolvers },
 ): Promise<GitCommandDecision> {
+  // Fail-closed lexical gate BEFORE any mint decision. The scanners below are
+  // quote-aware but do NOT model Bash backslash escaping or `#` comments, so
+  // either can make our escape-blind view of the command disagree with Bash and
+  // drive a token mint for a structure Bash parses differently (a `\"` that keeps
+  // a quote open, or a `#` that comments out an appended boundary). Any command
+  // carrying `\` or `#` therefore never reaches an inject decision: it blocks if
+  // it looks git-ish, else passes through tokenless. Never mint here.
+  if (containsEscapeBlindSyntax(command)) {
+    return looksLikePotentialGitCommand(command)
+      ? { kind: 'block', reason: COMPOSITION_REASON }
+      : { kind: 'pass-through' }
+  }
+
   // The single permitted `cd <simple-path> && git …` shortcut is rewritten to a
   // bare `git -C …` before any chain parsing, so a chain never has to reason
   // about a `cd` segment changing cwd for the gits that follow it. Multi-git
@@ -98,6 +139,9 @@ export async function analyzeGitCommand(
   const stripped = stripSafeCdPrefix(command)
   if (stripped.unsafe) return { kind: 'pass-through' }
   if (stripped.cdDir !== null) return analyzeSingleCdGit(stripped, options)
+
+  const cloneThenInspect = analyzeCloneThenInspect(command)
+  if (cloneThenInspect !== null) return cloneThenInspect
 
   // Split the command into `&&`-joined git segments. null = not a pure
   // git-only `&&` chain (a non-git segment, a forbidden shell operator, a
@@ -199,6 +243,127 @@ async function analyzeSingleCdGit(
     return { kind: 'block', reason: COMPOSITION_REASON }
   }
   return { kind: 'inject', repoSlug, rewrittenCommand: rewriteCdToDashC(effectiveCwd, stripped.rest) }
+}
+
+// The `git clone <url> <dir> && <tail>` shape: acquire a repo, then inspect it.
+// A naive `env -u TOKEN <tail>` is UNSOUND — shell substitution in the tail runs
+// in the still-token-bearing parent shell before `env`, and a stripped child can
+// still read the parent's env via /proc/$PPID/environ. So instead the git head
+// runs first (token reaches only the clone), then `exec` REPLACES the token-
+// bearing shell with `/usr/bin/env -u <keys> /bin/bash -c '<tail>'`: exec removes
+// that /proc target, the unset drops every injected key, and the tail rides as an
+// opaque single-quoted argument the fresh tokenless shell alone parses/expands.
+// Scoped to `clone` by DELIBERATE CHOICE, not a limit of the strip boundary
+// (which would neutralize the token just as well after fetch/pull). `clone` names
+// the repo in argv, so minting is unambiguous, and it creates a fresh tree the
+// tail inspects. fetch/pull would resolve the repo through an existing repo's cwd,
+// remotes, and mutable `.git/config` (and `pull` runs repo-configured integration
+// while the token is live) — extra resolution complexity and token-bearing surface
+// for a workflow already expressible as `git -C <repo> fetch` then a separate
+// tokenless inspect. So fetch/pull/push stay single-bare. Returns null when the
+// shape does not match, so the caller falls through to the normal chain analysis.
+function analyzeCloneThenInspect(command: string): GitCommandDecision | null {
+  // `\` and `#` are already rejected by the early gate in analyzeGitCommand, so
+  // splitCloneHeadAndTail's quote-aware scan is trustworthy here.
+  const split = splitCloneHeadAndTail(command)
+  if (split === null) return null
+  const { head, tail } = split
+  if (tail === '') return { kind: 'block', reason: COMPOSITION_REASON }
+
+  // A git in the tail is NOT inspection — it either wants the token (so it must
+  // ride the single-bare path or an explicit `git -C`) or is an exfil sibling.
+  // Fall through so the strict chain analysis keeps its existing block/pass rules
+  // for every `clone && git …` shape.
+  if (containsGitInvocation(tail)) return null
+
+  const parsed = parseStrictCloneHead(head)
+  if (parsed === null) {
+    // A clone of a NON-github url needs no token, so the compound is harmless —
+    // pass through and let git run tokenless rather than block a legitimate
+    // e.g. gitlab clone-then-grep. Anything else (a github clone that failed the
+    // strict grammar — flags, odd dir, malformed url) falls through to the strict
+    // chain analysis, which blocks it.
+    return isNonGithubCloneHead(head) ? { kind: 'pass-through' } : null
+  }
+
+  // Reconstruct the token-bearing head from the strict parse — an absolute git
+  // and separately single-quoted url + destination — so NO byte of the original
+  // untrusted head reaches the appended `&& exec` boundary. Absolute /usr/bin/git
+  // also removes alias/function/PATH ambiguity for the token-bearing command.
+  const canonicalHead = `/usr/bin/git clone ${posixSingleQuote(parsed.url)} ${posixSingleQuote(parsed.destination)}`
+
+  return {
+    kind: 'inject',
+    repoSlug: parsed.repoSlug,
+    rewrittenCommand: `${canonicalHead} && ${TAIL_STRIP_PREFIX} ${posixSingleQuote(tail)}`,
+  }
+}
+
+type StrictCloneHead = { repoSlug: string; url: string; destination: string }
+
+// A DELIBERATELY tiny grammar for the token-bearing clone head:
+// `git clone <https-github-url> <simple-destination>` — no flags (clone's own
+// `-c`/`--config` reopens credential-helper/url-redirection analysis), no leading
+// env assignment, no quoting, no metachars. The captured owner/repo and url come
+// straight from this match, never the generic escape-blind tokenizer, so the
+// reconstructed command cannot be perturbed by anything in the raw head. Anything
+// outside the grammar returns null → the caller falls through (blocks or passes).
+const STRICT_CLONE_HEAD_RE =
+  /^[ \t]*git[ \t]+clone[ \t]+(https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?)[ \t]+([A-Za-z0-9._/-]+)[ \t]*$/
+
+function parseStrictCloneHead(head: string): StrictCloneHead | null {
+  const m = STRICT_CLONE_HEAD_RE.exec(head)
+  if (m === null) return null
+  const url = m[1] as string
+  const repoSlug = m[2] as string
+  const destination = m[3] as string
+  if (destination.startsWith('-')) return null
+  if (repoSlug.endsWith('/') || repoSlug.startsWith('/')) return null
+  return { repoSlug, url, destination }
+}
+
+// True when the head is `git clone … <url> …` for a url whose host is clearly not
+// github.com — a clone that needs no minted token, so its compound form is safe to
+// run tokenless. Conservative: only a positive non-github host match returns true;
+// anything ambiguous returns false so the caller falls through (and blocks).
+function isNonGithubCloneHead(head: string): boolean {
+  if (!/^[ \t]*git[ \t]+clone[ \t]/.test(head)) return false
+  const url = /(?:^|[ \t])((?:https?:\/\/|git@|ssh:\/\/)[^ \t]+)/.exec(head)?.[1]
+  if (url === undefined) return false
+  return parseGithubRepoFromGitUrl(url) === null
+}
+
+// Splits on the FIRST top-level `&&`, quote-aware. Rejects (null) when any other
+// top-level operator (`;`, `|`, `||`, single `&`, newline) precedes it — those
+// don't guarantee the clone finished before the tail, so the token could still be
+// live in a concurrent sibling. head keeps the raw text up to the `&&`; tail is
+// everything after, treated as opaque.
+function splitCloneHeadAndTail(command: string): { head: string; tail: string } | null {
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i] as string
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    if (ch === '&' && command[i + 1] === '&') {
+      return { head: command.slice(0, i), tail: command.slice(i + 2).trim() }
+    }
+    if (ch === ';' || ch === '|' || ch === '&' || ch === '\n' || ch === '\r') return null
+  }
+  return null
+}
+
+// Wraps a string in single quotes with POSIX-safe escaping: each embedded single
+// quote becomes '\'' (close-quote, escaped literal quote, reopen). The result is
+// inert — no shell metacharacter inside can act — so the tail cannot break out of
+// the `bash -c` argument.
+function posixSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
 }
 
 // Global flags that can redirect git's auth or destination. `-c`/`--config-env`
