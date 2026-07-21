@@ -99,6 +99,7 @@ function createCallTool(manager: McpManager): Tool<McpCallArgs> {
         args: toolArgs,
         agentDir: ctx.agentDir,
         genericInputs: true,
+        logger: ctx.logger,
         signal: ctx.signal,
       })
       try {
