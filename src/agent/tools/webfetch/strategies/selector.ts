@@ -1,4 +1,4 @@
-import * as cheerio from 'cheerio'
+import type * as cheerio from 'cheerio'
 
 export class SelectorError extends Error {
   constructor(message: string) {
@@ -7,7 +7,9 @@ export class SelectorError extends Error {
   }
 }
 
-export function applySelector(html: string, selector: string): string {
+export async function applySelector(html: string, selector: string): Promise<string> {
+  const cheerio = await import('cheerio')
+
   let $: cheerio.CheerioAPI
   try {
     $ = cheerio.load(html)

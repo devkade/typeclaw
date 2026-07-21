@@ -1,4 +1,4 @@
-import * as cheerio from 'cheerio'
+import type * as cheerio from 'cheerio'
 import type { AnyNode, Element } from 'domhandler'
 
 const SEMANTIC_TAGS = new Set([
@@ -65,7 +65,8 @@ const ROLE_FOR_TAG: Record<string, string> = {
   label: 'label',
 }
 
-export function applySnapshot(html: string): string {
+export async function applySnapshot(html: string): Promise<string> {
+  const cheerio = await import('cheerio')
   const $ = cheerio.load(html)
   const lines: string[] = []
   const body = $('body').get(0)
