@@ -7,12 +7,10 @@ export const CANONICAL_AGENT_SECRET_DIRS = [
 export const CANONICAL_AGENT_SECRET_FILES = ['.env', 'secrets.json', 'auth.json'] as const
 
 // Canonical files whose recovery from Git history is a real confidentiality bypass. `.env` is
-// deliberately absent: per the expose-to-agent policy (PR #1244), every declared `.env` var is
-// already inherited into model bash, so recovering `.env` bytes from history discloses nothing the
-// operator did not already hand the agent — blocking all git/bash over a historical `.env` is pure
-// disruption. `secrets.json`/`auth.json` are never inherited, so their history recovery IS a bypass
-// and stays blocking. The live-file bwrap mask and non-bash denial still cover `.env` via
-// CANONICAL_AGENT_SECRET_FILES; only the history scanner uses this narrower set.
+// deliberately absent: per the expose-to-agent policy (PR #1244), declared `.env` values are normally
+// inherited into model bash, and knowing the model-HTTP policy strings does not grant runtime policy
+// authority. Blocking all Git/bash over a historical `.env` would violate PR #1256. The live-file
+// bwrap mask and non-bash denial still cover `.env`; only the history scanner uses this narrower set.
 export const CANONICAL_GIT_HISTORY_SECRET_FILES = ['secrets.json', 'auth.json'] as const
 
 export const CANONICAL_HOME_SECRET_DIRS = [
