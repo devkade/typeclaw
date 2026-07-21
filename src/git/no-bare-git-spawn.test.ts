@@ -14,7 +14,6 @@ const RUNTIME_GIT_FILES = [
   'src/git/reconcile-ignored.ts',
   'src/doctor/commit.ts',
   'src/agent/git-nudge.ts',
-  'src/git/secret-history.ts',
   'src/bundled-plugins/guard/policies/uncommitted-changes.ts',
   'src/dreams/git.ts',
   'src/init/index.ts',
