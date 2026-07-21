@@ -82,9 +82,15 @@ async function* readSessionFile(file: string, opts: ScanOptions): AsyncGenerator
   // Stays 'unknown' for legacy files (no stamp at all) so usage attribution
   // surfaces them as a distinct bucket rather than dropping the rows.
   const ctx: ParseCtx = { originKind: 'unknown', originPinned: false }
+  // Explicit reader + `finally` cancel so a consumer that abandons the generator
+  // early (or an exception mid-scan) releases the file descriptor deterministically
+  // instead of leaking it until GC — the scan runs over every session file on disk.
+  const reader = stream.getReader()
   try {
-    for await (const chunk of stream) {
-      buf += decoder.decode(chunk, { stream: true })
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
       let nl = buf.indexOf('\n')
       while (nl !== -1) {
         const line = buf.slice(0, nl)
@@ -97,6 +103,9 @@ async function* readSessionFile(file: string, opts: ScanOptions): AsyncGenerator
   } catch (err) {
     opts.onWarn?.(`error reading ${basename}: ${describeFileError(err)}`)
     return
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
   }
   // Tail line with no terminating \n: only emit if it parses cleanly so a
   // half-written record from a live writer is silently skipped (parseLine

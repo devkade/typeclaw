@@ -311,18 +311,30 @@ function describeErr(err: unknown): string {
   return String(err)
 }
 
+// Explicit reader + `finally` cancel so a consumer that breaks early (peekSession
+// stops after the first meta + a few user turns) releases the file descriptor
+// deterministically, not relying on async-iterator finalization. Load-bearing when
+// tens of thousands of session files are peeked under a low `ulimit -n`.
 async function* streamLines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buf = ''
-  for await (const chunk of stream) {
-    buf += decoder.decode(chunk, { stream: true })
-    let nl = buf.indexOf('\n')
-    while (nl !== -1) {
-      const line = buf.slice(0, nl)
-      buf = buf.slice(nl + 1)
-      yield line
-      nl = buf.indexOf('\n')
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let nl = buf.indexOf('\n')
+      while (nl !== -1) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        yield line
+        nl = buf.indexOf('\n')
+      }
     }
+    if (buf.length > 0) yield buf
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
   }
-  if (buf.length > 0) yield buf
 }

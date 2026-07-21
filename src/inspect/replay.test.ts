@@ -607,4 +607,37 @@ describe('replayJsonl (real file in tmpdir)', () => {
     const events = await collect(replayJsonl('/this/path/does/not/exist.jsonl', { onWarn: (m) => warnings.push(m) }))
     expect(events).toEqual([])
   })
+
+  test('breaking early many times releases the stream each time (no FD leak, no throw)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-inspect-replay-'))
+    try {
+      const file = join(dir, 'big.jsonl')
+      const lines = [
+        JSON.stringify({
+          type: 'custom',
+          customType: 'typeclaw.session-meta',
+          data: { origin: { kind: 'tui' } },
+          timestamp: 0,
+        }),
+      ]
+      for (let i = 0; i < 5000; i++) {
+        lines.push(JSON.stringify({ type: 'message', message: { role: 'user', content: `m${i}`, timestamp: i } }))
+      }
+      await writeFile(file, lines.join('\n') + '\n')
+
+      // given a consumer that reads only the first event then breaks — the same
+      // shape peekSession uses. Repeated far past a 256-FD ceiling, each iteration
+      // must free its descriptor via the reader's finally-cancel, or this EMFILEs.
+      for (let iter = 0; iter < 500; iter++) {
+        let first: InspectEvent | undefined
+        for await (const ev of replayJsonl(file)) {
+          first = ev
+          break
+        }
+        expect(first?.cat).toBe('meta')
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
