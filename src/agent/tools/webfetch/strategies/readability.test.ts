@@ -18,8 +18,8 @@ const ARTICLE = `
 </body></html>`
 
 describe('applyReadability', () => {
-  test('extracts the article body and renders markdown headings, paragraphs, and lists', () => {
-    const result = applyReadability(ARTICLE, 'https://example.com/post')
+  test('extracts the article body and renders markdown headings, paragraphs, and lists', async () => {
+    const result = await applyReadability(ARTICLE, 'https://example.com/post')
 
     expect(result).toMatch(/^# The Sample Article/)
     expect(result).toContain('paragraph of body text')
@@ -29,14 +29,14 @@ describe('applyReadability', () => {
     expect(result).toContain('[an example link](https://example.com/x)')
   })
 
-  test('does not include navigation or footer chrome', () => {
-    const result = applyReadability(ARTICLE, 'https://example.com/post')
+  test('does not include navigation or footer chrome', async () => {
+    const result = await applyReadability(ARTICLE, 'https://example.com/post')
     expect(result).not.toContain('Home')
     expect(result).not.toContain('copyright')
   })
 
-  test('returns a clear message when there is nothing to extract', () => {
-    const result = applyReadability('<html><body></body></html>', 'https://example.com/empty')
+  test('returns a clear message when there is nothing to extract', async () => {
+    const result = await applyReadability('<html><body></body></html>', 'https://example.com/empty')
     expect(result).toBe('Readability extracted no content from this page.')
   })
 })
