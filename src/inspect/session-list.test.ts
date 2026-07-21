@@ -270,6 +270,57 @@ describe('resolveSession', () => {
     if (out.ok) throw new Error('unreachable')
     expect(out.reason).toBe('not-found')
   })
+
+  test('an exact id match peeks ONLY the matched file, not every session on disk', async () => {
+    // given the target session plus a decoy whose body is malformed JSONL: if
+    // resolveSession peeked every file (the old FD-exhausting behavior) the decoy
+    // would surface a parse warning. Reading only the matched candidate stays silent.
+    await writeSession(`a_${UUID_A}.jsonl`, [metaLine({ kind: 'tui' }), userLine('target')], 2000)
+    await writeSession(`b_${UUID_B}.jsonl`, ['{ this is not valid json'], 1000)
+
+    const warnings: string[] = []
+    const out = await resolveSession(dir, UUID_A, (m) => warnings.push(m))
+
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error('unreachable')
+    expect(out.summary.sessionId).toBe(UUID_A)
+    expect(out.summary.firstPrompt).toBe('target')
+    expect(warnings).toEqual([])
+  })
+
+  test('a not-found id peeks no files (all bodies stay unread)', async () => {
+    await writeSession(`a_${UUID_A}.jsonl`, ['{ malformed'], 1000)
+    await writeSession(`b_${UUID_B}.jsonl`, ['{ malformed too'], 2000)
+
+    const warnings: string[] = []
+    const out = await resolveSession(dir, 'deadbeef-0000-7000-9000-000000000000', (m) => warnings.push(m))
+
+    expect(out.ok).toBe(false)
+    expect(warnings).toEqual([])
+  })
+
+  test('scales past the FD ceiling: a large directory resolves without EMFILE', async () => {
+    // given far more sessions than a low `ulimit -n` (256) would allow if each were
+    // opened concurrently — the bug this guards is an unbounded open() fan-out.
+    const ids: string[] = []
+    for (let i = 0; i < 400; i++) {
+      const id = `019e0000-0000-7000-9000-${i.toString().padStart(12, '0')}`
+      ids.push(id)
+      await writeSession(
+        `2026-05-22T00-00-00-000Z_${id}.jsonl`,
+        [metaLine({ kind: 'tui' }), userLine(`s${i}`)],
+        1000 + i,
+      )
+    }
+
+    const target = ids[200]!
+    const out = await resolveSession(dir, target)
+
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error('unreachable')
+    expect(out.summary.sessionId).toBe(target)
+    expect(out.summary.firstPrompt).toBe('s200')
+  })
 })
 
 describe('mergeLiveSessions', () => {
