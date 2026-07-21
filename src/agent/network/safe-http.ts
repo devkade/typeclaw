@@ -3,7 +3,8 @@ import { request as httpRequest, type IncomingHttpHeaders } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { isIP, type LookupFunction } from 'node:net'
 
-import { classifyIpAddress, classifyUrl } from '@/bundled-plugins/security/policies/ssrf'
+import { allowsInternalDestination, classifyIpAddress, classifyUrl } from '@/bundled-plugins/security/policies/ssrf'
+import { getBootInternalDestinationPolicy, type InternalDestinationPolicy } from '@/network/internal-destinations'
 
 export type PublicHttpAddress = { address: string; family: 4 | 6 }
 
@@ -45,11 +46,13 @@ export async function requestPublicHttpUrl(
     onResponse?: (response: PublicHttpResponse, url: string) => void
     maxRedirects?: number
     dependencies?: PublicHttpDependencies
+    internalDestinationPolicy?: InternalDestinationPolicy
   },
 ): Promise<PublicHttpResult> {
   const dependencies = options.dependencies ?? defaultPublicHttpDependencies
   const maxRedirects = options.maxRedirects ?? DEFAULT_PUBLIC_HTTP_MAX_REDIRECTS
-  let current = requirePublicHttpUrl(rawUrl)
+  const internalDestinationPolicy = options.internalDestinationPolicy ?? getBootInternalDestinationPolicy()
+  let current = requirePublicHttpUrl(rawUrl, internalDestinationPolicy)
   const initialOrigin = new URL(current).origin
   for (let redirects = 0; redirects <= maxRedirects; redirects++) {
     const parsed = new URL(current)
@@ -67,7 +70,7 @@ export async function requestPublicHttpUrl(
       },
       ...(parsed.protocol === 'https:' ? { servername: hostname } : {}),
       signal: options.signal,
-      lookup: createPublicSocketLookup(dependencies.resolveAddresses),
+      lookup: createPublicSocketLookup(dependencies.resolveAddresses, internalDestinationPolicy),
       autoSelectFamily: false,
     })
     options.onResponse?.(response, current)
@@ -76,7 +79,7 @@ export async function requestPublicHttpUrl(
       const location = headerValue(response.headers, 'location')
       if (location === null) throw new Error(`redirect from ${current} omitted the Location header`)
       if (redirects === maxRedirects) throw new Error(`redirect limit exceeded (${maxRedirects})`)
-      current = requirePublicHttpUrl(new URL(location, current).toString())
+      current = requirePublicHttpUrl(new URL(location, current).toString(), internalDestinationPolicy)
     } finally {
       response.cancel()
     }
@@ -95,7 +98,10 @@ function headersForHop(
   )
 }
 
-export function createPublicSocketLookup(resolveAddresses: PublicHttpDependencies['resolveAddresses']): LookupFunction {
+export function createPublicSocketLookup(
+  resolveAddresses: PublicHttpDependencies['resolveAddresses'],
+  internalDestinationPolicy: InternalDestinationPolicy = getBootInternalDestinationPolicy(),
+): LookupFunction {
   return (hostname, options, callback) => {
     void resolveAddresses(hostname).then(
       (addresses) => {
@@ -110,7 +116,10 @@ export function createPublicSocketLookup(resolveAddresses: PublicHttpDependencie
             return
           }
           const classification = classifyIpAddress(candidate.address)
-          if (classification.blocked) {
+          if (
+            classification.blocked &&
+            !allowsInternalDestination(hostname, candidate.address, internalDestinationPolicy)
+          ) {
             callback(
               new Error(
                 `DNS lookup rejected non-public address for ${hostname}: ${classification.reason ?? candidate.address}`,
@@ -170,7 +179,7 @@ export const defaultPublicHttpDependencies: PublicHttpDependencies = {
   },
 }
 
-function requirePublicHttpUrl(rawUrl: string): string {
+function requirePublicHttpUrl(rawUrl: string, internalDestinationPolicy: InternalDestinationPolicy): string {
   let parsed: URL
   try {
     parsed = new URL(rawUrl)
@@ -180,7 +189,7 @@ function requirePublicHttpUrl(rawUrl: string): string {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`URL must use public HTTP(S), not ${parsed.protocol}`)
   }
-  const classification = classifyUrl(parsed.toString())
+  const classification = classifyUrl(parsed.toString(), internalDestinationPolicy)
   if (classification.blocked) {
     throw new Error(
       `SSRF policy rejected non-public URL (${classification.category ?? 'internal'}): ${classification.reason ?? rawUrl}`,
