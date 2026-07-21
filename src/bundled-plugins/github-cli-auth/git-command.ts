@@ -226,9 +226,15 @@ async function analyzeSingleCdGit(
 // bearing shell with `/usr/bin/env -u <keys> /bin/bash -c '<tail>'`: exec removes
 // that /proc target, the unset drops every injected key, and the tail rides as an
 // opaque single-quoted argument the fresh tokenless shell alone parses/expands.
-// Scoped to `clone` (the op that creates the tree to inspect); fetch/pull/push
-// stay on the single-bare path. Returns null when the shape does not match, so
-// the caller falls through to the normal chain analysis (which blocks or passes).
+// Scoped to `clone` by DELIBERATE CHOICE, not a limit of the strip boundary
+// (which would neutralize the token just as well after fetch/pull). `clone` names
+// the repo in argv, so minting is unambiguous, and it creates a fresh tree the
+// tail inspects. fetch/pull would resolve the repo through an existing repo's cwd,
+// remotes, and mutable `.git/config` (and `pull` runs repo-configured integration
+// while the token is live) — extra resolution complexity and token-bearing surface
+// for a workflow already expressible as `git -C <repo> fetch` then a separate
+// tokenless inspect. So fetch/pull/push stay single-bare. Returns null when the
+// shape does not match, so the caller falls through to the normal chain analysis.
 async function analyzeCloneThenInspect(
   command: string,
   options: { cwd: string; resolvers: GitResolvers },
