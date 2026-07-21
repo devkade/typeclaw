@@ -1,6 +1,33 @@
 import { describe, expect, test } from 'bun:test'
 
-import { GUARD_SSRF, checkSsrfGuard, classifyIpAddress, classifyUrl } from './ssrf'
+import { createInternalDestinationPolicy } from '@/network/internal-destinations'
+
+import { GUARD_SSRF, allowsInternalDestination, checkSsrfGuard, classifyIpAddress, classifyUrl } from './ssrf'
+
+const TRANSLATED_CONTROL_PLANE_ADDRESSES = [
+  '::ffff:0:169.254.169.254',
+  '2002:a9fe:a9fe::',
+  '::ffff:0:168.63.129.16',
+  '2002:a83f:8110::',
+  '2002:6464:64c8::',
+]
+
+const RFC8215_LOCAL_USE_ADDRESSES = [
+  '64:ff9b:1::a9fe:a9fe',
+  '64:ff9b:1:a9fe:0:a9fe::',
+  '64:ff9b:1::808:808',
+  '64:ff9b:1:808:0:808::',
+  '64:ff9b:1:dead:beef:cafe:babe:1234',
+]
+
+const RFC6052_NETWORK_SPECIFIC_METADATA_ADDRESSES = [
+  'fd00:0:a9fe:a9fe::',
+  'fd00:0:a9:fea9:fe::',
+  'fd00:0:0:a9fe:a9:fe00::',
+  'fd00:0:0:a9:fe:a9fe::',
+  'fd00:0:0:0:a9:fea9:fe00:0',
+  'fd00::a9fe:a9fe',
+]
 
 describe('SSRF classifier', () => {
   test('blocks AWS IMDS metadata endpoint', () => {
@@ -10,6 +37,68 @@ describe('SSRF classifier', () => {
 
   test('blocks GCP metadata endpoint by hostname', () => {
     expect(classifyUrl('http://metadata.google.internal/computeMetadata/v1/').blocked).toBe(true)
+    expect(classifyUrl('http://metadata.google.internal./computeMetadata/v1/').category).toBe('cloud_metadata')
+  })
+
+  test('keeps IPv6 and IPv4-mapped metadata endpoints unconditionally blocked', () => {
+    const policy = createInternalDestinationPolicy({
+      allowInternalHosts: ['metadata.google.internal'],
+      allowInternalCidrs: ['::/0'],
+    })
+    expect(classifyUrl('http://[fd00:ec2::254]/latest/meta-data/', policy).category).toBe('cloud_metadata')
+    expect(classifyUrl('http://[::ffff:169.254.169.254]/latest/meta-data/', policy).category).toBe('cloud_metadata')
+  })
+
+  test.each(['168.63.129.16', '::ffff:168.63.129.16', '::168.63.129.16', '64:ff9b::a83f:8110'])(
+    'blocks Azure WireServer and its mapped/NAT64 form %s',
+    (address) => {
+      expect(classifyIpAddress(address).category).toBe('cloud_metadata')
+      const policy = createInternalDestinationPolicy({ allowInternalCidrs: ['0.0.0.0/0', '::/0'] })
+      const host = address.includes(':') ? `[${address}]` : address
+      expect(classifyUrl(`http://${host}/`, policy).category).toBe('cloud_metadata')
+    },
+  )
+
+  test.each(TRANSLATED_CONTROL_PLANE_ADDRESSES)(
+    'keeps standardized translated metadata/control-plane address %s below the allowlist floor',
+    (address) => {
+      const policy = createInternalDestinationPolicy({ allowInternalCidrs: ['::/0', '0.0.0.0/0'] })
+      expect(classifyIpAddress(address).category).toBe('cloud_metadata')
+      expect(classifyUrl(`http://[${address}]/`, policy).category).toBe('cloud_metadata')
+      expect(allowsInternalDestination('public.example', address, policy)).toBe(false)
+    },
+  )
+
+  test.each(RFC6052_NETWORK_SPECIFIC_METADATA_ADDRESSES)(
+    'keeps RFC 6052 network-specific metadata address %s below the internal exception floor',
+    (address) => {
+      const policy = createInternalDestinationPolicy({ allowInternalCidrs: ['fd00::/8'] })
+      expect(classifyIpAddress(address).category).toBe('cloud_metadata')
+      expect(classifyUrl(`http://[${address}]/latest/meta-data/`, policy).category).toBe('cloud_metadata')
+      expect(allowsInternalDestination(address, address, policy)).toBe(false)
+    },
+  )
+
+  test.each(RFC8215_LOCAL_USE_ADDRESSES)(
+    'keeps RFC8215 local-use translation address %s below hostname and CIDR allowlists',
+    (address) => {
+      const policy = createInternalDestinationPolicy({
+        allowInternalHosts: ['public.example'],
+        allowInternalCidrs: ['::/0', '0.0.0.0/0'],
+      })
+      expect(classifyIpAddress(address).category).toBe('cloud_metadata')
+      expect(classifyUrl(`http://[${address}]/`, policy).category).toBe('cloud_metadata')
+      expect(allowsInternalDestination('public.example', address, policy)).toBe(false)
+    },
+  )
+
+  test('bounds the RFC8215 floor to 64:ff9b:1::/48', () => {
+    expect(classifyIpAddress('64:ff9b:0:ffff:ffff:ffff:ffff:ffff')).toEqual({ blocked: false })
+    expect(classifyIpAddress('64:ff9b:2::')).toEqual({ blocked: false })
+  })
+
+  test('does not classify arbitrary global IPv6 by private-looking low bits', () => {
+    expect(classifyIpAddress('2001:db8::a9fe:a9fe')).toEqual({ blocked: false })
   })
 
   test('blocks IPv4 loopback', () => {
@@ -93,7 +182,7 @@ describe('SSRF classifier', () => {
     expect(classifyIpAddress(address)).toEqual({
       blocked: true,
       category: 'loopback',
-      reason: 'IPv4-mapped IPv6: IPv4 loopback (127.0.0.1)',
+      reason: 'IPv4-embedded IPv6: IPv4 loopback (127.0.0.1)',
     })
   })
 
@@ -139,12 +228,46 @@ describe('checkSsrfGuard', () => {
     expect(checkSsrfGuard({ tool: 'web_fetch', args: { url: 'https://example.com/' } })).toBeUndefined()
   })
 
-  test('allows acknowledged SSRF', () => {
+  test('does not let model-authored acknowledgement bypass SSRF', () => {
     const result = checkSsrfGuard({
       tool: 'web_fetch',
       args: { url: 'http://127.0.0.1:3000/dev', acknowledgeGuards: { ssrf: true } },
     })
-    expect(result).toBeUndefined()
+    expect(result?.block).toBe(true)
+  })
+
+  test('allows an exact operator-configured internal hostname', () => {
+    expect(
+      checkSsrfGuard({
+        tool: 'web_fetch',
+        args: { url: 'http://서비스.corp/status' },
+        internalDestinationPolicy: createInternalDestinationPolicy({
+          allowInternalHosts: ['xn--9w3b15cw7a.corp'],
+          allowInternalCidrs: [],
+        }),
+      }),
+    ).toBeUndefined()
+  })
+
+  test('never allows cloud metadata through hostname or CIDR exceptions', () => {
+    const internalDestinationPolicy = createInternalDestinationPolicy({
+      allowInternalHosts: ['metadata.google.internal'],
+      allowInternalCidrs: ['0.0.0.0/0', '::/0'],
+    })
+    expect(
+      checkSsrfGuard({
+        tool: 'web_fetch',
+        args: { url: 'http://metadata.google.internal/computeMetadata/v1/' },
+        internalDestinationPolicy,
+      })?.block,
+    ).toBe(true)
+    expect(
+      checkSsrfGuard({
+        tool: 'web_fetch',
+        args: { url: 'http://169.254.169.254/latest/meta-data/' },
+        internalDestinationPolicy,
+      })?.block,
+    ).toBe(true)
   })
 
   test('does not apply to non-web_fetch tools', () => {

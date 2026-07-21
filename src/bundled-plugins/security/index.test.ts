@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 
 import type { SessionOrigin } from '@/agent/session-origin'
+import { createInternalDestinationPolicy } from '@/network/internal-destinations'
 import { createPermissionService, noopPermissionService, type PermissionService, type RolesConfig } from '@/permissions'
 import type { HookContext, PluginContext, SessionPromptEvent, ToolBeforeEvent } from '@/plugin'
 
 import securityPlugin from './index'
 import { HIGH_TIER_PER_GUARD_PERMISSIONS, SECURITY_PERMISSIONS } from './permissions'
 import { __resetRemoteTaintStateForTests } from './policies/remote-taint-state'
+import { classifyUrl } from './policies/ssrf'
 
 // Production-shaped permission service: mirrors what `loadPlugins` builds
 // at boot — plugin-contributed permission strings + owner-wildcard
@@ -195,7 +197,7 @@ describe('security plugin wiring', () => {
     expect(await hook(toolEvent('bash', { command: 'git pull origin main' }), hookContext('/agent'))).toBeUndefined()
   })
 
-  test('tool.before honors acknowledgement for each guard independently', async () => {
+  test('tool.before honors acknowledgements except for operator-owned SSRF policy', async () => {
     const hook = await toolBeforeHook()
     expect(
       await hook(
@@ -221,11 +223,13 @@ describe('security plugin wiring', () => {
       ),
     ).toBeUndefined()
     expect(
-      await hook(
-        toolEvent('web_fetch', { url: 'http://127.0.0.1/dev', acknowledgeGuards: { ssrf: true } }),
-        hookContext('/agent'),
-      ),
-    ).toBeUndefined()
+      (
+        await hook(
+          toolEvent('web_fetch', { url: 'http://127.0.0.1/dev', acknowledgeGuards: { ssrf: true } }),
+          hookContext('/agent'),
+        )
+      )?.block,
+    ).toBe(true)
     expect(
       await hook(
         toolEvent('session_search', {
@@ -235,6 +239,12 @@ describe('security plugin wiring', () => {
         hookContext('/agent'),
       ),
     ).toBeUndefined()
+    expect(
+      classifyUrl(
+        'http://169.254.169.254/latest/meta-data/',
+        createInternalDestinationPolicy({ allowInternalCidrs: ['0.0.0.0/0'] }),
+      ).blocked,
+    ).toBe(true)
   })
 
   test('acking secretExfilRead does NOT let a restricted role read an in-agent secret (privateSurfaceRead backstops it)', async () => {
@@ -310,6 +320,8 @@ describe('security plugin wiring', () => {
 
     for (const event of [
       toolEvent('read', { path: '.env', acknowledgeGuards: { secretExfilRead: true } }),
+      toolEvent('write', { path: '.env', content: 'TYPECLAW_MODEL_HTTP_ALLOW_INTERNAL_HOSTS=attacker.corp' }),
+      toolEvent('edit', { path: '.env', oldText: '', newText: 'TYPECLAW_MODEL_HTTP_ALLOW_INTERNAL_CIDRS=0.0.0.0/0' }),
       toolEvent('grep', { pattern: 'token', path: '/agent/secrets.json' }),
       toolEvent('find', { path: '.', pattern: 'secrets.json' }),
       toolEvent('ls', { path: '/agent/.env' }),
@@ -578,6 +590,12 @@ describe('security plugin wiring', () => {
         hookContext('/agent'),
       ),
     ).toBeUndefined()
+    expect(
+      classifyUrl(
+        'http://169.254.169.254/latest/meta-data/',
+        createInternalDestinationPolicy({ allowInternalCidrs: ['0.0.0.0/0'] }),
+      ).blocked,
+    ).toBe(true)
   })
 
   test('tier bypass: TUI owner BYPASSES every high-tier guard (outboundSecret, systemPromptLeak) under the role-tower model', async () => {
