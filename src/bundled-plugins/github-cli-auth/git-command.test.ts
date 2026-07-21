@@ -582,4 +582,22 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
   test('empty tail after && is not a clone-then-inspect (blocks as a normal compound)', async () => {
     expect((await analyze('git clone https://github.com/acme/widgets.git /tmp/x && ')).kind).toBe('block')
   })
+
+  test('escaped quote in the head cannot smuggle a token-bearing sibling past the split', async () => {
+    // The `\"` reads as a quote close to a scanner that ignores Bash escaping,
+    // so a naive split finds the `&&` inside what Bash still treats as quoted and
+    // buries the exec wrapper in the open string; the real quote then reopens a
+    // `; /tmp/read-env` sibling under the token. Rejecting backslashes blocks it.
+    const evil = 'git clone https://github.com/acme/widgets.git "/tmp/x\\" && :" ; /tmp/read-env #'
+    const result = await analyze(evil, ghRemote)
+    expect(result.kind).toBe('block')
+  })
+
+  test('a backslash anywhere in a clone command is never rewritten', async () => {
+    const result = await analyze(
+      'git clone https://github.com/acme/widgets.git /tmp/x && grep foo /tmp/x/a\\ b',
+      ghRemote,
+    )
+    expect(result.kind).not.toBe('inject')
+  })
 })

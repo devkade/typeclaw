@@ -233,6 +233,16 @@ async function analyzeCloneThenInspect(
   command: string,
   options: { cwd: string; resolvers: GitResolvers },
 ): Promise<GitCommandDecision | null> {
+  // A backslash defeats the quote-aware scanners below: they do not model Bash
+  // escaping, so a `\"` inside the head reads as a quote close here while Bash
+  // keeps the quote OPEN, letting a `&&` that Bash still considers quoted become
+  // our split point. The rewrite would then bury `exec …` inside the still-open
+  // string and the real quote later reopens a token-bearing sibling. Since the
+  // token-bearing rewrite must be certain about top-level structure, refuse to
+  // rewrite any command containing a backslash — fall through to the strict chain
+  // analysis, which blocks it. Mirrors gh-command.ts's blanket `\` rejection.
+  if (command.includes('\\')) return null
+
   const split = splitCloneHeadAndTail(command)
   if (split === null) return null
   const { head, tail } = split
