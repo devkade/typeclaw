@@ -28,11 +28,12 @@ export type ToolContext = {
 export type ToolFileOperands = {
   input?: readonly string[]
   output?: readonly string[]
+  create?: readonly string[]
   destructive?: readonly string[]
   // Operand paths whose string values are control tokens or remote identifiers,
   // never a local file — the file-operand scanner skips them (like a first-party
-  // prose operand) instead of rejecting a `word.ext`-shaped id or a value that
-  // collides with an agent-root dir name. Scoped per operand path and survives
+  // prose operand) instead of rejecting a value that collides with an existing
+  // agent-root entry. Scoped per operand path and survives
   // the runtime `__plugin_*` tool-name prefix that a static in-scanner table
   // cannot. Declare a real file input under `input` (it gets pinned), not here.
   nonFile?: readonly string[]
