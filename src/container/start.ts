@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
+import { applyBoundGcConfig } from '@/git/bound-gc-config'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
 import { commitSystemFile as commitSystemFileShared } from '@/git/system-commit'
 import { send as sendToDaemon } from '@/hostd/client'
@@ -238,6 +239,15 @@ export async function start({
     // that would surprise a user invoking `compose start` against a partially-up
     // tree.
     const state = await inspectContainer(exec, containerName)
+
+    // Bound gc/repack memory even when start() is an already-running no-op below:
+    // the running agent's backup keeps committing, so it must not keep using the
+    // unbounded Git defaults until a full stop/restart. This is a machine-local
+    // `git config` write (never committed, no template/side effect), so unlike the
+    // Dockerfile/.gitignore/package.json refreshes it is safe before the running
+    // return — no surprise for `compose start` against a partially-up tree.
+    await applyBoundGcConfig(cwd)
+
     if (state.exists && state.running) {
       return await reportAlreadyRunning(exec, cwd, containerName)
     }
@@ -262,6 +272,9 @@ export async function start({
     // refreshGitignore call below reads typeclaw.json and will incidentally
     // trigger the migration commit if the file was legacy.
     await refreshGitignore(cwd)
+    // Machine-local `git config` that bounds gc/repack memory on the agent repo.
+    // Runs alongside the other managed-file refreshes; not committed (local scope).
+    await applyBoundGcConfig(cwd)
     const pkgRefresh = await refreshPackageJson(cwd)
     const { untracked } = await untrackTrulyIgnoredFiles(cwd, (await loadTypeclawConfig(cwd)).git.ignore.append)
     if (untracked.length > 0) {

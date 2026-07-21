@@ -2999,6 +2999,41 @@ describe('start (composition)', () => {
     expect(onDisk).toBe('FROM stale\n')
   })
 
+  test('bounds gc/repack memory even when the container is already running', async () => {
+    // given: a real initialized repo, an already-running container, and a stale
+    // Dockerfile so we can prove the git keys land while template/docker ops no-op
+    await gitInit(root)
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      container: { exists: true, running: true },
+    })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: the memory bounds are written to the running agent's repo
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.alreadyRunning).toBe(true)
+    expect(await runGit(root, ['config', '--local', 'gc.auto'])).toBe('0')
+    expect(await runGit(root, ['config', '--local', 'pack.windowMemory'])).toBe('64m')
+    expect(await runGit(root, ['config', '--local', 'core.bigFileThreshold'])).toBe('10m')
+    // and: docker/template operations stayed no-ops on the already-running path
+    expect(calls.find((c) => c.args[0] === 'run')).toBeUndefined()
+    expect(calls.find((c) => isBuildCall(c.args))).toBeUndefined()
+    expect(await readFile(join(root, 'Dockerfile'), 'utf8')).toBe('FROM stale\n')
+  })
+
   test('reports an error when an already-running container has no published host port', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
