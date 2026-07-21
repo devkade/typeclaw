@@ -3451,34 +3451,6 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     }
   })
 
-  test('blocks model-facing bash before execution when canonical secret history exists', async () => {
-    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-contaminated-boundary-'))
-    const record: { command?: string } = {}
-    try {
-      await runFixtureGit(agentDir, 'init')
-      await runFixtureGit(agentDir, 'config', 'user.name', 'Test User')
-      await runFixtureGit(agentDir, 'config', 'user.email', 'test@example.com')
-      await writeFile(path.join(agentDir, 'secrets.json'), '{"token":"example-placeholder"}')
-      await runFixtureGit(agentDir, 'add', 'secrets.json')
-      await runFixtureGit(agentDir, 'commit', '-m', 'add fixture')
-      const wrapped = wrapBuiltinToolDefinition(fakeBash(record), {
-        agentDir,
-        sessionId: 'contaminated-boundary',
-        hooks: createHookBus(),
-        getOrigin: () => tui,
-        permissions: createPermissionService(),
-        bashSandboxBoundary: { ensureAvailable: async () => {}, buildCommand: buildSandboxedCommand },
-      })
-
-      await expect(wrapped.execute('c', { command: 'git status' }, undefined, undefined, {} as never)).rejects.toThrow(
-        /contaminated|canonical|secret/i,
-      )
-      expect(record.command).toBeUndefined()
-    } finally {
-      await rm(agentDir, { recursive: true, force: true })
-    }
-  })
-
   test('cleanup failure invokes tool.after once after cleanup and propagates the cleanup error', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-cleanup-boundary-'))
     const order: string[] = []

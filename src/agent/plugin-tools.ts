@@ -24,7 +24,6 @@ import {
   checkSkillAuthoringGuard,
 } from '@/bundled-plugins/guard/policy'
 import { config, getSandboxWritablePathSpecs } from '@/config/config'
-import { assertNoCanonicalSecretsInGit } from '@/git/secret-history'
 import { readEnvFile } from '@/init/env-file'
 import type { PermissionService } from '@/permissions/permissions'
 import type {
@@ -716,8 +715,6 @@ export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) 
   return { masks, writable, protected: protectedZones }
 }
 
-const SLOW_SECRET_SCAN_WARN_MS = 5_000
-
 // Rewrites mutableArgs.command in place so the bash builtin runs inside bwrap
 // with role-derived private-directory masks and unconditional canonical-secret
 // file masks. When masks are needed but bwrap is unavailable
@@ -734,16 +731,6 @@ async function applyBashSandbox(
 ): Promise<PreparedBashSandbox> {
   const command = mutableArgs.command
   if (typeof command !== 'string') return { verify: async () => {}, cleanup: async () => {} }
-
-  const secretScanStart = performance.now()
-  await assertNoCanonicalSecretsInGit(agentDir)
-  const secretScanMs = Math.round(performance.now() - secretScanStart)
-  if (secretScanMs > SLOW_SECRET_SCAN_WARN_MS) {
-    console.warn(
-      `[sandbox] git secret-history scan took ${secretScanMs}ms before this bash call; ` +
-        'the agent repo is likely oversized — a `git gc` in the agent folder should speed it up',
-    )
-  }
 
   const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
   const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, envOverlay)

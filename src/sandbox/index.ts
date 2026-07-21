@@ -2,7 +2,6 @@ export { buildSandboxedCommand, type SandboxedCommand } from './build'
 export {
   CANONICAL_AGENT_SECRET_DIRS,
   CANONICAL_AGENT_SECRET_FILES,
-  CANONICAL_GIT_HISTORY_SECRET_FILES,
   CANONICAL_HOME_SECRET_DIRS,
   CANONICAL_HOME_SECRET_FILES,
 } from './canonical-secrets'
