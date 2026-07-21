@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs'
-import { open, readFile, unlink, writeFile } from 'node:fs/promises'
+import { lstat, open, readFile, unlink, writeFile } from 'node:fs/promises'
+
+import lockfile from 'proper-lockfile'
 
 import { isWindows } from '@/shared'
 
@@ -14,6 +16,9 @@ export type EnsureDaemonOptions = {
   // Test seam: tests inject a deterministic version probe + respawn so the
   // unit test can exercise the drift path without spawning a real daemon.
   expectedVersion?: string
+  // Test seam: parks execution inside the spawn lock, just before spawning, so a
+  // test can prove a concurrent caller cannot enter the critical section.
+  onSpawnEnter?: () => Promise<void>
 }
 
 export type EnsureDaemonResult =
@@ -23,6 +28,18 @@ export type EnsureDaemonResult =
 const DEFAULT_SPAWN_TIMEOUT_MS = 5_000
 const SHUTDOWN_TIMEOUT_MS = 5_000
 const POLL_INTERVAL_MS = 50
+const EXIT_SETTLE_MS = 500
+// proper-lockfile refreshes the held lock's mtime every `stale/2` ms, so a lock
+// held across the full spawn (readiness poll + EXIT_SETTLE_MS grace) is never
+// seen as stale by a contender — only a crashed holder, whose refresh timer
+// died with it, is reclaimed. Mirrors the models/secrets locks' 30s ceiling.
+const LOCK_STALE_MS = 30_000
+const LOCK_RETRY_BACKOFF = {
+  factor: 1,
+  minTimeout: POLL_INTERVAL_MS,
+  maxTimeout: POLL_INTERVAL_MS,
+  randomize: false,
+} as const
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
   if (await isDaemonReachable()) {
@@ -36,13 +53,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       return { ok: false, reason: 'daemon version drifted but shutdown request did not complete' }
     }
     await ensureDirs()
-    const respawn = await ensureDaemonWithRetry(opts, 1)
+    const respawn = await spawnUnderLock(opts)
     if (!respawn.ok) return respawn
     return { ...respawn, respawned: true }
   }
 
   await ensureDirs()
-  const result = await ensureDaemonWithRetry(opts, 1)
+  const result = await spawnUnderLock(opts)
   if (!result.ok) return result
   return { ...result, respawned: false }
 }
@@ -90,19 +107,20 @@ async function requestShutdownAndWait(): Promise<boolean> {
 
 type SpawnAttemptResult = { ok: true; pid: number; spawned: boolean; httpPort: number } | { ok: false; reason: string }
 
-async function ensureDaemonWithRetry(opts: EnsureDaemonOptions, retriesLeft: number): Promise<SpawnAttemptResult> {
-  const lock = await acquireLockOrWait(opts.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS)
-  if (lock.kind === 'daemon-reachable') {
-    const httpPort = await readHttpPort()
-    if (httpPort === null) return { ok: false, reason: 'daemon did not report an HTTP control port' }
-    return { ok: true, pid: await readPidQuiet(), spawned: false, httpPort }
-  }
-  if (lock.kind === 'stale-lock-cleared') {
-    if (retriesLeft > 0) return ensureDaemonWithRetry(opts, retriesLeft - 1)
-    return { ok: false, reason: 'stale lockfile cleared but retry budget exhausted' }
-  }
-  if (lock.kind === 'timeout') {
-    return { ok: false, reason: lock.reason }
+async function spawnUnderLock(opts: EnsureDaemonOptions): Promise<SpawnAttemptResult> {
+  const lock = await acquireSpawnLock(opts.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS)
+  if (lock.kind === 'contended') {
+    // Another caller holds the spawn lock. If a daemon came up meanwhile, reuse
+    // it; otherwise that caller is still mid-spawn, so back off without racing a
+    // second spawn. proper-lockfile reclaims a crashed holder's lock on its own
+    // (its mtime refresh timer dies with the process), so there's no lock to
+    // clear here — the ownership-unsafe manual clear is gone.
+    if (await isDaemonReachable()) {
+      const httpPort = await readHttpPort()
+      if (httpPort === null) return { ok: false, reason: 'daemon did not report an HTTP control port' }
+      return { ok: true, pid: await readPidQuiet(), spawned: false, httpPort }
+    }
+    return { ok: false, reason: 'another daemon spawn is in progress' }
   }
 
   try {
@@ -121,9 +139,10 @@ async function ensureDaemonWithRetry(opts: EnsureDaemonOptions, retriesLeft: num
       if (ready === null) return { ok: false, reason: 'daemon spawned but did not become reachable yet' }
       return { ok: true, pid: existingPid, spawned: false, httpPort: ready }
     }
+    await opts.onSpawnEnter?.()
     return await spawnDaemonDetached(opts)
   } finally {
-    await releaseLock(lock.token)
+    await lock.release()
   }
 }
 
@@ -196,10 +215,18 @@ async function spawnDaemonDetached(opts: EnsureDaemonOptions): Promise<SpawnAtte
   // Timed out waiting for readiness. A still-running child is "slow-booting",
   // not "wedged" — killing it would throw away a daemon that's about to come up
   // and force every caller into a respawn loop. Only reap a child that already
-  // EXITED (proc.exitCode !== null): that's a genuine failure with a dangling
-  // pidfile to clean. A live-but-not-ready child is left running so the caller
-  // can re-probe it (see registerWithDaemon's retry) — the next ensureDaemon()
-  // fast-paths through isDaemonReachable() once its socket binds.
+  // EXITED: that's a genuine failure with a dangling pidfile to clean. A
+  // live-but-not-ready child is left running so the caller can re-probe it (see
+  // registerWithDaemon's retry) — the next ensureDaemon() fast-paths through
+  // isDaemonReachable() once its socket binds.
+  //
+  // `proc.exitCode` is a non-blocking snapshot, so a child that fails fast (e.g.
+  // a bad CLI entry) can still read as `null` here if the readiness deadline
+  // lands in the narrow window between the process exiting and Bun reaping it.
+  // Give it a bounded grace to settle by racing `proc.exited`; this makes the
+  // exited-vs-slow-booting classification deterministic instead of dependent on
+  // scheduler timing, without ever killing a still-live child.
+  if (proc.exitCode === null) await settleExit(proc, EXIT_SETTLE_MS)
   if (proc.exitCode !== null) {
     try {
       const raw = await readFile(pidfilePath(), 'utf8').catch(() => '')
@@ -210,40 +237,99 @@ async function spawnDaemonDetached(opts: EnsureDaemonOptions): Promise<SpawnAtte
   return { ok: false, reason: 'daemon spawned but did not become reachable yet' }
 }
 
-type LockToken = { path: string }
-type LockResult =
-  | { kind: 'acquired'; token: LockToken }
-  | { kind: 'daemon-reachable' }
-  | { kind: 'stale-lock-cleared' }
-  | { kind: 'timeout'; reason: string }
-
-async function acquireLockOrWait(timeoutMs: number): Promise<LockResult> {
-  const path = lockfilePath()
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    try {
-      const handle = await open(path, 'wx')
-      await handle.write(`${process.pid}\n`)
-      await handle.close()
-      return { kind: 'acquired', token: { path } }
-    } catch {
-      if (await isDaemonReachable()) return { kind: 'daemon-reachable' }
-      await sleep(POLL_INTERVAL_MS)
-    }
-  }
-  // Lock held by something that never finished. Clear it so the caller can
-  // retry once. Rare in practice (only happens if a previous ensureDaemon
-  // process was killed mid-spawn).
+async function settleExit(proc: ReturnType<typeof Bun.spawn>, graceMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const grace = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, graceMs)
+  })
   try {
-    await unlink(path)
-  } catch {}
-  return { kind: 'stale-lock-cleared' }
+    await Promise.race([proc.exited.then(() => undefined), grace])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
-async function releaseLock(token: LockToken): Promise<void> {
+type LockResult = { kind: 'acquired'; release: () => Promise<void> } | { kind: 'contended' }
+
+async function acquireSpawnLock(timeoutMs: number): Promise<LockResult> {
+  const path = lockfilePath()
+  await clearLegacyFileLock(path)
+  const retries = Math.max(1, Math.ceil(timeoutMs / POLL_INTERVAL_MS))
   try {
-    await unlink(token.path)
-  } catch {}
+    const release = await lockfile.lock(path, {
+      lockfilePath: path,
+      realpath: false,
+      stale: LOCK_STALE_MS,
+      retries: { ...LOCK_RETRY_BACKOFF, retries },
+    })
+    return { kind: 'acquired', release: () => release().catch(() => {}) }
+  } catch (error) {
+    if (errorCode(error) === 'ELOCKED') return { kind: 'contended' }
+    throw error
+  }
+}
+
+// The pre-proper-lockfile daemon left the lock as a regular FILE at this path.
+// proper-lockfile locks by creating a DIRECTORY there, so a stale legacy file
+// makes mkdir fail EEXIST (reported as ELOCKED) while its own reclaim rmdir
+// fails ENOTDIR — wedging startup forever after an upgrade. Clear an abandoned
+// legacy file, but never a live one: a co-existing old-binary caller mid-spawn
+// may hold it before its daemon is reachable. The recorded pid is only a hint
+// (pids get recycled), so it's trusted only while the file is fresh; an aged
+// file is reclaimed regardless. Directories (a live proper-lockfile lock) and
+// symlinks are left untouched.
+async function clearLegacyFileLock(path: string): Promise<void> {
+  let observed: Awaited<ReturnType<typeof lstat>>
+  try {
+    observed = await lstat(path)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return
+    throw error
+  }
+  if (!observed.isFile()) return
+
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    const code = errorCode(error)
+    if (code === 'ENOENT' || code === 'EISDIR') return
+    throw error
+  }
+
+  const pid = Number.parseInt(raw.trim(), 10)
+  const hasValidPid = Number.isSafeInteger(pid) && pid > 0
+  const isFresh = Date.now() - observed.mtimeMs < LOCK_STALE_MS
+  // A bare pid is only trustworthy briefly: pid reuse would otherwise let an
+  // abandoned legacy file (whose recorded pid the OS reassigned to an unrelated
+  // process) look "held" forever. So preserve only a FRESH file that is either
+  // held by a live pid or still within the grace for a not-yet-written pid; once
+  // the file ages past LOCK_STALE_MS, reclaim it regardless of pid liveness.
+  if (isFresh && (!hasValidPid || processExists(pid))) return
+
+  try {
+    const current = await lstat(path)
+    if (!current.isFile() || current.dev !== observed.dev || current.ino !== observed.ino) return
+    await unlink(path)
+  } catch (error) {
+    const code = errorCode(error)
+    if (code === 'ENOENT' || code === 'EISDIR' || code === 'EPERM') return
+    throw error
+  }
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM means the process exists but we may not signal it — still alive.
+    return errorCode(error) !== 'ESRCH'
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null ? (error as { code?: string }).code : undefined
 }
 
 async function readPidQuiet(): Promise<number> {

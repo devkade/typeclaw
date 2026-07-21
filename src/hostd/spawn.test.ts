@@ -1,14 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+
+import lockfile from 'proper-lockfile'
 
 import { isWindows } from '@/shared'
 
 import { isDaemonReachable } from './client'
 import { startDaemon, type Daemon } from './daemon'
-import { pidfilePath, socketPath } from './paths'
+import { ensureDirs, lockfilePath, pidfilePath, socketPath } from './paths'
 import { ensureDaemon } from './spawn'
 
 let home: string
@@ -96,10 +98,11 @@ describe('ensureDaemon', () => {
       spawnTimeoutMs: 100,
     })
 
-    // Production path requires a real CLI entry; the test invokes with a
-    // dummy path, so the spawned child exits immediately. The test asserts the
-    // failure mode is the spawn failure (not the drift path), and that an
-    // EXITED child is reaped — its pidfile must not linger.
+    // Production path requires a real CLI entry; the dummy path makes the
+    // spawned child fail fast. spawnDaemonDetached races the child's exit
+    // against a grace window, so the failure is classified as EXITED regardless
+    // of scheduler timing — not left as the ambiguous "not reachable yet". The
+    // reaped pidfile must not linger, and we must not fall into the drift path.
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.reason.toLowerCase()).not.toContain('drift')
@@ -136,4 +139,157 @@ describe('ensureDaemon', () => {
       child.kill('SIGKILL')
     }
   })
+
+  test('a short-timeout caller never clears or replaces an actively held spawn lock', async () => {
+    // given: another caller holds the spawn lock — e.g. one sitting in the
+    // exit-settle grace inside spawnDaemonDetached, which can outlast a short
+    // spawnTimeoutMs. We hold it directly so the interleaving is deterministic.
+    if (isWindows()) return
+    await expectDaemonEndpointGone()
+    await ensureDirs()
+    const release = await lockfile.lock(lockfilePath(), {
+      lockfilePath: lockfilePath(),
+      realpath: false,
+      stale: 30_000,
+      retries: 0,
+    })
+
+    try {
+      // when: a caller with a short spawn timeout contends for the same lock
+      const result = await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', spawnTimeoutMs: 100 })
+
+      // then: it backs off as contended rather than clearing the held lock and
+      // racing a second spawn — the pre-fix bug would have cleared+reacquired it
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.reason.toLowerCase()).toContain('in progress')
+      // the lock is still held by us and was never reaped by the contender
+      expect(existsSync(lockfilePath())).toBe(true)
+    } finally {
+      await release()
+    }
+    // and: once we release, the lock is gone — proving the contender left it intact
+    expect(existsSync(lockfilePath())).toBe(false)
+  })
+
+  test('reclaims a legacy file lock whose recorded pid has exited', async () => {
+    // given: an abandoned legacy-format lock (a regular FILE) recording a pid
+    // that has since exited — would otherwise wedge the directory lock forever
+    if (isWindows()) return
+    await expectDaemonEndpointGone()
+    await ensureDirs()
+    const deadPid = await spawnAndReapPid()
+    await writeFile(lockfilePath(), `${deadPid}\n`)
+
+    // when: a spawn runs against that stale legacy file
+    const result = await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', spawnTimeoutMs: 100 })
+
+    // then: the legacy file is reclaimed and the spawn reaches the spawn path
+    // (fails on the dummy cliEntry) rather than being locked out forever
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason.toLowerCase()).not.toContain('in progress')
+    expect(existsSync(lockfilePath())).toBe(false)
+  })
+
+  test('preserves a fresh legacy file lock whose recorded pid is still alive', async () => {
+    // given: a fresh legacy-format lock recording a live pid (a co-existing
+    // old-binary caller mid-spawn, before its daemon is reachable) — not stolen
+    if (isWindows()) return
+    await expectDaemonEndpointGone()
+    await ensureDirs()
+    await writeFile(lockfilePath(), `${process.pid}\n`)
+
+    // when: a spawn runs while that legacy lock is held by a live pid
+    const result = await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', spawnTimeoutMs: 100 })
+
+    // then: the live legacy lock is left intact and the caller backs off
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason.toLowerCase()).toContain('in progress')
+    expect(readFileSync(lockfilePath(), 'utf8').trim()).toBe(String(process.pid))
+  })
+
+  test('reclaims an aged legacy file lock even when its recorded pid is live (pid reuse)', async () => {
+    // given: an OLD legacy file recording a live pid — the classic pid-reuse
+    // trap where the OS reassigned the dead daemon's pid to an unrelated live
+    // process. Backdating the mtime past the stale grace makes it reclaimable
+    // despite the live pid, so it can't wedge startup permanently.
+    if (isWindows()) return
+    await expectDaemonEndpointGone()
+    await ensureDirs()
+    await writeFile(lockfilePath(), `${process.pid}\n`)
+    const aged = new Date(Date.now() - 35_000)
+    await utimes(lockfilePath(), aged, aged)
+
+    // when: a spawn runs against the aged-but-live-pid legacy file
+    const result = await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', spawnTimeoutMs: 100 })
+
+    // then: it is reclaimed (age overrides pid liveness) and the spawn proceeds
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason.toLowerCase()).not.toContain('in progress')
+    expect(existsSync(lockfilePath())).toBe(false)
+  })
+
+  test('only one concurrent caller enters the spawn path; the other is locked out', async () => {
+    if (isWindows()) return
+    await expectDaemonEndpointGone()
+
+    const entered = deferred()
+    const release = deferred()
+    let spawnEntries = 0
+
+    // given: caller A acquires the lock and parks inside the critical section,
+    // just past lock-acquire, holding the lock open
+    const first = ensureDaemon({
+      cliEntry: '/nonexistent/cli.ts',
+      spawnTimeoutMs: 100,
+      onSpawnEnter: async () => {
+        spawnEntries++
+        entered.resolve()
+        await release.promise
+      },
+    })
+
+    try {
+      await entered.promise
+
+      // when: caller B runs while A still holds the lock
+      const second = await ensureDaemon({
+        cliEntry: '/nonexistent/cli.ts',
+        spawnTimeoutMs: 100,
+        onSpawnEnter: async () => {
+          spawnEntries++
+        },
+      })
+
+      // then: B is locked out and never reaches the spawn path — exactly one
+      // caller entered the critical section, so no second daemon can race
+      expect(second.ok).toBe(false)
+      if (!second.ok) expect(second.reason.toLowerCase()).toContain('in progress')
+      expect(spawnEntries).toBe(1)
+    } finally {
+      release.resolve()
+      await first
+    }
+    expect(spawnEntries).toBe(1)
+  })
 })
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+// Spawns a trivial process, waits for it to exit, and returns its now-dead pid —
+// a real reaped pid is a more faithful "dead process" than an invented large
+// number, whose out-of-range signal may not surface as ESRCH.
+async function spawnAndReapPid(): Promise<number> {
+  const child = Bun.spawn({ cmd: [process.execPath, '-e', ''], stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+  await child.exited
+  return child.pid
+}
