@@ -88,6 +88,12 @@ const ENV_KEY_RECON_TARGETS: ReadonlyArray<string> = [
 
 const ENV_KEY_RECON_THRESHOLD = 3
 
+// Names are fixed literals, so these boundary regexes are constant. Compile
+// once at module load, not ~30 RegExps per outbound message (guard is per-send).
+const ENV_KEY_RECON_MATCHERS: ReadonlyArray<readonly [name: string, pattern: RegExp]> = ENV_KEY_RECON_TARGETS.map(
+  (name) => [name, new RegExp(`\\b${name}\\b`)] as const,
+)
+
 const TEXT_KEYS = ['text', 'message', 'content', 'body']
 
 export type OutboundSecretMatch = {
@@ -137,9 +143,8 @@ export function findOutboundSecrets(text: string, env: NodeJS.ProcessEnv = proce
 
 function findReconEnvKeys(text: string): string[] {
   const out: string[] = []
-  for (const name of ENV_KEY_RECON_TARGETS) {
-    const re = new RegExp(`\\b${name}\\b`)
-    if (re.test(text)) out.push(name)
+  for (const [name, pattern] of ENV_KEY_RECON_MATCHERS) {
+    if (pattern.test(text)) out.push(name)
   }
   return out
 }
