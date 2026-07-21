@@ -101,10 +101,37 @@ const TAIL_STRIP_PREFIX =
 // quotes too, so they are screened separately. Mirrors gh-command.ts.
 const SHELL_ACTIVE_METACHARS = new Set(['|', ';', '&', '\n', '\r', '(', ')', '{', '}', '<', '>', '`', '$'])
 
+// `\` (Bash escaping) and `#` (comments) are the two constructs our quote-aware
+// scanners do not model. Either can make our view of top-level structure disagree
+// with Bash's — so a command carrying them must never drive a token mint.
+function containsEscapeBlindSyntax(command: string): boolean {
+  return command.includes('\\') || command.includes('#')
+}
+
+// Conservative raw-text probe for a `git` word — NOT the escape-blind tokenizer.
+// Used only to choose block-vs-pass in the fail-closed gate; a miss is harmless
+// (the command runs tokenless), so it never needs to be exhaustive.
+function looksLikePotentialGitCommand(command: string): boolean {
+  return /(^|[^A-Za-z0-9_])git(?=$|[^A-Za-z0-9_-])/.test(command)
+}
+
 export async function analyzeGitCommand(
   command: string,
   options: { cwd: string; resolvers: GitResolvers },
 ): Promise<GitCommandDecision> {
+  // Fail-closed lexical gate BEFORE any mint decision. The scanners below are
+  // quote-aware but do NOT model Bash backslash escaping or `#` comments, so
+  // either can make our escape-blind view of the command disagree with Bash and
+  // drive a token mint for a structure Bash parses differently (a `\"` that keeps
+  // a quote open, or a `#` that comments out an appended boundary). Any command
+  // carrying `\` or `#` therefore never reaches an inject decision: it blocks if
+  // it looks git-ish, else passes through tokenless. Never mint here.
+  if (containsEscapeBlindSyntax(command)) {
+    return looksLikePotentialGitCommand(command)
+      ? { kind: 'block', reason: COMPOSITION_REASON }
+      : { kind: 'pass-through' }
+  }
+
   // The single permitted `cd <simple-path> && git …` shortcut is rewritten to a
   // bare `git -C …` before any chain parsing, so a chain never has to reason
   // about a `cd` segment changing cwd for the gits that follow it. Multi-git
@@ -113,7 +140,7 @@ export async function analyzeGitCommand(
   if (stripped.unsafe) return { kind: 'pass-through' }
   if (stripped.cdDir !== null) return analyzeSingleCdGit(stripped, options)
 
-  const cloneThenInspect = await analyzeCloneThenInspect(command, options)
+  const cloneThenInspect = analyzeCloneThenInspect(command)
   if (cloneThenInspect !== null) return cloneThenInspect
 
   // Split the command into `&&`-joined git segments. null = not a pure
@@ -235,20 +262,9 @@ async function analyzeSingleCdGit(
 // for a workflow already expressible as `git -C <repo> fetch` then a separate
 // tokenless inspect. So fetch/pull/push stay single-bare. Returns null when the
 // shape does not match, so the caller falls through to the normal chain analysis.
-async function analyzeCloneThenInspect(
-  command: string,
-  options: { cwd: string; resolvers: GitResolvers },
-): Promise<GitCommandDecision | null> {
-  // A backslash defeats the quote-aware scanners below: they do not model Bash
-  // escaping, so a `\"` inside the head reads as a quote close here while Bash
-  // keeps the quote OPEN, letting a `&&` that Bash still considers quoted become
-  // our split point. The rewrite would then bury `exec …` inside the still-open
-  // string and the real quote later reopens a token-bearing sibling. Since the
-  // token-bearing rewrite must be certain about top-level structure, refuse to
-  // rewrite any command containing a backslash — fall through to the strict chain
-  // analysis, which blocks it. Mirrors gh-command.ts's blanket `\` rejection.
-  if (command.includes('\\')) return null
-
+function analyzeCloneThenInspect(command: string): GitCommandDecision | null {
+  // `\` and `#` are already rejected by the early gate in analyzeGitCommand, so
+  // splitCloneHeadAndTail's quote-aware scan is trustworthy here.
   const split = splitCloneHeadAndTail(command)
   if (split === null) return null
   const { head, tail } = split
@@ -260,28 +276,61 @@ async function analyzeCloneThenInspect(
   // for every `clone && git …` shape.
   if (containsGitInvocation(tail)) return null
 
-  const invocation = extractSingleGitInvocation(head)
-  if (invocation === null) return null
-  if (findSubcommand(invocation.args) !== 'clone') return null
-  if (invocation.hasLeadingEnvAssignment || hasDangerousGitConfig(invocation.args)) {
-    return { kind: 'block', reason: DANGEROUS_CONFIG_REASON }
+  const parsed = parseStrictCloneHead(head)
+  if (parsed === null) {
+    // A clone of a NON-github url needs no token, so the compound is harmless —
+    // pass through and let git run tokenless rather than block a legitimate
+    // e.g. gitlab clone-then-grep. Anything else (a github clone that failed the
+    // strict grammar — flags, odd dir, malformed url) falls through to the strict
+    // chain analysis, which blocks it.
+    return isNonGithubCloneHead(head) ? { kind: 'pass-through' } : null
   }
-  if (containsShellActiveMetachar(head)) return { kind: 'block', reason: COMPOSITION_REASON }
 
-  let slugs: string[]
-  try {
-    slugs = await resolveRepoSlugs('clone', invocation.args, options.cwd, options.resolvers)
-  } catch {
-    return { kind: 'pass-through' }
-  }
-  if (slugs.length === 0) return { kind: 'pass-through' }
-  if (new Set(slugs).size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
+  // Reconstruct the token-bearing head from the strict parse — an absolute git
+  // and separately single-quoted url + destination — so NO byte of the original
+  // untrusted head reaches the appended `&& exec` boundary. Absolute /usr/bin/git
+  // also removes alias/function/PATH ambiguity for the token-bearing command.
+  const canonicalHead = `/usr/bin/git clone ${posixSingleQuote(parsed.url)} ${posixSingleQuote(parsed.destination)}`
 
   return {
     kind: 'inject',
-    repoSlug: slugs[0] as string,
-    rewrittenCommand: `${head.trimEnd()} && ${TAIL_STRIP_PREFIX} ${posixSingleQuote(tail)}`,
+    repoSlug: parsed.repoSlug,
+    rewrittenCommand: `${canonicalHead} && ${TAIL_STRIP_PREFIX} ${posixSingleQuote(tail)}`,
   }
+}
+
+type StrictCloneHead = { repoSlug: string; url: string; destination: string }
+
+// A DELIBERATELY tiny grammar for the token-bearing clone head:
+// `git clone <https-github-url> <simple-destination>` — no flags (clone's own
+// `-c`/`--config` reopens credential-helper/url-redirection analysis), no leading
+// env assignment, no quoting, no metachars. The captured owner/repo and url come
+// straight from this match, never the generic escape-blind tokenizer, so the
+// reconstructed command cannot be perturbed by anything in the raw head. Anything
+// outside the grammar returns null → the caller falls through (blocks or passes).
+const STRICT_CLONE_HEAD_RE =
+  /^[ \t]*git[ \t]+clone[ \t]+(https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?)[ \t]+([A-Za-z0-9._/-]+)[ \t]*$/
+
+function parseStrictCloneHead(head: string): StrictCloneHead | null {
+  const m = STRICT_CLONE_HEAD_RE.exec(head)
+  if (m === null) return null
+  const url = m[1] as string
+  const repoSlug = m[2] as string
+  const destination = m[3] as string
+  if (destination.startsWith('-')) return null
+  if (repoSlug.endsWith('/') || repoSlug.startsWith('/')) return null
+  return { repoSlug, url, destination }
+}
+
+// True when the head is `git clone … <url> …` for a url whose host is clearly not
+// github.com — a clone that needs no minted token, so its compound form is safe to
+// run tokenless. Conservative: only a positive non-github host match returns true;
+// anything ambiguous returns false so the caller falls through (and blocks).
+function isNonGithubCloneHead(head: string): boolean {
+  if (!/^[ \t]*git[ \t]+clone[ \t]/.test(head)) return false
+  const url = /(?:^|[ \t])((?:https?:\/\/|git@|ssh:\/\/)[^ \t]+)/.exec(head)?.[1]
+  if (url === undefined) return false
+  return parseGithubRepoFromGitUrl(url) === null
 }
 
 // Splits on the FIRST top-level `&&`, quote-aware. Rejects (null) when any other

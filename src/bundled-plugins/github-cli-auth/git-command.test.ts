@@ -504,24 +504,24 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
     '-u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 -u GIT_CONFIG_KEY_2 -u GIT_CONFIG_VALUE_2 ' +
     '-u GIT_CONFIG_KEY_3 -u GIT_CONFIG_VALUE_3 /bin/bash -c'
 
-  test('clone && grep is injected with the tail re-exec under a token-stripped shell', async () => {
+  // The head is RECONSTRUCTED from the strict parse, not the raw input bytes:
+  // an absolute /usr/bin/git and separately single-quoted url + destination, so
+  // nothing attacker-controlled reaches the appended `&& exec` boundary.
+  const HEAD = "/usr/bin/git clone 'https://github.com/acme/widgets.git' '/tmp/x'"
+
+  test('clone && grep is injected with a canonical head and the tail re-exec under a token-stripped shell', async () => {
     const result = await analyze('git clone https://github.com/acme/widgets.git /tmp/x && cd /tmp/x && grep -r foo .')
     expect(result).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
-      rewrittenCommand:
-        'git clone https://github.com/acme/widgets.git /tmp/x && ' + STRIP + " 'cd /tmp/x && grep -r foo .'",
+      rewrittenCommand: HEAD + ' && ' + STRIP + " 'cd /tmp/x && grep -r foo .'",
     })
   })
 
-  test('the git clone head is preserved verbatim (token still reaches the clone)', async () => {
+  test('the clone head is reconstructed canonically (absolute git, quoted url + destination)', async () => {
     const result = await analyze('git clone https://github.com/acme/widgets.git /tmp/x && ls /tmp/x')
     expect(result.kind).toBe('inject')
-    expect(
-      (result as { rewrittenCommand: string }).rewrittenCommand.startsWith(
-        'git clone https://github.com/acme/widgets.git /tmp/x && ',
-      ),
-    ).toBe(true)
+    expect((result as { rewrittenCommand: string }).rewrittenCommand.startsWith(HEAD + ' && ')).toBe(true)
   })
 
   test('a tail containing $() is opaque — quoted, never expanded in the token-bearing shell', async () => {
@@ -599,5 +599,41 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
       ghRemote,
     )
     expect(result.kind).not.toBe('inject')
+  })
+
+  test.each([
+    'git clone https://github.com/acme/widgets.git /tmp/x #',
+    'git clone https://github.com/acme/widgets.git /tmp/x # && ls',
+    'git clone https://github.com/acme/widgets.git /tmp/x#comment && ls',
+    'git clone https://github.com/acme/widgets.git /tmp/x && ls # && cd x',
+    'git clone https://github.com/acme/widgets.git /tmp/x && echo hi #\n/tmp/read-env',
+  ])('a `#` anywhere is never rewritten (comment would eat the appended boundary): %s', async (cmd) => {
+    // An unquoted `#` in the head comments out the appended `&& exec …` strip, so
+    // the clone runs with the token and a following line runs token-bearing. The
+    // early gate refuses to mint for any command containing `#`.
+    expect((await analyze(cmd, ghRemote)).kind).not.toBe('inject')
+  })
+
+  test('a strict-grammar head with flags is not rewritten (no-flags grammar avoids clone --config)', async () => {
+    const result = await analyze('git clone --depth 1 https://github.com/acme/widgets.git /tmp/x && ls', ghRemote)
+    expect(result.kind).not.toBe('inject')
+  })
+
+  test('a url with embedded credentials/port is not accepted by the strict head grammar', async () => {
+    expect((await analyze('git clone https://x@github.com:443/acme/widgets.git /tmp/x && ls', ghRemote)).kind).not.toBe(
+      'inject',
+    )
+  })
+
+  test('the injected clone head uses an absolute /usr/bin/git, not bare git', async () => {
+    const result = await analyze('git clone https://github.com/acme/widgets.git /tmp/x && ls', ghRemote)
+    expect(result.kind).toBe('inject')
+    expect((result as { rewrittenCommand: string }).rewrittenCommand.startsWith('/usr/bin/git clone ')).toBe(true)
+  })
+
+  test('the fallback single-git path never mints for a command containing `#`', async () => {
+    // `git fetch origin main #` must not reach an inject decision through the
+    // escape-blind tokenizer; the early gate blocks it before minting.
+    expect((await analyze('git fetch origin main #', ghRemote)).kind).not.toBe('inject')
   })
 })
