@@ -19,6 +19,14 @@ const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 const BLOCK_SIZE = 4
 const BLOCK_COUNT = 2
 
+// Shape is fixed by the block constants, so compile once at module load rather
+// than per inbound message — extractClaimCode runs on every channel message
+// carrying a potential claim.
+const CLAIM_CODE_RE = new RegExp(
+  `${CLAIM_CODE_PREFIX}([0-9a-zA-Z]{${BLOCK_SIZE}}(?:-[0-9a-zA-Z]{${BLOCK_SIZE}}){${BLOCK_COUNT - 1}})`,
+  'i',
+)
+
 export function generateClaimCode(): string {
   const bytes = randomBytes(BLOCK_SIZE * BLOCK_COUNT)
   const chars: string[] = []
@@ -37,11 +45,7 @@ export function generateClaimCode(): string {
 // whitespace, punctuation, and case — chat clients may auto-correct case
 // or surround pastes with quotes/backticks.
 export function extractClaimCode(text: string): string | null {
-  const pattern = new RegExp(
-    `${CLAIM_CODE_PREFIX}([0-9a-zA-Z]{${BLOCK_SIZE}}(?:-[0-9a-zA-Z]{${BLOCK_SIZE}}){${BLOCK_COUNT - 1}})`,
-    'i',
-  )
-  const match = pattern.exec(text)
+  const match = CLAIM_CODE_RE.exec(text)
   if (!match) return null
   return `${CLAIM_CODE_PREFIX}${match[1]!.toUpperCase()}`
 }

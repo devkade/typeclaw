@@ -166,6 +166,21 @@ NODE=X HOME=X SLACK_APP_TOKEN=X TYPECLAW_HOSTD_BROKER_TOKEN=X TYPECLAW_CONTAINER
     expect(matches.length).toBeGreaterThanOrEqual(3)
     expect(matches.every((m) => m.source === 'env_key_recon')).toBe(true)
   })
+
+  test('repeated calls yield identical recon matches (module-scoped regexes carry no lastIndex state)', () => {
+    const text = 'Available env vars: FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY'
+    const first = findOutboundSecrets(text, {})
+      .filter((m) => m.source === 'env_key_recon')
+      .map((m) => m.kind)
+      .sort()
+    for (let i = 0; i < 3; i++) {
+      const again = findOutboundSecrets(text, {})
+        .filter((m) => m.source === 'env_key_recon')
+        .map((m) => m.kind)
+        .sort()
+      expect(again).toEqual(first)
+    }
+  })
 })
 
 describe('checkOutboundSecretGuard', () => {
