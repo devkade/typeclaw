@@ -22,6 +22,7 @@ import {
   CANONICAL_AGENT_SECRET_FILES,
   CANONICAL_HOME_SECRET_DIRS,
   CANONICAL_HOME_SECRET_FILES,
+  CONTAINER_RUNTIME_HOME,
   type HiddenPaths,
 } from '@/sandbox'
 
@@ -166,7 +167,11 @@ function deniedSurface(agentDir: string, hidden: HiddenPaths): { deniedDirs: str
       ...new Set([
         ...hidden.dirs,
         ...CANONICAL_AGENT_SECRET_DIRS.map((dir) => path.join(agentDir, dir)),
+        // homedir() follows the live container HOME; the fixed runtime path
+        // keeps the same denial deterministic in host-stage tests and any
+        // partially-initialized caller whose environment has not switched yet.
         ...CANONICAL_HOME_SECRET_DIRS.map((dir) => path.join(homedir(), dir)),
+        ...CANONICAL_HOME_SECRET_DIRS.map((dir) => path.join(CONTAINER_RUNTIME_HOME, dir)),
       ]),
     ],
     // Keep runtime-owned credential stores independent of role-derived
@@ -176,6 +181,7 @@ function deniedSurface(agentDir: string, hidden: HiddenPaths): { deniedDirs: str
         ...hidden.files,
         ...CANONICAL_AGENT_SECRET_FILES.map((file) => path.join(agentDir, file)),
         ...CANONICAL_HOME_SECRET_FILES.map((file) => path.join(homedir(), file)),
+        ...CANONICAL_HOME_SECRET_FILES.map((file) => path.join(CONTAINER_RUNTIME_HOME, file)),
       ]),
     ],
   }
