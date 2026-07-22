@@ -13,10 +13,10 @@ import {
 
 // In-folder scratch for an in-progress `typeclaw init`, co-located with the
 // agent it describes. Lives under the agent's `.typeclaw/` (the same gitignored
-// local-scratch dir as the persistent-$HOME overlay), so it self-cleans when
-// the half-init folder is deleted, survives a folder rename mid-init, and is
-// inspectable right next to the thing being resumed. Gitignored via
-// `TRULY_IGNORED_PATTERNS`; never committed.
+// local-scratch dir that may contain orphaned legacy runtime-HOME credentials),
+// so it self-cleans when the half-init folder is deleted, survives a folder
+// rename mid-init, and is inspectable right next to the thing being resumed.
+// Gitignored via `TRULY_IGNORED_PATTERNS`; never committed.
 export const INIT_CHECKPOINT_PATH = join('.typeclaw', 'init-progress.json')
 
 export const WIZARD_CHECKPOINT_VERSION = 1

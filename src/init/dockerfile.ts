@@ -4,7 +4,6 @@ import type { DockerfileConfig, DockerfileFeatureToggle } from '@/config/config'
 import {
   CLAUDE_CREDENTIALS_FILE_NAME,
   CLAUDE_CREDENTIALS_RELATIVE_PATH,
-  CLAUDE_DEFAULT_CONFIG_DIR_NAME,
 } from '@/secrets/export-claude-credentials-file'
 
 import { GHCR_BASE_IMAGE_REPO } from './cli-version'
@@ -361,68 +360,6 @@ set -eu
 #   -nolisten tcp           refuse TCP connections (Unix socket only).
 #                           Defense-in-depth — we are in a netns with
 #                           no inbound exposure anyway.
-# link_persistent_home_files symlinks credential files that tools write
-# to $HOME into a bind-mounted location so they survive container
-# restarts. The container's $HOME (/root by default) lives on Docker's
-# writable overlay and is wiped on every \`stop\`+\`start\` cycle, so
-# without this symlink the operator would have to re-paste credentials
-# after every restart.
-#
-# Two files are linked today, both following the same contract:
-#   - ~/.codex/auth.json — Codex CLI rotates OAuth tokens in place by
-#     rewriting auth.json with refreshed credentials.
-#   - $CLAUDE_CONFIG_DIR/.credentials.json, or ~/.claude/.credentials.json
-#     by default — Claude Code rotates OAuth tokens in place by rewriting
-#     .credentials.json on every successful refresh (anthropics/claude-code
-#     #53063). Linux/Windows path; macOS uses the Keychain entry "Claude
-#     Code-credentials" with the same JSON shape.
-#
-# The persist root lives under /agent/.typeclaw/home/ (bind-mounted
-# from the agent folder via the -v <cwd>:/agent flag in start.ts).
-# Namespacing under .typeclaw/ keeps the agent's top-level layout clean and reserves
-# a system-owned subtree we can extend later (e.g. ~/.gemini/) without
-# colliding with user files. The directory is gitignored by buildGitignore()
-# so credentials never enter history.
-#
-# Three invariants this function enforces:
-#
-# 1. Symlink is unconditional and idempotent. We never check whether
-#    auth.json exists before linking — \`ln -sfn\` creates a dangling
-#    symlink on first boot, and the first \`codex login\` write goes
-#    through it to land at the persistent location. -f replaces an
-#    existing symlink; -n stops ln from dereferencing into a directory
-#    if a previous container life happened to write a real ~/.codex/
-#    dir before this code shipped.
-#
-# 2. We symlink credential FILES for tools whose config dirs are mostly
-#    scratch/history (Codex, Claude). We do not redirect global config
-#    locations such as XDG_CONFIG_HOME or ~/.config here because tools like
-#    git also read config from those paths; first-party bundles that need
-#    persistence should set their own app-specific env vars instead.
-#
-# 3. We mkdir -p the target's parent on every boot. /agent is bind-
-#    mounted, so the host-side path may exist or not depending on
-#    whether the operator ever started the container before this code
-#    shipped. mkdir -p is idempotent and cheap.
-#
-# 4. The root is overridable via TYPECLAW_PERSIST_HOME_ROOT, which only
-#    the shim's executable tests set. Production never sets it, so the
-#    in-container path is always /agent/.typeclaw/home/. The override
-#    lets the shim's behavioral tests verify symlink semantics against
-#    a real tmpdir on the host without touching /agent (which doesn't
-#    exist on developer machines and CI runners).
-link_persistent_home_files() {
-  persist_root="\${TYPECLAW_PERSIST_HOME_ROOT:-/agent/.typeclaw/home}"
-  mkdir -p "$persist_root/.codex" "$HOME/.codex"
-  ln -sfn "$persist_root/.codex/auth.json" "$HOME/.codex/auth.json"
-  claude_config_dir="\${CLAUDE_CONFIG_DIR:-}"
-  if [ -z "$claude_config_dir" ]; then
-    claude_config_dir="$HOME/${CLAUDE_DEFAULT_CONFIG_DIR_NAME}"
-  fi
-  mkdir -p "$persist_root/${CLAUDE_DEFAULT_CONFIG_DIR_NAME}" "$claude_config_dir"
-  ln -sfn "$persist_root/${CLAUDE_CREDENTIALS_RELATIVE_PATH}" "$claude_config_dir/${CLAUDE_CREDENTIALS_FILE_NAME}"
-}
-
 # link_configured_symlinks creates the operator's \`sandbox.symlinks\` at the real
 # container $HOME for runtime-owned processes. Model-driven bash runs in bwrap
 # for every role and gets an equivalent in-jail symlink from the per-tool builder
@@ -439,8 +376,7 @@ link_persistent_home_files() {
 # per-entry so one bad symlink never blocks container boot.
 #
 # TYPECLAW_AGENT_DIR defaults to /agent (the bind-mount path) and is overridable
-# only by the shim's behavioral tests, which point it at a tmpdir — same escape
-# hatch as TYPECLAW_PERSIST_HOME_ROOT in link_persistent_home_files. Production
+# only by the shim's behavioral tests, which point it at a tmpdir. Production
 # never sets it.
 link_configured_symlinks() {
   [ -n "\${TYPECLAW_SANDBOX_SYMLINKS:-}" ] || return 0
@@ -485,20 +421,72 @@ link_configured_symlinks() {
   ' || true
 }
 
-# seed_runtime_home copies the image-baked Claude Code / Codex CLI settings from
-# the build-time HOME (/root) into the managed runtime HOME the non-root re-exec
-# switches to. The Dockerfile writes ~/.claude.json, ~/.claude/settings.json,
-# and ~/.codex/hooks.json against /root during \`docker build\`; once the runtime
-# runs under HOME=$runtime_home those files would be invisible, silently
-# disabling Claude onboarding state and both CLIs' completion hooks for
-# claudeCode/codexCli users. link_persistent_home_files only links CREDENTIALS,
-# not this config, so we seed it here.
+# link_custom_claude_credentials keeps a custom CLAUDE_CONFIG_DIR credential file
+# out of model-visible reach. The Claude Code exporter writes the OAuth refresh
+# token to \$CLAUDE_CONFIG_DIR/.credentials.json when that env var is set. Under
+# the default (unset) it lands in the runtime HOME's .claude, which bwrap never
+# binds — invisible to sandboxed bash. But a custom dir under /agent (or any
+# jail-visible root) would put the real token where model bash can read it.
 #
-# Runs in the root setup phase (HOME is still /root), BEFORE the chown so the
-# copies inherit the host ownership. \`cp -n\` never clobbers a file the operator
-# already persisted into the runtime home (the bind-mounted persist root survives
-# restarts), so seeding is idempotent and one-way: image defaults fill only what
-# is missing.
+# Instead of masking every possible custom location, plant a symlink from the
+# custom path INTO the runtime HOME's .claude and let the exporter's
+# symlink-aware writeAtomic() follow it — so the real bytes always live in the
+# unbound, already-denied runtime HOME regardless of where CLAUDE_CONFIG_DIR
+# points. This restores the invariant the old persistence helper used to provide
+# (it linked into the masked persist root); the target moved to the ephemeral
+# HOME, but the "credential is only an alias in the custom dir" property is
+# preserved. Runs in the root phase before privilege drop so custom dirs under
+# root-owned roots (e.g. /etc) can still be created. No-op when the value is
+# unset/blank or already resolves to the runtime HOME's .claude (avoids a
+# self-referential link). Re-linking is idempotent (an existing symlink is
+# replaced); failures are non-fatal so a bad custom path never blocks boot.
+#
+# The from-path MUST match where the exporter actually writes. The exporter
+# (src/secrets/export-claude-credentials-file.ts resolveClaudeConfigDir) applies
+# JS String.trim() and treats an all-whitespace value as unset. Replicating that
+# in POSIX sed would diverge on Unicode whitespace (\u00A0, \u2003, …) that
+# .trim() strips but a byte-oriented sed class does not — a divergence is a
+# credential-isolation bypass (exporter writes the trimmed path, alias sits at
+# the padded path, token stays model-readable). So do the normalization in the
+# same \`bun -e\` runtime the exporter uses, guaranteeing byte-for-byte identical
+# trimming, and create the symlink there too.
+link_custom_claude_credentials() {
+  CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-}" _CLAUDE_RUNTIME_HOME="$runtime_home" \\
+    _CLAUDE_CRED_FILE="${CLAUDE_CREDENTIALS_FILE_NAME}" _CLAUDE_CRED_REL="${CLAUDE_CREDENTIALS_RELATIVE_PATH}" bun -e '
+    import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+    import { dirname, join } from "node:path";
+    const raw = process.env.CLAUDE_CONFIG_DIR;
+    const trimmed = raw?.trim();
+    if (trimmed === undefined || trimmed.length === 0) process.exit(0);
+    const runtimeHome = process.env._CLAUDE_RUNTIME_HOME || "/home/agent";
+    const from = join(trimmed, process.env._CLAUDE_CRED_FILE);
+    const to = join(runtimeHome, process.env._CLAUDE_CRED_REL);
+    if (from === to) process.exit(0);
+    try {
+      mkdirSync(trimmed, { recursive: true });
+      mkdirSync(dirname(to), { recursive: true });
+      // Unconditionally (re)point the alias, matching the old ln -sfn: a
+      // pre-existing real file at the custom path would otherwise keep the token
+      // model-readable, which is exactly the exposure this aliasing closes.
+      try { rmSync(from); } catch { /* nothing to remove */ }
+      symlinkSync(to, from);
+    } catch (e) {
+      console.error("typeclaw-entrypoint: failed to alias custom Claude credentials:", String(e));
+    }
+  ' || true
+}
+
+# seed_runtime_home copies the image-baked Claude Code / Codex CLI settings from
+# the build-time HOME (/root) into the ephemeral runtime HOME. The Dockerfile
+# writes ~/.claude.json, ~/.claude/settings.json, and ~/.codex/hooks.json against
+# /root during \`docker build\`; once the runtime runs under HOME=$runtime_home
+# those files would otherwise be invisible, silently disabling Claude onboarding
+# state and both CLIs' completion hooks for claudeCode/codexCli users.
+#
+# Runs in the root setup phase (HOME is still /root), BEFORE the optional chown
+# so copied files have the dynamic host ownership when the runtime drops
+# privileges. \`cp -n\` keeps repeated shim execution idempotent within one
+# container life; Docker removes this HOME with the container.
 seed_runtime_home() {
   _src="\${1:-/root}"
   _dst="$2"
@@ -578,19 +566,25 @@ start_xvfb() {
 }
 
 if [ "\${TYPECLAW_ENTRYPOINT_RUNTIME:-0}" = "1" ]; then
-  link_persistent_home_files
   link_configured_symlinks
   start_xvfb
   exec ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
 fi
 
-persist_root="\${TYPECLAW_PERSIST_HOME_ROOT:-/agent/.typeclaw/home}"
-runtime_home="$persist_root/runtime"
+runtime_home="\${TYPECLAW_RUNTIME_HOME:-/home/agent}"
+mkdir -p "$runtime_home"
+seed_runtime_home "$HOME" "$runtime_home"
+link_custom_claude_credentials
 if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
-  mkdir -p "$runtime_home"
-  seed_runtime_home "$HOME" "$runtime_home"
-  chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$persist_root"
+  chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$runtime_home"
 fi
+# Adopt the runtime HOME for the rest of this root phase, BEFORE any
+# link_configured_symlinks call. The re-exec paths below override HOME again for
+# the fresh runtime process, but the no-host-identity/root fallbacks run
+# link_configured_symlinks in THIS process — without this they would create the
+# operator's \`~/\` symlinks under the inherited build HOME (/root) instead of
+# \$runtime_home.
+export HOME="$runtime_home"
 
 if [ "\${TYPECLAW_NETWORK_BLOCK_INTERNAL:-0}" != "1" ]; then
   if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
@@ -606,10 +600,9 @@ if [ "\${TYPECLAW_NETWORK_BLOCK_INTERNAL:-0}" != "1" ]; then
       --bounding-set=-all --inh-caps=-all --ambient-caps=-all \\
       -- env HOME="$runtime_home" TYPECLAW_ENTRYPOINT_RUNTIME=1 "$0" "$@"
   fi
-  link_persistent_home_files
   link_configured_symlinks
   start_xvfb
-  exec ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
+  exec env HOME="$runtime_home" ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
 fi
 
 iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -661,10 +654,9 @@ if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
     --bounding-set=-all --inh-caps=-all --ambient-caps=-all \\
     -- env HOME="$runtime_home" TYPECLAW_ENTRYPOINT_RUNTIME=1 "$0" "$@"
 fi
-link_persistent_home_files
 link_configured_symlinks
 start_xvfb
-exec setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
+exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
 `
 }
 

@@ -42,12 +42,11 @@ export function buildGitignore(config: GitignoreConfig = { append: [] }): string
 # as a safety net so an agent folder cloned from a pre-rename machine never
 # stages credentials by accident.
 #
-# .typeclaw/ is the agent's local-scratch dir. It holds the persistent-$HOME
-# overlay (.typeclaw/home/, populated by the entrypoint shim's
-# \`link_persistent_home_files\` — see src/init/dockerfile.ts, mirrors container
-# $HOME files like ~/.codex/auth.json so tool credentials survive restarts) and
-# the in-progress init checkpoint (.typeclaw/init-progress.json, non-secret
-# wizard selections for resume). Local-only; never commit.
+# .typeclaw/ is the agent's local-scratch dir. It holds the in-progress init
+# checkpoint (.typeclaw/init-progress.json, non-secret wizard selections for
+# resume). Upgraded agents may also retain legacy .typeclaw/home/ credentials;
+# the runtime no longer uses or migrates them, but they must remain ignored.
+# Local-only; never commit.
 ${TRULY_IGNORED_PATTERNS.join('\n')}
 
 # System-managed: gitignored by default so the agent never stages them by hand,
