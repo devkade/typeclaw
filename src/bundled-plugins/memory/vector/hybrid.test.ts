@@ -1215,6 +1215,36 @@ describe('hybridSearch query chunking', () => {
       store.close()
     }
   })
+
+  it('decodes the corpus once per search regardless of chunk count', async () => {
+    const { agentDir, store } = createFixture()
+    try {
+      writeTopic(agentDir, 'noise', 'Noise', 'Unrelated.')
+      store.upsert(row('topic:noise', 'noise', vector({ 1: 1 })))
+
+      const loadRows = store.loadRows.bind(store)
+      let loadRowsCalls = 0
+      store.loadRows = (modelId, dims) => {
+        loadRowsCalls += 1
+        return loadRows(modelId, dims)
+      }
+
+      // An over-budget prompt that fans out to the 10-chunk cap.
+      const query = `${'word '.repeat(TEXT_TOKEN_BUDGET * 40)} FINAL-TAIL`
+      let seenChunks = 0
+      const embedPerChunk: EmbedFn = async (texts) => {
+        seenChunks = texts.length
+        return texts.map(() => vector({ 1: 1 }))
+      }
+
+      await hybridSearch(query, store, agentDir, 3, embedPerChunk)
+
+      expect(seenChunks).toBe(10)
+      expect(loadRowsCalls).toBe(1)
+    } finally {
+      store.close()
+    }
+  })
 })
 
 function createFixture(): { agentDir: string; store: VectorStore } {

@@ -24,7 +24,7 @@ import { embed, EMBEDDING_MODEL_ID, type EmbedType } from './embedder'
 import type { Passage } from './passages'
 import { clearsBaseline, gateRelevance, MARGIN, streamAdmissionBaseline } from './relevance-gate'
 import { crossScriptMarginScale, dominantScript, type ScriptClass } from './script'
-import { VectorStore, type ScoredVectorRow, type VectorRow } from './store'
+import { scoreRows, VectorStore, type ScoredVectorRow, type VectorRow } from './store'
 import { chunkEmbeddableText } from './truncation'
 
 export { collectPassages, findMissingPassages, type Passage } from './passages'
@@ -241,9 +241,17 @@ function maxScoreAcrossChunks(
   queryEmbeddings: Float32Array[],
   store: VectorStore,
 ): { scored: ScoredVectorRow[]; winnerChunkByRowId: Map<string, number> } {
+  // Decode the compatible corpus ONCE and score every chunk against it, instead
+  // of re-reading and re-decoding the whole table per chunk (queryScored did a
+  // full SELECT + BLOB decode on each call). Same MAX-across-chunks result, but
+  // the O(rows) decode runs once per turn instead of once per chunk.
+  const dims = queryEmbeddings[0]?.length
+  if (dims === undefined) return { scored: [], winnerChunkByRowId: new Map() }
+  const rows = store.loadRows(EMBEDDING_MODEL_ID, dims)
+
   const best = new Map<string, { scored: ScoredVectorRow; chunkIndex: number }>()
   queryEmbeddings.forEach((embedding, chunkIndex) => {
-    for (const scoredRow of store.queryScored(embedding, EMBEDDING_MODEL_ID)) {
+    for (const scoredRow of scoreRows(rows, embedding)) {
       const existing = best.get(scoredRow.row.id)
       if (existing === undefined || scoredRow.score > existing.scored.score) {
         best.set(scoredRow.row.id, { scored: scoredRow, chunkIndex })
