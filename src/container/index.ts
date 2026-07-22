@@ -24,6 +24,7 @@ export {
   type RequireContainerRunningResult,
 } from './require-running'
 export { planShell, shell, type ShellPlan, type ShellResult } from './shell'
+export { parseStatsLine, stats, type ContainerStats, type StatsOptions, type StatsSnapshot } from './stats'
 export { status, type ContainerStatus, type StatusOptions } from './status'
 export {
   checkDockerAvailable,
