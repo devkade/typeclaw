@@ -129,6 +129,40 @@ function levenshtein(a: string, b: string): number {
   return prev[lb]!
 }
 
+// Cap on the memoized role-resolution cache. Channel keys derive from
+// externally-controlled coordinates, so the cache must be bounded — see the
+// roleCache comment in createPermissionService.
+export const ROLE_CACHE_MAX = 4096
+
+export type BoundedCache<V> = {
+  get(key: string): V | undefined
+  set(key: string, value: V): void
+  clear(): void
+  readonly size: number
+}
+
+// Insertion-ordered cache with a hard capacity. On overflow it evicts the
+// oldest inserted entry (JS Map preserves insertion order), so size never
+// exceeds `max`. Extracted as a standalone factory so the bound is unit-testable
+// in isolation — the in-service cache is otherwise unobservable.
+export function createBoundedCache<V>(max: number): BoundedCache<V> {
+  const store = new Map<string, V>()
+  return {
+    get: (key) => store.get(key),
+    set(key, value) {
+      if (!store.has(key) && store.size >= max) {
+        const oldest = store.keys().next().value
+        if (oldest !== undefined) store.delete(oldest)
+      }
+      store.set(key, value)
+    },
+    clear: () => store.clear(),
+    get size() {
+      return store.size
+    },
+  }
+}
+
 export function createPermissionService(opts: CreatePermissionServiceOptions = {}): PermissionService {
   let pluginPermissions = opts.pluginPermissions ?? []
   let ownerWildcardExclusions = opts.ownerWildcardExclusions ?? []
@@ -136,9 +170,24 @@ export function createPermissionService(opts: CreatePermissionServiceOptions = {
   let resolved = buildRoleTable(lastRoles, pluginPermissions, ownerWildcardExclusions)
   let byName = new Map(resolved.map((r) => [r.name, r]))
 
-  function resolveRole(origin: SessionOrigin | undefined): string {
-    if (origin === undefined) return 'guest'
+  // resolveRole is called several times per tool invocation (the bash sandbox
+  // alone resolves it up to 6x through resolveHiddenPaths) and once per channel
+  // admission, and each call re-scans the whole role table via matchesOrigin.
+  // The result is a pure function of (role table, resolved origin fields), so
+  // memoize it. The cache holds only the CURRENT role table's verdicts; both
+  // role-table rebuilds (replaceRoles / replacePluginPermissions) drop it, so a
+  // stale entry can never survive a config change and hand back a now-wrong
+  // (e.g. over-privileged) role. See roleCacheKey for exactly which fields the
+  // key covers — it must stay a superset of what computeRole reads.
+  //
+  // Bounded because channel cache keys derive from externally-controlled
+  // coordinates (workspace/chat/author): a stream of distinct GitHub issue or
+  // chat ids — even denied traffic that resolves to guest — would otherwise
+  // grow the map without limit until the next role-table rebuild. See
+  // createBoundedCache for the eviction policy.
+  const roleCache = createBoundedCache<string>(ROLE_CACHE_MAX)
 
+  function computeRole(origin: SessionOrigin): string {
     // Runtime-owned infrastructure (memory, backup) acts on the operator's
     // behalf over operator-owned state. It is constructed only by runtime/
     // bundled code — inbound channel/cron content cannot produce this kind —
@@ -166,6 +215,21 @@ export function createPermissionService(opts: CreatePermissionServiceOptions = {
       }
     }
     return 'guest'
+  }
+
+  function resolveRole(origin: SessionOrigin | undefined): string {
+    if (origin === undefined) return 'guest'
+    const key = roleCacheKey(origin)
+    if (key === null) return computeRole(origin)
+    const cached = roleCache.get(key)
+    if (cached !== undefined) return cached
+    const role = computeRole(origin)
+    roleCache.set(key, role)
+    return role
+  }
+
+  function invalidateRoleCache(): void {
+    roleCache.clear()
   }
 
   function roleSeverity(name: string): number | undefined {
@@ -214,12 +278,14 @@ export function createPermissionService(opts: CreatePermissionServiceOptions = {
       lastRoles = roles ?? {}
       resolved = buildRoleTable(lastRoles, pluginPermissions, ownerWildcardExclusions)
       byName = new Map(resolved.map((r) => [r.name, r]))
+      invalidateRoleCache()
     },
     replacePluginPermissions(next) {
       pluginPermissions = next.pluginPermissions
       ownerWildcardExclusions = next.ownerWildcardExclusions
       resolved = buildRoleTable(lastRoles, pluginPermissions, ownerWildcardExclusions)
       byName = new Map(resolved.map((r) => [r.name, r]))
+      invalidateRoleCache()
     },
   }
 }
@@ -291,6 +357,31 @@ function resolveOne(
     name,
     match: user?.match ?? [],
     permissions: user?.permissions ?? [],
+  }
+}
+
+// Cache key for the memoized role resolution. It MUST enumerate exactly the
+// origin fields that computeRole/matchesOrigin consult, and NOTHING that varies
+// turn-to-turn without changing the verdict (participants, membership, thread,
+// reactionRef, *Name display fields). Returning null opts an origin OUT of the
+// cache — used for kinds where the answer is already O(1) (system/cron/subagent,
+// which read only a role string off the origin) so there is no scan to save and
+// no reason to risk an under-specified key. tui and channel are the scan-heavy
+// kinds worth caching:
+//   - tui: verdict depends only on kind (matchesOrigin's tui rule ignores
+//     sessionId), so every tui origin shares one entry.
+//   - channel: verdict depends on adapter + workspace + chat + lastInboundAuthorId
+//     (the exact inputs matchesChannel/matchesBucket/matchesAuthor read).
+// The `c` prefix + NUL separators keep channel keys unambiguous even if a field
+// contained the delimiter of another.
+function roleCacheKey(origin: SessionOrigin): string | null {
+  switch (origin.kind) {
+    case 'tui':
+      return 'tui'
+    case 'channel':
+      return ['c', origin.adapter, origin.workspace, origin.chat, origin.lastInboundAuthorId ?? ''].join('\u0000')
+    default:
+      return null
   }
 }
 
