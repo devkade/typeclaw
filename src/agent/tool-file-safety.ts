@@ -861,15 +861,24 @@ async function streamSnapshot(
       callback(null, chunk)
     },
   })
-  await pipeline(
-    source.createReadStream({ autoClose: false, start: 0 }),
-    limiter,
-    createWriteStream(destination, {
-      flags: 'wx',
-      mode: 0o400,
-    }),
-    { signal },
-  )
+  // `autoClose: false` leaves the FileHandle to the caller, but the ReadStream
+  // opens its OWN fd that `source.close()` never releases and GC never reclaims
+  // — one leaked fd per snapshotted file, reaching EMFILE on a long-running
+  // agent. Destroy the stream explicitly to free that fd deterministically.
+  const readStream = source.createReadStream({ autoClose: false, start: 0 })
+  try {
+    await pipeline(
+      readStream,
+      limiter,
+      createWriteStream(destination, {
+        flags: 'wx',
+        mode: 0o400,
+      }),
+      { signal },
+    )
+  } finally {
+    readStream.destroy()
+  }
   return copied
 }
 

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
+import { readdirSync } from 'node:fs'
 import {
   link,
   mkdir,
@@ -678,6 +679,36 @@ describe('wrapPluginTool', () => {
     } finally {
       await rm(agentDir, { recursive: true, force: true })
     }
+  })
+
+  test.skipIf(lacksInodeAnchoring)('repeatedly pinning a file operand does not leak file descriptors', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-pin-fd-leak-'))
+    await writeFile(path.join(agentDir, 'input.txt'), 'x'.repeat(4096))
+    const fdCount = () => readdirSync('/proc/self/fd').length
+
+    // Warm one cycle so lazy one-time descriptors are allocated before baseline.
+    await (
+      await enforceAndPinToolFiles({
+        tool: 'reader',
+        args: { path: 'input.txt' },
+        agentDir,
+        fileOperands: { input: ['path'] },
+      })
+    ).cleanup()
+
+    const baseline = fdCount()
+    for (let i = 0; i < 50; i++) {
+      const pinned = await enforceAndPinToolFiles({
+        tool: 'reader',
+        args: { path: 'input.txt' },
+        agentDir,
+        fileOperands: { input: ['path'] },
+      })
+      await pinned.cleanup()
+    }
+
+    expect(fdCount()).toBeLessThanOrEqual(baseline)
+    await rm(agentDir, { recursive: true, force: true })
   })
 
   test('researcher write_report preserves its absent O_EXCL output through the production plugin wrapper', async () => {
