@@ -122,6 +122,10 @@ export type StartAgentOptions = {
   // over the real env + <cwd>/secrets.json. Injectable so tests can supply a
   // fake secrets provider without touching process.env.
   caps?: RuntimeCapabilities
+  // Boot credential exporters are injectable so ordering tests can prove they
+  // observe secrets only after the awaited provider-OAuth refresh settles.
+  exportCodexAuthFile?: typeof exportCodexAuthFileForAgent
+  exportClaudeCredentialsFile?: typeof exportClaudeCredentialsFileForAgent
   // Boot-time proactive provider-OAuth refresh. Injectable so a test can supply
   // a refresh that holds the real secrets lock on a gate, proving the boot
   // barrier settles this before any session-producing consumer starts.
@@ -186,6 +190,8 @@ async function startAgentRuntime(
     createChannelManager: createChannelManagerFor = createChannelManager,
     createTunnelManager: createTunnelManagerFor = createTunnelManager,
     caps = createRuntimeCapabilities(process.env, join(cwd, 'secrets.json')),
+    exportCodexAuthFile = exportCodexAuthFileForAgent,
+    exportClaudeCredentialsFile = exportClaudeCredentialsFileForAgent,
     refreshProviderOAuth = refreshProviderOAuthForAgent,
   }: StartAgentOptions,
   registerBootCleanup: (cleanup: () => void | Promise<void>) => void,
@@ -355,32 +361,6 @@ async function startAgentRuntime(
   // stay in env, the file stays user-owned. See src/secrets/hydrate.ts.
   hydrateChannelEnvFromSecrets({ agentDir: cwd })
 
-  // When the user has `docker.file.codexCli: true` AND a typeclaw-managed
-  // openai-codex OAuth credential in secrets.json, write ~/.codex/auth.json
-  // so the Codex CLI in the container can run without a second login. The
-  // exporter is failure-tolerant by design: any error (gate miss, fs error,
-  // corrupt file) returns a non-fatal result and the agent boot continues.
-  // See src/secrets/export-codex-auth-file.ts for the newer-wins compare
-  // that prevents clobbering Codex CLI's in-place token refreshes.
-  exportCodexAuthFileForAgent({
-    agentDir: cwd,
-    codexCliEnabled: cwdConfig.docker.file.codexCli,
-    log: (message) => console.warn(message),
-  })
-
-  // Same shape as the codex exporter above, gated on `docker.file.claudeCode`
-  // and `secrets.json#providers.anthropic`. Writes ~/.claude/.credentials.json
-  // so the Claude Code CLI in the container can run without the user pasting
-  // a CLAUDE_CODE_OAUTH_TOKEN. See src/secrets/export-claude-credentials-
-  // file.ts for the newer-wins compare that prevents clobbering Claude
-  // Code's in-place token refreshes, and the read-merge-write that preserves
-  // any mcpOAuth state in the file.
-  exportClaudeCredentialsFileForAgent({
-    agentDir: cwd,
-    claudeCodeEnabled: cwdConfig.docker.file.claudeCode,
-    log: (message) => console.warn(message),
-  })
-
   // Proactively refresh any stored provider-OAuth token now. The SDK's own
   // refresh is lazy (fires on the first LLM call), so a container that restarts
   // with an already-expired access token otherwise discovers the staleness —
@@ -389,18 +369,47 @@ async function startAgentRuntime(
   // log. Channel-adapter OAuth already has host-side renewal crons; this is the
   // provider-OAuth equivalent.
   //
-  // MUST be awaited, and MUST run before the first session-producing consumer
-  // (subagentConsumer.start / cronConsumer.start / channelManager.start / the
-  // websocket server). The SDK refresh holds SecretsBackend's async file lock
-  // across its network request; getAuthFor()'s synchronous lock read gives up
-  // after ~200ms and process.exit(1)s on ELOCKED. Fire-and-forget here would let
-  // a slow refresh still own the lock when a consumer creates a session — worse
-  // than the lazy path. Awaiting behind this barrier guarantees no synchronous
-  // auth reader exists while the refresh owns the lock. Never throws (the
-  // wrapper swallows and logs), so a probe failure can't block boot; a refresh
-  // that hangs on a wedged network hangs the first turn today anyway.
+  // MUST be awaited, and MUST run before the credential-file exporters below
+  // and the first session-producing consumer (subagentConsumer.start /
+  // cronConsumer.start / channelManager.start / the websocket server). The SDK
+  // refresh holds SecretsBackend's async file lock across its network request;
+  // getAuthFor()'s synchronous lock read gives up after ~200ms and
+  // process.exit(1)s on ELOCKED. Fire-and-forget here would let a slow refresh
+  // still own the lock when an exporter or consumer reads secrets — worse than
+  // the lazy path. Awaiting behind this barrier guarantees no synchronous auth
+  // reader exists while the refresh owns the lock. Never throws (the wrapper
+  // swallows and logs), so a probe failure can't block boot; a refresh that
+  // hangs on a wedged network hangs the first turn today anyway.
   await refreshProviderOAuth({
     agentDir: cwd,
+    log: (message) => console.warn(message),
+  })
+
+  // When the user has `docker.file.codexCli: true` AND a typeclaw-managed
+  // openai-codex OAuth credential in secrets.json, write ~/.codex/auth.json
+  // so the Codex CLI in the container can run without a second login. This runs
+  // after the awaited boot refresh so the fresh ephemeral HOME receives the
+  // refreshed token, never the stale pre-refresh value. The exporter is
+  // failure-tolerant by design: any error (gate miss, fs error, corrupt file)
+  // returns a non-fatal result and the agent boot continues. See
+  // src/secrets/export-codex-auth-file.ts for the newer-wins compare that
+  // prevents clobbering Codex CLI's in-place token refreshes.
+  exportCodexAuthFile({
+    agentDir: cwd,
+    codexCliEnabled: cwdConfig.docker.file.codexCli,
+    log: (message) => console.warn(message),
+  })
+
+  // Same shape as the codex exporter above, gated on `docker.file.claudeCode`
+  // and `secrets.json#providers.anthropic`. It likewise runs after the boot
+  // refresh, then writes ~/.claude/.credentials.json so the Claude Code CLI in
+  // the container can run without the user pasting a CLAUDE_CODE_OAUTH_TOKEN.
+  // See src/secrets/export-claude-credentials-file.ts for the newer-wins compare
+  // that prevents clobbering Claude Code's in-place token refreshes, and the
+  // read-merge-write that preserves any mcpOAuth state in the file.
+  exportClaudeCredentialsFile({
+    agentDir: cwd,
+    claudeCodeEnabled: cwdConfig.docker.file.claudeCode,
     log: (message) => console.warn(message),
   })
 

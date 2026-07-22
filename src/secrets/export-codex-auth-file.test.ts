@@ -361,36 +361,29 @@ describe('exportCodexAuthFileIfApplicable', () => {
     })
   })
 
-  test('preserves the entrypoint shim symlink: writes through the link to the persistent target, not replacing the link', async () => {
+  test('preserves a pre-existing symlink by writing through it instead of replacing it', async () => {
     await withHome((home) => {
-      // given: entrypoint shim has installed a symlink at $HOME/.codex/auth.json
-      // pointing at the persistent host-side path (mimicking
-      // link_persistent_home_files in src/init/dockerfile.ts).
-      const persistRoot = join(home, 'persist', '.codex')
-      mkdirSync(persistRoot, { recursive: true })
+      // given: an operator or external tool installed a dangling symlink at the
+      // standard Codex credential path
+      const targetDir = join(home, 'external', '.codex')
+      mkdirSync(targetDir, { recursive: true })
       mkdirSync(join(home, '.codex'), { recursive: true })
       const symlinkPath = join(home, '.codex', 'auth.json')
-      const persistPath = join(persistRoot, 'auth.json')
-      symlinkSync(persistPath, symlinkPath)
+      const targetPath = join(targetDir, 'auth.json')
+      symlinkSync(targetPath, symlinkPath)
 
-      // when: the runtime exporter fires on a first boot (persist target is
-      // a dangling symlink — file does not exist yet).
+      // when: the runtime exporter writes through the dangling symlink
       const result = exportCodexAuthFileIfApplicable({
         codexCliEnabled: true,
         providers: oauthProviders({ refresh: 'first-boot-refresh' }),
         homeDir: home,
       })
 
-      // then: the symlink at $HOME/.codex/auth.json must still be a symlink
-      // (NOT replaced with a regular file). Without the fix, renameSync
-      // would have replaced the symlink directory entry, leaving the
-      // persistent path untouched and breaking the next-boot re-symlink.
+      // then: renameSync did not replace the symlink directory entry
       expect(result.action).toBe('wrote')
       expect(lstatSync(symlinkPath).isSymbolicLink()).toBe(true)
-      // and: the credential lands at the persistent target, where the
-      // entrypoint shim's next-boot ln -sfn re-symlinks back to.
-      expect(existsSync(persistPath)).toBe(true)
-      const onDisk = JSON.parse(readFileSync(persistPath, 'utf8')) as {
+      expect(existsSync(targetPath)).toBe(true)
+      const onDisk = JSON.parse(readFileSync(targetPath, 'utf8')) as {
         tokens: { refresh_token: string }
       }
       expect(onDisk.tokens.refresh_token).toBe('first-boot-refresh')
@@ -399,17 +392,16 @@ describe('exportCodexAuthFileIfApplicable', () => {
 
   test('symlink case: newer-wins compare still works because readFileSync follows symlinks', async () => {
     await withHome((home) => {
-      // given: symlink in place + persistent file already contains a fresher
-      // token (Codex CLI rotated it in-place since the last typeclaw write).
-      const persistRoot = join(home, 'persist', '.codex')
-      mkdirSync(persistRoot, { recursive: true })
+      // given: a symlink target already contains a fresher token
+      const targetDir = join(home, 'external', '.codex')
+      mkdirSync(targetDir, { recursive: true })
       mkdirSync(join(home, '.codex'), { recursive: true })
       const symlinkPath = join(home, '.codex', 'auth.json')
-      const persistPath = join(persistRoot, 'auth.json')
-      symlinkSync(persistPath, symlinkPath)
+      const targetPath = join(targetDir, 'auth.json')
+      symlinkSync(targetPath, symlinkPath)
       const fresherAccess = makeJwt({ exp: 3_000_000_000 })
       writeFileSync(
-        persistPath,
+        targetPath,
         JSON.stringify({
           tokens: { id_token: fresherAccess, access_token: fresherAccess, refresh_token: 'codex-rotated' },
         }),
@@ -422,10 +414,9 @@ describe('exportCodexAuthFileIfApplicable', () => {
         homeDir: home,
       })
 
-      // then: skip — the symlink path resolves through to the persistent
-      // file, the newer-wins compare sees codex's later exp, no write.
+      // then: skip — the symlink resolves through to the fresher file
       expect(result).toEqual({ action: 'skipped', reason: 'on-disk-is-fresher' })
-      const after = JSON.parse(readFileSync(persistPath, 'utf8')) as {
+      const after = JSON.parse(readFileSync(targetPath, 'utf8')) as {
         tokens: { refresh_token: string }
       }
       expect(after.tokens.refresh_token).toBe('codex-rotated')

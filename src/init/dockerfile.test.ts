@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync } from 'node:fs'
 import { mkdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1434,7 +1434,7 @@ describe('network egress entrypoint shim', () => {
     expect(runtimeExecs).toHaveLength(2)
   })
 
-  test('uses a managed persistent runtime HOME and only chowns the TypeClaw-owned home subtree', () => {
+  test('uses the ephemeral /home/agent runtime HOME, preserving env while dropping to the dynamic host identity', () => {
     // given
     const shim = buildEntrypointShim()
 
@@ -1445,17 +1445,18 @@ describe('network egress entrypoint shim', () => {
       .join('\n')
 
     // then
-    expect(shim).toContain('runtime_home="$persist_root/runtime"')
+    expect(shim).toContain('runtime_home="${TYPECLAW_RUNTIME_HOME:-/home/agent}"')
     // The privilege-drop handoffs must NOT use --reset-env: it would wipe the
     // --env-file values and the TypeClaw-injected runtime variables. HOME is
     // overridden via the trailing `env`; everything else is forwarded.
     expect(executable).not.toContain('--reset-env')
     expect(shim.match(/-- env HOME="\$runtime_home" TYPECLAW_ENTRYPOINT_RUNTIME=1 "\$0" "\$@"/g)?.length).toBe(2)
-    expect(shim).toContain('chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$persist_root"')
+    expect(shim).toContain('chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$runtime_home"')
     expect(executable).not.toMatch(/chown -R [^\n]*\/agent(?:\s|$)/)
+    expect(executable).not.toMatch(/(?:501|:20\b)/)
   })
 
-  test('seeds the managed runtime HOME with image-baked Claude/Codex settings, before the chown, without clobbering persisted files', () => {
+  test('creates and seeds the ephemeral runtime HOME unconditionally, then chowns it only when host identity is available', () => {
     const shim = buildEntrypointShim()
     expect(shim).toContain('seed_runtime_home() {')
     // The image bakes these three files against /root at build time; the helper
@@ -1463,16 +1464,49 @@ describe('network egress entrypoint shim', () => {
     expect(shim).toContain('.claude.json')
     expect(shim).toContain('.claude/settings.json')
     expect(shim).toContain('.codex/hooks.json')
-    // cp -n → never overwrite a file the operator already persisted.
+    // cp -n keeps the helper idempotent within one container life.
     expect(shim).toMatch(/cp -n "\$_src\/\.claude\.json"/)
-    // Seeding must run BEFORE the chown so copied files inherit host ownership.
+    const runtimeHomeIdx = shim.indexOf('runtime_home="${TYPECLAW_RUNTIME_HOME:-/home/agent}"')
+    const mkdirIdx = shim.indexOf('mkdir -p "$runtime_home"', runtimeHomeIdx)
     const seedCallIdx = shim.indexOf('seed_runtime_home "$HOME" "$runtime_home"')
-    const chownIdx = shim.indexOf('chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$persist_root"')
+    const identityGuardIdx = shim.indexOf('if [ -n "${TYPECLAW_HOST_UID:-}" ]', runtimeHomeIdx)
+    const chownIdx = shim.indexOf('chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$runtime_home"')
+    expect(runtimeHomeIdx).toBeGreaterThan(-1)
+    expect(mkdirIdx).toBeGreaterThan(runtimeHomeIdx)
+    expect(seedCallIdx).toBeGreaterThan(mkdirIdx)
+    expect(identityGuardIdx).toBeGreaterThan(seedCallIdx)
     expect(seedCallIdx).toBeGreaterThan(-1)
-    expect(chownIdx).toBeGreaterThan(seedCallIdx)
+    expect(chownIdx).toBeGreaterThan(identityGuardIdx)
   })
 
-  test('runs persistent-home links, configured symlinks, Xvfb, and bun only in the non-root runtime phase', () => {
+  test('aliases a custom CLAUDE_CONFIG_DIR credentials file into the ephemeral runtime HOME, in the root phase before privilege drop', () => {
+    const shim = buildEntrypointShim()
+    expect(shim).toContain('link_custom_claude_credentials() {')
+    // Normalization runs in the SAME bun runtime as the exporter, so
+    // String.trim() (incl. Unicode whitespace) matches byte-for-byte — a sed
+    // replica would diverge and open a credential-isolation bypass.
+    expect(shim).toContain('const trimmed = raw?.trim();')
+    expect(shim).toContain('if (trimmed === undefined || trimmed.length === 0) process.exit(0);')
+    // Alias FROM the (trimmed) custom dir INTO $runtime_home/.claude so the
+    // exporter's symlink-aware write lands the real token in the unbound
+    // (bash-invisible) runtime HOME, not the model-visible custom path.
+    expect(shim).toContain('const to = join(runtimeHome, process.env._CLAUDE_CRED_REL);')
+    expect(shim).toContain('symlinkSync(to, from);')
+    // No self-link when the custom path already resolves to HOME; otherwise the
+    // alias is repointed unconditionally (a pre-existing real file is removed) so
+    // a stale credential can't stay at the model-visible custom path.
+    expect(shim).toContain('if (from === to) process.exit(0);')
+    expect(shim).toContain('rmSync(from);')
+    // Must run in the root phase, after runtime_home is set and BEFORE the
+    // privilege-drop re-exec, so custom dirs under root-owned roots still work.
+    const callIdx = shim.indexOf('link_custom_claude_credentials\n')
+    const runtimeHomeIdx = shim.indexOf('runtime_home="${TYPECLAW_RUNTIME_HOME:-/home/agent}"')
+    const firstDropIdx = shim.indexOf('exec setpriv --reuid')
+    expect(callIdx).toBeGreaterThan(runtimeHomeIdx)
+    expect(callIdx).toBeLessThan(firstDropIdx)
+  })
+
+  test('runs configured symlinks, Xvfb, and bun in the non-root runtime phase without legacy persistence links', () => {
     // given
     const shim = buildEntrypointShim()
 
@@ -1483,7 +1517,7 @@ describe('network egress entrypoint shim', () => {
 
     // then
     expect(runtimeBranchStart).toBeGreaterThan(-1)
-    expect(runtimeBranch).toContain('link_persistent_home_files')
+    expect(shim).not.toContain('link_persistent_home_files')
     expect(runtimeBranch).toContain('link_configured_symlinks')
     expect(runtimeBranch).toContain('start_xvfb')
     expect(runtimeBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
@@ -1501,7 +1535,7 @@ describe('network egress entrypoint shim', () => {
     // then
     expect(offBranch).not.toContain('iptables -A OUTPUT')
     expect(offBranch).toContain('TYPECLAW_ENTRYPOINT_RUNTIME=1')
-    expect(offBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(offBranch).toContain(`exec env HOME="$runtime_home" bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
   })
 
   test('shim self-heals on Xvfb presence: spawns Xvfb directly (not xvfb-run, which hangs as PID 1) and exports DISPLAY', () => {
@@ -1591,7 +1625,7 @@ describe('network egress entrypoint shim', () => {
   test('drops NET_ADMIN from bounding+inheritable+ambient sets before exec-ing (matches setpriv(1) warning)', () => {
     const shim = buildEntrypointShim()
     expect(shim).toContain(
-      `exec setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`,
+      `exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`,
     )
   })
 
@@ -1609,7 +1643,9 @@ describe('network egress entrypoint shim', () => {
     expect(runtimeBranch.indexOf('start_xvfb\n')).toBeLessThan(
       runtimeBranch.indexOf(`exec bun --smol run ${TYPECLAW_CLI_ENTRY}`),
     )
-    expect(networkOnTail.indexOf('start_xvfb\n')).toBeLessThan(networkOnTail.indexOf(`exec setpriv --bounding-set`))
+    expect(networkOnTail.indexOf('start_xvfb\n')).toBeLessThan(
+      networkOnTail.indexOf(`exec env HOME="$runtime_home" setpriv --bounding-set`),
+    )
   })
 
   test('Xvfb drops NET_ADMIN via setpriv ONLY on the root/fallback path; in the non-root runtime phase it launches directly (CAP_SETPCAP is already gone, so a second bounding-set drop would fail)', () => {
@@ -1651,11 +1687,12 @@ describe('network egress entrypoint shim', () => {
 
   test('on-mode side effects (iptables OUTPUT rules, the agent-exec setpriv drop) appear only on the on-branch — the off-branch execs the agent directly without firewall installation', () => {
     const shim = buildEntrypointShim()
-    const offBranchEnd = shim.indexOf('fi\n', shim.indexOf('!= "1"'))
+    const offBranchStart = shim.indexOf('if [ "${TYPECLAW_NETWORK_BLOCK_INTERNAL:-0}" != "1" ]; then')
+    const offBranchEnd = shim.indexOf('\nfi\n', offBranchStart)
     expect(offBranchEnd).toBeGreaterThan(-1)
-    const offBranch = shim.slice(0, offBranchEnd)
+    const offBranch = shim.slice(offBranchStart, offBranchEnd)
     expect(offBranch).not.toContain('iptables -A OUTPUT')
-    expect(offBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(offBranch).toContain(`exec env HOME="$runtime_home" bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
     expect(offBranch).not.toMatch(/exec setpriv [^\n]*-- bun --smol run/)
   })
 
@@ -1737,15 +1774,12 @@ describe('network egress entrypoint shim', () => {
     expect(shim).toContain('unset IFS')
   })
 
-  test('defines link_persistent_home_files that symlinks ~/.codex/auth.json into /agent/.typeclaw/home/ so OAuth credentials survive container restarts', () => {
+  test('removes the legacy persistent-HOME helper and override completely', () => {
     const shim = buildEntrypointShim()
-    expect(shim).toContain('link_persistent_home_files() {')
-    // Default root is /agent/.typeclaw/home in production; the env var
-    // override exists only so the shim's executable tests can rebind
-    // the root to a tmpdir without touching /agent on the test host.
-    expect(shim).toContain('persist_root="${TYPECLAW_PERSIST_HOME_ROOT:-/agent/.typeclaw/home}"')
-    expect(shim).toContain('mkdir -p "$persist_root/.codex" "$HOME/.codex"')
-    expect(shim).toContain('ln -sfn "$persist_root/.codex/auth.json" "$HOME/.codex/auth.json"')
+    expect(shim).not.toContain('link_persistent_home_files')
+    expect(shim).not.toContain('TYPECLAW_PERSIST_HOME_ROOT')
+    expect(shim).not.toContain('persist_root')
+    expect(shim).not.toContain('/agent/.typeclaw/home')
   })
 
   test('defines link_configured_symlinks gated on TYPECLAW_SANDBOX_SYMLINKS and calls it from every runtime path', () => {
@@ -1769,85 +1803,21 @@ describe('network egress entrypoint shim', () => {
     expect(dockerfile).toContain('ENV GWS_CONFIG_HOME=/agent/workspace/.config/gws')
   })
 
-  test('also symlinks Claude Code .credentials.json into /agent/.typeclaw/home/ so OAuth credentials survive container restarts', () => {
+  test('sets HOME on both root fallbacks while preserving the inherited HOME in the non-root runtime phase', () => {
     const shim = buildEntrypointShim()
-    // Claude Code rotates tokens in-place by rewriting .credentials.json on
-    // every successful refresh (anthropics/claude-code#53063). Without the
-    // symlink, the refreshed credential lands on the container's overlay
-    // and is wiped on the next `stop`+`start`. Same persist-root contract
-    // as the codex line above.
-    expect(shim).toContain('claude_config_dir="${CLAUDE_CONFIG_DIR:-}"')
-    expect(shim).toContain('claude_config_dir="$HOME/.claude"')
-    expect(shim).toContain('mkdir -p "$persist_root/.claude" "$claude_config_dir"')
-    expect(shim).toContain('ln -sfn "$persist_root/.claude/.credentials.json" "$claude_config_dir/.credentials.json"')
-  })
-
-  test('uses ln -sfn (idempotent + non-dereferencing) so re-runs across container lives never fail and never recurse into a pre-existing ~/.codex directory', () => {
-    const shim = buildEntrypointShim()
-    expect(shim).toMatch(/ln -sfn "\$persist_root\/\.codex\/auth\.json" "\$HOME\/\.codex\/auth\.json"/)
-    expect(shim).not.toMatch(/ln -s "\$persist_root\/\.codex\/auth\.json"/)
-    expect(shim).not.toMatch(/ln -sf "\$persist_root\/\.codex\/auth\.json"/)
-  })
-
-  test('claude symlink also uses ln -sfn (same idempotency contract as codex)', () => {
-    const shim = buildEntrypointShim()
-    expect(shim).toMatch(
-      /ln -sfn "\$persist_root\/\.claude\/\.credentials\.json" "\$claude_config_dir\/\.credentials\.json"/,
-    )
-    expect(shim).not.toMatch(/ln -s "\$persist_root\/\.claude\/\.credentials\.json"/)
-    expect(shim).not.toMatch(/ln -sf "\$persist_root\/\.claude\/\.credentials\.json"/)
-  })
-
-  test('claude symlink honors CLAUDE_CONFIG_DIR when set', () => {
-    const shim = buildEntrypointShim()
-    const claudeConfigCheckIdx = shim.indexOf('if [ -z "$claude_config_dir" ]; then')
-    const claudeSymlinkIdx = shim.indexOf('"$claude_config_dir/.credentials.json"')
-    expect(claudeConfigCheckIdx).toBeGreaterThan(-1)
-    expect(claudeSymlinkIdx).toBeGreaterThan(claudeConfigCheckIdx)
-  })
-
-  test('link_persistent_home_files runs after firewall setup and before bun on the runtime paths', () => {
-    // given
-    const shim = buildEntrypointShim()
-
-    // when
     const runtimeBranchStart = shim.indexOf('if [ "${TYPECLAW_ENTRYPOINT_RUNTIME:-0}" = "1" ]; then')
     const runtimeBranchEnd = shim.indexOf('\nfi\n', runtimeBranchStart)
     const runtimeBranch = shim.slice(runtimeBranchStart, runtimeBranchEnd)
+    const networkOffStart = shim.indexOf('if [ "${TYPECLAW_NETWORK_BLOCK_INTERNAL:-0}" != "1" ]; then')
+    const networkOffEnd = shim.indexOf('\nfi\n', networkOffStart)
+    const networkOffBranch = shim.slice(networkOffStart, networkOffEnd)
     const networkOnTail = shim.slice(shim.lastIndexOf('if [ -n "${TYPECLAW_HOST_UID:-}" ]'))
 
-    // then
-    expect(runtimeBranch.indexOf('link_persistent_home_files\n')).toBeLessThan(
-      runtimeBranch.indexOf(`exec bun --smol run ${TYPECLAW_CLI_ENTRY}`),
+    expect(runtimeBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(networkOffBranch).toContain(`exec env HOME="$runtime_home" bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(networkOnTail).toContain(
+      `exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`,
     )
-    expect(networkOnTail.indexOf('link_persistent_home_files\n')).toBeLessThan(
-      networkOnTail.indexOf(`exec setpriv --bounding-set`),
-    )
-  })
-
-  test('on-path: link_persistent_home_files runs AFTER iptables OUTPUT rules so a failure in the helper cannot prevent the egress lockdown from taking effect (security invariant pinned by AGENTS.md)', () => {
-    const shim = buildEntrypointShim()
-    const offBranchEnd = shim.indexOf('fi\n', shim.indexOf('!= "1"'))
-    const onBranch = shim.slice(offBranchEnd)
-    const lastIptablesIdx = onBranch.lastIndexOf('iptables -A OUTPUT')
-    const lastIp6tablesIdx = onBranch.lastIndexOf('ip6tables -A OUTPUT')
-    const linkIdx = onBranch.lastIndexOf('link_persistent_home_files\n')
-    expect(lastIptablesIdx).toBeGreaterThan(-1)
-    expect(lastIp6tablesIdx).toBeGreaterThan(-1)
-    expect(linkIdx).toBeGreaterThan(lastIptablesIdx)
-    expect(linkIdx).toBeGreaterThan(lastIp6tablesIdx)
-  })
-
-  test('symlink target is unconditional — never gated on auth.json existing — so first-time codex login writes through the link to the persistent location', () => {
-    const shim = buildEntrypointShim()
-    const fnStart = shim.indexOf('link_persistent_home_files() {')
-    const fnEnd = shim.indexOf('\n}\n', fnStart)
-    expect(fnStart).toBeGreaterThan(-1)
-    expect(fnEnd).toBeGreaterThan(fnStart)
-    const fnBody = shim.slice(fnStart, fnEnd)
-    expect(fnBody).not.toMatch(/if .* -f .*auth\.json/)
-    expect(fnBody).not.toMatch(/test -e .*auth\.json/)
-    expect(fnBody).not.toMatch(/\[ -e .*auth\.json \]/)
   })
 })
 
@@ -1923,7 +1893,7 @@ exit 1
       env: {
         PATH: `${bindir}:${process.env['PATH'] ?? ''}`,
         HOME: fakeHome,
-        TYPECLAW_PERSIST_HOME_ROOT: join(workdir, 'persist-xvfb-fail'),
+        TYPECLAW_RUNTIME_HOME: join(workdir, 'runtime-home-xvfb-fail'),
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -1994,7 +1964,7 @@ exit 0
       env: {
         PATH: runBin,
         HOME: fakeHome,
-        TYPECLAW_PERSIST_HOME_ROOT: join(runWorkdir, 'persist'),
+        TYPECLAW_RUNTIME_HOME: join(runWorkdir, 'runtime-home'),
         TYPECLAW_HOST_UID: String(process.getuid?.() ?? 1000),
         TYPECLAW_HOST_GID: String(process.getgid?.() ?? 1000),
       },
@@ -2009,6 +1979,94 @@ exit 0
     const log = readFileSync(logfileRuntime, 'utf8')
     expect(log).toContain('DISPLAY: :99')
     rmSync(runWorkdir, { recursive: true, force: true })
+  })
+
+  test('a custom CLAUDE_CONFIG_DIR credentials path is symlinked into the runtime HOME so the exporter writes the real token there, not the model-visible custom dir', async () => {
+    const realBun = Bun.which('bun')
+    if (!realBun) throw new Error('bun not on host PATH')
+
+    const claudeWorkdir = mkdtempSync(join(tmpdir(), 'typeclaw-shim-claude-'))
+    const claudeBin = join(claudeWorkdir, 'bin')
+    await mkdir(claudeBin, { recursive: true })
+    await symlinkHostBinaries(claudeBin, ['mkdir', 'ln', 'readlink', 'env', 'sh', 'chown', 'rm', 'dirname'])
+    // The alias is created inside `bun -e`, so forward -e to the real bun; no-op
+    // the final `bun run` so the shim ends without launching the agent. No Xvfb
+    // and no host UID → the shim reaches the root fallback and the alias step.
+    await writeShellScript(
+      join(claudeBin, 'bun'),
+      `#!/bin/sh\nfor a in "$@"; do [ "$a" = "-e" ] && exec ${realBun} "$@"; done\nexit 0\n`,
+    )
+
+    const shimPath = join(claudeWorkdir, 'shim-claude.sh')
+    await writeShellScript(shimPath, buildEntrypointShim())
+
+    const runtimeHome = join(claudeWorkdir, 'runtime-home')
+    const expectedTarget = join(runtimeHome, '.claude', '.credentials.json')
+    // The custom config dir lives under a stand-in agent dir — the model-visible
+    // location that must NOT hold the real credential. Pad it with surrounding
+    // whitespace: the exporter trims before writing, so the alias MUST be created
+    // at the trimmed path or the real token leaks to the padded model-visible one.
+    const customConfigDir = join(claudeWorkdir, 'agent', 'public', 'claude')
+    const proc = Bun.spawn(['/bin/sh', shimPath, 'run'], {
+      env: {
+        PATH: claudeBin,
+        HOME: join(claudeWorkdir, 'root-home'),
+        TYPECLAW_RUNTIME_HOME: runtimeHome,
+        CLAUDE_CONFIG_DIR: `  ${customConfigDir}  `,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(await proc.exited).toBe(0)
+
+    // The alias sits at the TRIMMED custom path (matching where the exporter
+    // writes), is a symlink, and points into the unbound runtime HOME.
+    const customCred = join(customConfigDir, '.credentials.json')
+    expect(lstatSync(customCred).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(customCred)).toBe(expectedTarget)
+    // No stray alias at the untrimmed (padded) path.
+    expect(existsSync(join(`  ${customConfigDir}  `, '.credentials.json'))).toBe(false)
+    rmSync(claudeWorkdir, { recursive: true, force: true })
+  })
+
+  test('a pre-existing REAL credential file at a custom CLAUDE_CONFIG_DIR is replaced by the alias (no stale model-readable token)', async () => {
+    const realBun = Bun.which('bun')
+    if (!realBun) throw new Error('bun not on host PATH')
+
+    const workdir = mkdtempSync(join(tmpdir(), 'typeclaw-shim-claude-real-'))
+    const bin = join(workdir, 'bin')
+    await mkdir(bin, { recursive: true })
+    await symlinkHostBinaries(bin, ['mkdir', 'ln', 'readlink', 'env', 'sh', 'chown', 'rm', 'dirname'])
+    await writeShellScript(
+      join(bin, 'bun'),
+      `#!/bin/sh\nfor a in "$@"; do [ "$a" = "-e" ] && exec ${realBun} "$@"; done\nexit 0\n`,
+    )
+    const shimPath = join(workdir, 'shim.sh')
+    await writeShellScript(shimPath, buildEntrypointShim())
+
+    const runtimeHome = join(workdir, 'runtime-home')
+    const customConfigDir = join(workdir, 'agent', 'public', 'claude')
+    // given: a real (non-symlink) credential file already sits at the custom path
+    await mkdir(customConfigDir, { recursive: true })
+    await writeFile(join(customConfigDir, '.credentials.json'), '{"stale":"token"}')
+
+    const proc = Bun.spawn(['/bin/sh', shimPath, 'run'], {
+      env: {
+        PATH: bin,
+        HOME: join(workdir, 'root-home'),
+        TYPECLAW_RUNTIME_HOME: runtimeHome,
+        CLAUDE_CONFIG_DIR: customConfigDir,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(await proc.exited).toBe(0)
+
+    // then: the real file is GONE — replaced by a symlink into the runtime HOME
+    const customCred = join(customConfigDir, '.credentials.json')
+    expect(lstatSync(customCred).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(customCred)).toBe(join(runtimeHome, '.claude', '.credentials.json'))
+    rmSync(workdir, { recursive: true, force: true })
   })
 
   test('host UID/GID re-exec forwards env-file values and TypeClaw-injected vars (no --reset-env), overriding only HOME + RUNTIME', async () => {
@@ -2033,12 +2091,12 @@ exec "$@"
 
     const envFakeHome = join(envWorkdir, 'host-home')
     await mkdir(envFakeHome, { recursive: true })
-    const expectedRuntimeHome = join(envWorkdir, 'persist', 'runtime')
+    const expectedRuntimeHome = join(envWorkdir, 'runtime-home')
     const proc = Bun.spawn(['/bin/sh', envShimPath, 'run'], {
       env: {
         PATH: envBin,
         HOME: envFakeHome,
-        TYPECLAW_PERSIST_HOME_ROOT: join(envWorkdir, 'persist'),
+        TYPECLAW_RUNTIME_HOME: expectedRuntimeHome,
         TYPECLAW_HOST_UID: String(process.getuid?.() ?? 1000),
         TYPECLAW_HOST_GID: String(process.getgid?.() ?? 1000),
         // Stand-ins for an --env-file credential and TypeClaw-injected vars.
@@ -2067,7 +2125,9 @@ exec "$@"
     const seedWorkdir = mkdtempSync(join(tmpdir(), 'typeclaw-shim-seed-'))
     const seedBin = join(seedWorkdir, 'bin')
     await mkdir(seedBin, { recursive: true })
-    await symlinkHostBinaries(seedBin, ['mkdir', 'ln', 'readlink', 'env', 'sh', 'chown', 'rm', 'sleep', 'cp', 'cat'])
+    await symlinkHostBinaries(seedBin, ['mkdir', 'ln', 'readlink', 'env', 'sh', 'rm', 'sleep', 'cp', 'cat'])
+    const chownDump = join(seedWorkdir, 'chown.log')
+    await writeShellScript(join(seedBin, 'chown'), `#!/bin/sh\nprintf '%s\n' "$*" > "${chownDump}"\nexit 0\n`)
     await writeShellScript(
       join(seedBin, 'setpriv'),
       `#!/bin/sh
@@ -2106,9 +2166,9 @@ exit 0
       env: {
         PATH: seedBin,
         HOME: bakedHome,
-        TYPECLAW_PERSIST_HOME_ROOT: join(seedWorkdir, 'persist'),
-        TYPECLAW_HOST_UID: String(process.getuid?.() ?? 1000),
-        TYPECLAW_HOST_GID: String(process.getgid?.() ?? 1000),
+        TYPECLAW_RUNTIME_HOME: join(seedWorkdir, 'runtime-home'),
+        TYPECLAW_HOST_UID: '12345',
+        TYPECLAW_HOST_GID: '23456',
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -2117,105 +2177,60 @@ exit 0
     expect(exitCode).toBe(0)
 
     const dumped = readFileSync(seedDump, 'utf8')
-    const expectedRuntimeHome = join(seedWorkdir, 'persist', 'runtime')
+    const expectedRuntimeHome = join(seedWorkdir, 'runtime-home')
     expect(dumped).toContain(`HOME=${expectedRuntimeHome}`)
     expect(dumped).toContain('claude_json={"onboarded":true}')
     expect(dumped).toContain('claude_settings={"hooks":"cc"}')
     expect(dumped).toContain('codex_hooks={"hooks":"cx"}')
+    expect(readFileSync(chownDump, 'utf8').trim()).toBe(`-R 12345:23456 ${expectedRuntimeHome}`)
     rmSync(seedWorkdir, { recursive: true, force: true })
   })
 
-  test('off-path: link_persistent_home_files creates a dangling symlink (~/.codex/auth.json → persist root) even when no credential exists yet, so the first codex login write lands at the persistent location', async () => {
-    const persistRoot = join(workdir, 'persist')
-    const fakeHome = join(workdir, 'home')
-    await mkdir(fakeHome, { recursive: true })
+  test('root fallback creates and seeds TYPECLAW_RUNTIME_HOME without a host identity, then execs the agent with that HOME', async () => {
+    const rootWorkdir = mkdtempSync(join(tmpdir(), 'typeclaw-shim-root-home-'))
+    const rootBin = join(rootWorkdir, 'bin')
+    await mkdir(rootBin, { recursive: true })
+    await symlinkHostBinaries(rootBin, ['mkdir', 'env', 'cp', 'cat'])
 
-    const noXvfbBin = join(workdir, 'bin-link-test')
-    await mkdir(noXvfbBin, { recursive: true })
-    await symlinkHostBinaries(noXvfbBin, ['mkdir', 'ln', 'readlink'])
-    await writeShellScript(join(noXvfbBin, 'bun'), `#!/bin/sh\nexit 0\n`)
+    const runtimeDump = join(rootWorkdir, 'runtime.log')
     await writeShellScript(
-      join(noXvfbBin, 'setpriv'),
+      join(rootBin, 'bun'),
       `#!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in --) shift; break;; *) shift;; esac; done
-exec "$@"
+{
+  echo "HOME=$HOME"
+  echo "claude_json=$(cat "$HOME/.claude.json" 2>/dev/null)"
+} > "${runtimeDump}"
+exit 0
 `,
     )
 
-    const shim = buildEntrypointShim()
-    const shimPath = join(workdir, 'shim-link.sh')
-    await writeShellScript(shimPath, shim)
+    const bakedHome = join(rootWorkdir, 'root')
+    const runtimeHome = join(rootWorkdir, 'runtime-home')
+    await mkdir(bakedHome, { recursive: true })
+    await writeFile(join(bakedHome, '.claude.json'), '{"onboarded":true}')
+    const shimPath = join(rootWorkdir, 'shim-root-home.sh')
+    await writeShellScript(shimPath, buildEntrypointShim())
 
     const proc = Bun.spawn(['/bin/sh', shimPath, 'run'], {
       env: {
-        PATH: noXvfbBin,
-        HOME: fakeHome,
-        TYPECLAW_PERSIST_HOME_ROOT: persistRoot,
+        PATH: rootBin,
+        HOME: bakedHome,
+        TYPECLAW_RUNTIME_HOME: runtimeHome,
       },
       stdout: 'pipe',
       stderr: 'pipe',
     })
-    const exitCode = await proc.exited
-    expect(exitCode).toBe(0)
-
-    const linkPath = join(fakeHome, '.codex', 'auth.json')
-    const linkStat = lstatSync(linkPath)
-    expect(linkStat.isSymbolicLink()).toBe(true)
-    expect(readlinkSync(linkPath)).toBe(join(persistRoot, '.codex', 'auth.json'))
-    expect(statSync(join(persistRoot, '.codex')).isDirectory()).toBe(true)
-
-    const claudeLinkPath = join(fakeHome, '.claude', '.credentials.json')
-    const claudeLinkStat = lstatSync(claudeLinkPath)
-    expect(claudeLinkStat.isSymbolicLink()).toBe(true)
-    expect(readlinkSync(claudeLinkPath)).toBe(join(persistRoot, '.claude', '.credentials.json'))
-    expect(statSync(join(persistRoot, '.claude')).isDirectory()).toBe(true)
-  })
-
-  test('off-path: link_persistent_home_files is idempotent — running the shim twice does not error and leaves the same symlink in place (ln -sfn replaces atomically)', async () => {
-    const persistRoot = join(workdir, 'persist-idem')
-    const fakeHome = join(workdir, 'home-idem')
-    await mkdir(fakeHome, { recursive: true })
-
-    const noXvfbBin = join(workdir, 'bin-idem-test')
-    await mkdir(noXvfbBin, { recursive: true })
-    await symlinkHostBinaries(noXvfbBin, ['mkdir', 'ln', 'readlink'])
-    await writeShellScript(join(noXvfbBin, 'bun'), `#!/bin/sh\nexit 0\n`)
-    await writeShellScript(
-      join(noXvfbBin, 'setpriv'),
-      `#!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in --) shift; break;; *) shift;; esac; done
-exec "$@"
-`,
-    )
-
-    const shim = buildEntrypointShim()
-    const shimPath = join(workdir, 'shim-idem.sh')
-    await writeShellScript(shimPath, shim)
-
-    const env = {
-      PATH: noXvfbBin,
-      HOME: fakeHome,
-      TYPECLAW_PERSIST_HOME_ROOT: persistRoot,
-    }
-    const first = Bun.spawn(['/bin/sh', shimPath, 'run'], { env, stdout: 'pipe', stderr: 'pipe' })
-    expect(await first.exited).toBe(0)
-    const second = Bun.spawn(['/bin/sh', shimPath, 'run'], { env, stdout: 'pipe', stderr: 'pipe' })
-    expect(await second.exited).toBe(0)
-
-    const linkPath = join(fakeHome, '.codex', 'auth.json')
-    expect(lstatSync(linkPath).isSymbolicLink()).toBe(true)
-    expect(readlinkSync(linkPath)).toBe(join(persistRoot, '.codex', 'auth.json'))
-
-    const claudeLinkPath = join(fakeHome, '.claude', '.credentials.json')
-    expect(lstatSync(claudeLinkPath).isSymbolicLink()).toBe(true)
-    expect(readlinkSync(claudeLinkPath)).toBe(join(persistRoot, '.claude', '.credentials.json'))
+    expect(await proc.exited).toBe(0)
+    expect(readFileSync(runtimeDump, 'utf8')).toContain(`HOME=${runtimeHome}`)
+    expect(readFileSync(runtimeDump, 'utf8')).toContain('claude_json={"onboarded":true}')
+    rmSync(rootWorkdir, { recursive: true, force: true })
   })
 
   test('off-path: link_configured_symlinks creates from -> /agent/<to> with a ~/ from expanded against $HOME, and makes the target dir', async () => {
     const realBun = Bun.which('bun')
     if (!realBun) throw new Error('bun not on host PATH')
 
-    const persistRoot = join(workdir, 'persist-sym')
+    const runtimeHome = join(workdir, 'runtime-home-sym')
     const fakeHome = join(workdir, 'home-sym')
     const fakeAgent = join(workdir, 'agent-sym')
     await mkdir(fakeHome, { recursive: true })
@@ -2223,7 +2238,7 @@ exec "$@"
 
     const bin = join(workdir, 'bin-sym')
     await mkdir(bin, { recursive: true })
-    await symlinkHostBinaries(bin, ['mkdir', 'ln', 'readlink'])
+    await symlinkHostBinaries(bin, ['mkdir', 'ln', 'readlink', 'env'])
     // Fake `bun`: pass `-e <script>` through to the real bun (link_configured_symlinks
     // needs a real JSON parser + fs), but turn the final `bun run <cli-entry>` exec
     // into a no-op so the shim ends cleanly without launching the agent.
@@ -2241,7 +2256,7 @@ exec "$@"
       env: {
         PATH: bin,
         HOME: fakeHome,
-        TYPECLAW_PERSIST_HOME_ROOT: persistRoot,
+        TYPECLAW_RUNTIME_HOME: runtimeHome,
         TYPECLAW_AGENT_DIR: fakeAgent,
         TYPECLAW_SANDBOX_SYMLINKS: Buffer.from(JSON.stringify(symlinks), 'utf8').toString('base64'),
       },
@@ -2250,28 +2265,34 @@ exec "$@"
     })
     expect(await proc.exited).toBe(0)
 
-    const linkPath = join(fakeHome, '.metabase-cli')
+    // The root phase exports HOME=$runtime_home before link_configured_symlinks,
+    // so a `~/` from expands against the runtime HOME — not the inherited build
+    // HOME — even on the no-host-identity root fallback.
+    const linkPath = join(runtimeHome, '.metabase-cli')
     expect(lstatSync(linkPath).isSymbolicLink()).toBe(true)
     expect(readlinkSync(linkPath)).toBe(join(fakeAgent, 'workspace', '.metabase-cli'))
     expect(statSync(join(fakeAgent, 'workspace', '.metabase-cli')).isDirectory()).toBe(true)
+    expect(existsSync(join(fakeHome, '.metabase-cli'))).toBe(false)
   })
 
   test('off-path: link_configured_symlinks refuses to clobber an existing non-symlink at from', async () => {
     const realBun = Bun.which('bun')
     if (!realBun) throw new Error('bun not on host PATH')
 
-    const persistRoot = join(workdir, 'persist-noclobber')
+    const runtimeHome = join(workdir, 'runtime-home-noclobber')
     const fakeHome = join(workdir, 'home-noclobber')
     const fakeAgent = join(workdir, 'agent-noclobber')
     await mkdir(fakeHome, { recursive: true })
     await mkdir(fakeAgent, { recursive: true })
-    // a real file already sits at the symlink location
-    const existing = join(fakeHome, '.metabase-cli')
+    await mkdir(runtimeHome, { recursive: true })
+    // a real file already sits at the symlink location under the runtime HOME,
+    // where a `~/` from now resolves
+    const existing = join(runtimeHome, '.metabase-cli')
     await writeFile(existing, 'real config, do not clobber')
 
     const bin = join(workdir, 'bin-noclobber')
     await mkdir(bin, { recursive: true })
-    await symlinkHostBinaries(bin, ['mkdir', 'ln', 'readlink'])
+    await symlinkHostBinaries(bin, ['mkdir', 'ln', 'readlink', 'env'])
     await writeShellScript(join(bin, 'bun'), `#!/bin/sh\nif [ "$1" = "-e" ]; then exec ${realBun} "$@"; fi\nexit 0\n`)
     await writeShellScript(
       join(bin, 'setpriv'),
@@ -2286,7 +2307,7 @@ exec "$@"
       env: {
         PATH: bin,
         HOME: fakeHome,
-        TYPECLAW_PERSIST_HOME_ROOT: persistRoot,
+        TYPECLAW_RUNTIME_HOME: runtimeHome,
         TYPECLAW_AGENT_DIR: fakeAgent,
         TYPECLAW_SANDBOX_SYMLINKS: Buffer.from(JSON.stringify(symlinks), 'utf8').toString('base64'),
       },
@@ -2303,7 +2324,7 @@ exec "$@"
   test('off-path: when Xvfb is not on PATH (docker.file.xvfb=false equivalent), the shim execs the agent directly without spawning anything or exporting DISPLAY', async () => {
     // Make Xvfb unfindable by pointing PATH at a directory that contains
     // the bun + setpriv fakes plus the specific coreutils the shim's
-    // link_persistent_home_files helper needs (mkdir, ln) — symlinked
+    // runtime-HOME setup needs — symlinked
     // from the host so they work on Linux CI and macOS dev boxes alike.
     // Crucially we do NOT add /usr/bin or /bin to PATH, because Linux
     // CI runners (GitHub Actions ubuntu-latest in particular) ship a
@@ -2311,10 +2332,10 @@ exec "$@"
     // and break the off-switch test premise. Symlinking only the
     // utilities we actually need keeps Xvfb unreachable on every
     // platform. Production containers ship coreutils in the baseline
-    // image so the helper's mkdir+ln calls work for the same reason.
+    // image so the helper calls work for the same reason.
     const isolatedBin = join(workdir, 'bin-no-xvfb')
     await mkdir(isolatedBin, { recursive: true })
-    await symlinkHostBinaries(isolatedBin, ['mkdir', 'ln', 'readlink'])
+    await symlinkHostBinaries(isolatedBin, ['mkdir', 'ln', 'readlink', 'env'])
     await writeShellScript(
       join(isolatedBin, 'bun'),
       `#!/bin/sh\necho "DISPLAY: \${DISPLAY:-<unset>}" > "${logfile}"\nexit 0\n`,
@@ -2337,7 +2358,7 @@ exec "$@"
       env: {
         PATH: isolatedBin,
         HOME: fakeHome,
-        TYPECLAW_PERSIST_HOME_ROOT: join(workdir, 'persist-no-xvfb'),
+        TYPECLAW_RUNTIME_HOME: join(workdir, 'runtime-home-no-xvfb'),
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -2354,7 +2375,7 @@ async function writeShellScript(path: string, contents: string): Promise<void> {
 }
 
 // Symlinks specific host binaries into a test's isolated bin directory so
-// the shim's helpers (link_persistent_home_files calls mkdir + ln) can
+// the shim's helpers can
 // run without widening PATH to /usr/bin or /bin. Widening PATH would
 // drag in real Xvfb on Linux CI (it's preinstalled at /usr/bin/Xvfb on
 // GitHub Actions ubuntu-latest), which breaks any test whose premise is

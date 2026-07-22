@@ -4,6 +4,7 @@ export {
   CANONICAL_AGENT_SECRET_FILES,
   CANONICAL_HOME_SECRET_DIRS,
   CANONICAL_HOME_SECRET_FILES,
+  CONTAINER_RUNTIME_HOME,
 } from './canonical-secrets'
 export {
   buildProcBindProbeScript,

@@ -1,6 +1,6 @@
 ---
 title: Headed browser (Xvfb)
-description: The headed-via-Xvfb decision, NET_ADMIN drop, persistent-$HOME overlay, agent-browser headed-mode wrapper
+description: The headed-via-Xvfb decision, NET_ADMIN drop, ephemeral runtime HOME, agent-browser headed-mode wrapper
 icon: Monitor
 ---
 
@@ -30,11 +30,13 @@ Hangs forever as PID 1 — its `wait`+SIGUSR1 dance races with PID 1's silent-ig
 
 `start_xvfb` polls both `/tmp/.X11-unix/X99` and `kill -0 $xvfb_pid` on a 3s budget; exits non-zero on early exit or timeout. Fail-fast — silently exporting `DISPLAY=:99` to a non-existent server surfaces as a confusing `cannot open display`.
 
-## Persistent-`$HOME` overlay (`link_persistent_home_files`)
+## Ephemeral runtime `$HOME`
 
-Container `$HOME` lives on the overlay and is wiped on every stop+start. Some tools (today: Codex CLI's `~/.codex/auth.json`) write credentials there and expect them to survive. The shim symlinks specific files into `/agent/.typeclaw/home/` (the bind-mounted agent folder); `buildGitignore` ignores `.typeclaw/home/`. The helper symlinks **files**, not dirs — keeps the persistence scope tight to credentials and leaves other CLI state ephemeral. Symlink approach (vs bind-mounting `~/.codex/`) avoids requiring a `mounts[]` entry and keeps persistence a system-shipped invariant. Files live inside the agent folder (not a sibling on the host) so `tar c agent-folder/` stays a complete migration.
+The trusted in-process runtime uses `/home/agent`, which lives only in the container writable layer and disappears when `typeclaw stop` removes the container. The entrypoint's root bootstrap creates it unconditionally, copies image-baked `~/.claude.json`, `~/.claude/settings.json`, and `~/.codex/hooks.json` from `/root`, then chowns only that subtree when a dynamic host UID/GID is available. Both privilege-drop handoffs and both root-compatible fallbacks exec the runtime with `HOME=/home/agent`; no UID/GID is hardcoded.
 
-The helper is called on both network paths before `start_xvfb` and exec. `ln -sfn` is idempotent; the `-n` flag is load-bearing (without it, a previous container's real `~/.codex/` dir from before this code shipped would cause `ln -sf` to dereference into it).
+CLI OAuth files are reconstructed there from `secrets.json` at boot. Provider OAuth refresh is awaited before the Codex and Claude exporters, so a fresh container receives the refreshed token rather than a stale pre-refresh copy. TypeClaw does not persist, migrate, or delete the former `/agent/.typeclaw/home/` overlay. The path stays gitignored and masked as a canonical legacy secret location for upgraded agents that still have orphaned credentials.
+
+This is independent of model-driven bash: bwrap builds a narrower filesystem view that does not bind `/home`, resets sandbox `HOME` to `/tmp`, and masks canonical agent secret paths. Non-bash model tools deny both `/home/agent` CLI profiles and the legacy overlay explicitly.
 
 ## Xvfb args
 

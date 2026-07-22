@@ -12,7 +12,7 @@ export type SandboxSymlinkSpec = {
 // Resolves config `sandbox.symlinks` into the in-jail `--symlink` ops the bwrap
 // builder consumes. `from` is the symlink LOCATION: a `~/`-prefixed `from` is
 // expanded against the SANDBOX HOME (`/tmp`, where the per-session tmp dir is
-// bound), NOT the container's real `/root` — inside the jail a CLI reading
+// bound), NOT the trusted runtime's `/home/agent` — inside the jail a CLI reading
 // `$HOME/.foo` looks under `/tmp`, so the symlink must live there. An absolute
 // `from` is used verbatim. `to` is resolved to the absolute /agent path the
 // symlink points at. Container paths are always POSIX, so this uses posix path

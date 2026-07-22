@@ -1073,7 +1073,7 @@ describe('scaffold', () => {
     expect(gitignore).toMatch(/^packages\/\*\/node_modules\/$/m)
   })
 
-  test('gitignores the .typeclaw/ scratch dir (overlay + init checkpoint) so symlinked credentials like ~/.codex/auth.json never enter git history', () => {
+  test('gitignores the .typeclaw/ scratch dir so init checkpoints and orphaned legacy credentials never enter history', () => {
     const gitignore = buildGitignore({ append: [] })
     expect(gitignore).toMatch(/^\.typeclaw\/$/m)
     const trulyIgnoredHeader = gitignore.indexOf('# Truly ignored:')
