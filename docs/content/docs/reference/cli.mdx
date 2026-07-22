@@ -15,6 +15,7 @@ TypeClaw runs code in three stages with different filesystems ([/concepts/archit
 | `typeclaw restart` | `stop` + `start` with the same flag set as `start`.                                                                              |
 | `typeclaw stop`    | `docker stop` then `docker rm` so a clean stop leaves no trace.                                                                  |
 | `typeclaw status`  | Container + daemon registration state.                                                                                           |
+| `typeclaw stats`   | Live resource snapshot for the container: cpu %, memory usage, and pid count (a `docker stats --no-stream` for this one agent).  |
 | `typeclaw logs`    | Print container stdout/stderr with reformatted local timestamps. `-f` / `--follow` to stream; `-n` / `--tail <N\|all>` to limit. |
 | `typeclaw shell`   | Drop into a shell inside the running container. `--shell` to pick (defaults to `bash` if present, else `sh`).                    |
 | `typeclaw tui`     | Attach an interactive TUI. Takes an optional one-shot prompt argument; `--url` to override the websocket URL.                    |

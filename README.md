@@ -79,10 +79,11 @@
 - 📊 **usage** — reports token and dollar spend by day, model, session, or origin
 - 🔍 **inspect** — replays a session transcript and tails live activity
 - 📜 **logs** — streams container logs with local-time prefixes
+- 📈 **stats** — a live cpu / memory / pid snapshot of the agent container
 
 ## Compose — manage a fleet from the CLI
 
-- 🎼 **Fleet operations** — discover agent folders and start, stop, restart, check status, tail logs, report usage, and run diagnostics across them from the command line
+- 🎼 **Fleet operations** — discover agent folders and start, stop, restart, check status, snapshot resource stats, tail logs, report usage, and run diagnostics across them from the command line
 
 Memory loop and subagent architecture are covered in detail in the [Internals docs](https://typeclaw.dev/docs/internals) and [`src/bundled-plugins/memory/README.md`](./src/bundled-plugins/memory/README.md).
 

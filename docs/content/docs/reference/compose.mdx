@@ -23,19 +23,20 @@ Cwd is scanned **one directory deep**. A subdirectory is treated as an agent whe
 - the name does not start with `_` (park disabled or in-progress agents as `_archived-coder/`, `_wip-foo/` without compose touching them)
 - the directory contains a `typeclaw.json`
 
-Agents are sorted by folder name so output across `start` / `stop` / `status` / `restart` / `logs` is stable regardless of filesystem readdir order. When zero agents are discovered, every subcommand exits 0 with a `No typeclaw agents found in immediate subdirectories of cwd.` notice — discovery is not a failure.
+Agents are sorted by folder name so output across `start` / `stop` / `status` / `stats` / `restart` / `logs` is stable regardless of filesystem readdir order. When zero agents are discovered, every subcommand exits 0 with a `No typeclaw agents found in immediate subdirectories of cwd.` notice — discovery is not a failure.
 
 ## Subcommands
 
-| Command                    | Per-agent equivalent | Parallel | Notes                                                                                       |
-| -------------------------- | -------------------- | -------- | ------------------------------------------------------------------------------------------- |
-| `typeclaw compose start`   | `typeclaw start`     | yes      | host port collisions fall back to ephemeral per agent                                       |
-| `typeclaw compose stop`    | `typeclaw stop`      | yes      | already-stopped agents report `not running`, not failure                                    |
-| `typeclaw compose restart` | `typeclaw restart`   | yes      | `stop` then `start` per agent; surfaces both phases on the progress board                   |
-| `typeclaw compose status`  | (inspects Docker)    | yes      | running / stopped / absent + resolved host port for running agents                          |
-| `typeclaw compose logs`    | `typeclaw logs`      | yes      | multiplexed; each line prefixed with the agent name and a deterministic color               |
-| `typeclaw compose usage`   | `typeclaw usage`     | yes      | aggregates per-agent token usage; one corrupt `sessions/` dir does not blank out the report |
-| `typeclaw compose doctor`  | `typeclaw doctor`    | yes      | per-agent `doctor` plus cross-agent checks (port collisions, container-name collisions)     |
+| Command                    | Per-agent equivalent | Parallel | Notes                                                                                         |
+| -------------------------- | -------------------- | -------- | --------------------------------------------------------------------------------------------- |
+| `typeclaw compose start`   | `typeclaw start`     | yes      | host port collisions fall back to ephemeral per agent                                         |
+| `typeclaw compose stop`    | `typeclaw stop`      | yes      | already-stopped agents report `not running`, not failure                                      |
+| `typeclaw compose restart` | `typeclaw restart`   | yes      | `stop` then `start` per agent; surfaces both phases on the progress board                     |
+| `typeclaw compose status`  | (inspects Docker)    | yes      | running / stopped / absent + resolved host port for running agents                            |
+| `typeclaw compose stats`   | `typeclaw stats`     | yes      | cpu %, memory usage, and pid count per running agent; stopped / absent agents show no metrics |
+| `typeclaw compose logs`    | `typeclaw logs`      | yes      | multiplexed; each line prefixed with the agent name and a deterministic color                 |
+| `typeclaw compose usage`   | `typeclaw usage`     | yes      | aggregates per-agent token usage; one corrupt `sessions/` dir does not blank out the report   |
+| `typeclaw compose doctor`  | `typeclaw doctor`    | yes      | per-agent `doctor` plus cross-agent checks (port collisions, container-name collisions)       |
 
 ## Flags
 
@@ -73,7 +74,7 @@ Agents without a running container are skipped with a `compose: skipping <name> 
 | `--only <a,b,c>`  | (none)  | comma-separated category filter forwarded to each agent's `doctor` run                                                                                  |
 | `--shallow`       | `false` | run cross-agent checks only; skip per-agent `doctor` runs                                                                                               |
 
-`status`, `stop` take no flags.
+`status`, `stats`, `stop` take no flags.
 
 ## Cross-agent checks (`compose doctor`)
 
