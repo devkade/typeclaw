@@ -5,6 +5,7 @@ import {
   composeLogs,
   composeRestart,
   composeStart,
+  composeStats,
   composeStatus,
   composeStop,
   composeUsage,
@@ -15,6 +16,7 @@ import { config } from '@/config'
 import { parseTailValue } from '@/container'
 import { formatJson, formatReport } from '@/doctor'
 
+import { formatComposeStats } from './compose-stats'
 import { formatComposeStatus } from './compose-status'
 import { formatComposeUsage, formatComposeUsageJson } from './compose-usage'
 import { preflightDocker, printDockerGuidance } from './docker-preflight'
@@ -154,6 +156,16 @@ const statusSub = defineCommand({
   },
 })
 
+const statsSub = defineCommand({
+  meta: { name: 'stats', description: 'show cpu, memory, and pids for every agent in immediate subdirectories of cwd' },
+  async run() {
+    await requireDockerOrExit()
+    const result = await composeStats(process.cwd())
+    const useColor = Boolean(process.stdout.isTTY) && process.env.NO_COLOR === undefined
+    process.stdout.write(`${formatComposeStats(result, { useColor })}\n`)
+  },
+})
+
 const logsSub = defineCommand({
   meta: { name: 'logs', description: 'multiplex docker logs for every running agent in immediate subdirectories' },
   args: {
@@ -284,6 +296,7 @@ export const composeCommand = defineCommand({
     stop: stopSub,
     restart: restartSub,
     status: statusSub,
+    stats: statsSub,
     logs: logsSub,
     usage: usageSub,
     doctor: doctorSub,
