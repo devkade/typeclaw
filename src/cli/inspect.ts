@@ -194,6 +194,9 @@ export async function runInspectViewer(opts: RunInspectViewerOptions): Promise<n
       const listOpts: Parameters<typeof listViewerItems>[0] = {
         sessionsDir,
         containerRunning,
+        // listViewerItems also gates writable promotion on `interactive`, so a
+        // non-TTY explicit id can't auto-open a TUI it cannot drive.
+        interactive,
         // Compose the CLI-level permission (false on tui detach handoff) with
         // the loop-level one (false after returning to the picker from a viewer).
         allowWritable: cliAllowWritable && loopAllowWritable,
