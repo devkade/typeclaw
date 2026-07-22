@@ -118,6 +118,14 @@ describe('startAgent', () => {
       loadCron: noCron,
       createChannelManager: createChannelManagerFor,
       refreshProviderOAuth,
+      exportCodexAuthFile: () => {
+        order.push('export:codex')
+        return { action: 'skipped', reason: 'codex-cli-disabled' }
+      },
+      exportClaudeCredentialsFile: () => {
+        order.push('export:claude')
+        return { action: 'skipped', reason: 'claude-code-disabled' }
+      },
     })
 
     await lockAcquiredSignal
@@ -132,7 +140,14 @@ describe('startAgent', () => {
 
     // then ordering is exact: refresh settles fully before the channel start
     // (and its synchronous auth read, which did not ELOCKED)
-    expect(order).toEqual(['refresh:lock-acquired', 'refresh:lock-released', 'channel:start', 'auth:sync-read'])
+    expect(order).toEqual([
+      'refresh:lock-acquired',
+      'refresh:lock-released',
+      'export:codex',
+      'export:claude',
+      'channel:start',
+      'auth:sync-read',
+    ])
   })
 
   test('installs a process crash guard so an escaped channel rejection does not crash', async () => {
