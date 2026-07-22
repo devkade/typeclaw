@@ -8,6 +8,7 @@ export {
   type ComposeDoctorReport,
 } from './doctor'
 export { colorFor, composeLogs, makeLinePrefixer, type ComposeLogsOptions, type ComposeLogsResult } from './logs'
+export { composeStats, type AgentStatsEntry, type AgentStatsState, type ComposeStatsResult } from './stats'
 export { composeStatus, type AgentRuntimeState, type AgentStatusEntry, type ComposeStatusResult } from './status'
 export {
   composeRestart,

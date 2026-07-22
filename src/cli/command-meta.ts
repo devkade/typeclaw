@@ -16,6 +16,7 @@ export type BuiltinCommandName =
   | 'stop'
   | 'restart'
   | 'status'
+  | 'stats'
   | 'reload'
   | 'logs'
   | 'inspect'
@@ -50,6 +51,7 @@ export const BUILTIN_COMMANDS: readonly BuiltinCommandMeta[] = [
   { name: 'stop', description: 'stop the agent container (host stage)' },
   { name: 'restart', description: 'stop and relaunch the agent container (host stage)' },
   { name: 'status', description: 'show the agent container and host daemon status (host stage)' },
+  { name: 'stats', description: 'show the agent container resource usage: cpu, memory, pids (host stage)' },
   { name: 'reload', description: "reload the running agent's reloadable subsystems (cron, ...)" },
   { name: 'logs', description: 'show the agent container logs (host stage)' },
   { name: 'inspect', description: 'session viewer: a session, the live TUI, or container logs' },
