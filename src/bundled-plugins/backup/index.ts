@@ -299,8 +299,11 @@ async function resolveBackupAuthEnv(
   }
 }
 
-export async function resolveOriginPushUrl(cwd: string): Promise<string | null> {
-  const bun = (globalThis as { Bun?: { spawn: typeof Bun.spawn } }).Bun
+export async function resolveOriginPushUrl(
+  cwd: string,
+  bunOverride?: { spawn: typeof Bun.spawn },
+): Promise<string | null> {
+  const bun = bunOverride ?? (globalThis as { Bun?: { spawn: typeof Bun.spawn } }).Bun
   if (!bun) return null
   const repo = resolveAgentGit(cwd)
   if (!repo) return null
@@ -311,8 +314,22 @@ export async function resolveOriginPushUrl(cwd: string): Promise<string | null> 
       stderr: 'ignore',
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
     })
-    if ((await proc.exited) !== 0) return null
-    const out = (await new Response(proc.stdout).text()).trim()
+    const exited = proc.exited
+    const stdoutDrain = new Response(proc.stdout).text()
+    let exitCode: number
+    let stdout: string
+    try {
+      ;[exitCode, stdout] = await Promise.all([exited, stdoutDrain])
+    } catch {
+      // A stdout-drain rejection must not leave the git child running: kill it
+      // and await exit + drain before returning, so `Promise.all`'s early reject
+      // can't orphan the subprocess or its pipe.
+      proc.kill()
+      await Promise.allSettled([exited, stdoutDrain])
+      return null
+    }
+    if (exitCode !== 0) return null
+    const out = stdout.trim()
     return out === '' ? null : out
   } catch {
     return null
