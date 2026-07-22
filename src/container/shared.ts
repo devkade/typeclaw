@@ -92,7 +92,7 @@ export const defaultDockerExec: DockerExec = async (args, options) => {
 // needs both: the user watches the build, and start() inspects the captured
 // stderr to detect a missing credential helper and retry under a sanitized
 // DOCKER_CONFIG.
-async function spawnInheritTeeStderr(
+export async function spawnInheritTeeStderr(
   bun: NonNullable<ReturnType<typeof getBun>>,
   cmd: string[],
   cwd: string | undefined,
@@ -102,11 +102,24 @@ async function spawnInheritTeeStderr(
   const proc = bun.spawn({ cmd, cwd, stdout: 'inherit', stderr: 'pipe', signal, env })
   const chunks: Uint8Array[] = []
   const reader = proc.stderr.getReader()
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    process.stderr.write(value)
-    chunks.push(value)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      process.stderr.write(value)
+      chunks.push(value)
+    }
+  } catch (err) {
+    // A read/write throw skips the normal drain: cancel (not just releaseLock,
+    // which leaves the pipe live per the Streams contract), kill the child, and
+    // await its exit so neither the stderr pipe nor the docker subprocess is
+    // orphaned. releaseLock is handled in `finally` for both paths.
+    await reader.cancel().catch(() => {})
+    proc.kill()
+    await proc.exited.catch(() => {})
+    throw err
+  } finally {
+    reader.releaseLock()
   }
   const exitCode = await proc.exited
   return { exitCode, stdout: '', stderr: Buffer.concat(chunks).toString('utf8') }

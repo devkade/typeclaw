@@ -156,6 +156,7 @@ async function readCapped(res: Response, maxBytes: number): Promise<string | nul
     return null
   } finally {
     await reader.cancel().catch(() => undefined)
+    reader.releaseLock()
   }
 }
 

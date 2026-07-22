@@ -107,10 +107,24 @@ async function runTimedBunProcess({
     proc.kill('SIGKILL')
   }, timeoutMs)
   try {
-    const code = await proc.exited
+    // Drain both pipes alongside exit: an undrained 'pipe' stdout/stderr holds
+    // its fd (and can deadlock a child that fills the buffer) until GC. A drain
+    // that rejects must not escape before the child is reaped — otherwise the
+    // `finally` clears the timeout while the process is still alive. Kill and
+    // await exit on any drain failure so the timer never disarms a live child.
+    const stdoutDrain = new Response(proc.stdout).text()
+    const stderrDrain = new Response(proc.stderr).text()
+    let code: number
+    let stderr: string
+    try {
+      ;[code, , stderr] = await Promise.all([proc.exited, stdoutDrain, stderrDrain])
+    } catch (err) {
+      proc.kill('SIGKILL')
+      await Promise.allSettled([proc.exited, stdoutDrain, stderrDrain])
+      throw err
+    }
     if (timedOut) return { ok: false, reason: timeoutReason(timeoutMs / 1000) }
     if (code === 0) return { ok: true }
-    const stderr = await new Response(proc.stderr).text()
     return { ok: false, reason: failureReason(code, stderr) }
   } finally {
     clearTimeout(timeout)

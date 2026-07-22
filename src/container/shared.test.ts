@@ -22,6 +22,7 @@ import {
   resolveDockerBinary,
   sanitizeDockerConfigJson,
   sanitizeDockerStderr,
+  spawnInheritTeeStderr,
   waitForRemoval,
 } from './shared'
 
@@ -706,5 +707,46 @@ describe('dockerBindMount', () => {
 
   test('throws on a comma in a path because --mount cannot express it', () => {
     expect(() => dockerBindMount({ src: '/srv/a,b', dst: '/agent' })).toThrow(/comma/)
+  })
+})
+
+describe('spawnInheritTeeStderr', () => {
+  test('kills the child and awaits its exit when a stderr read throws', async () => {
+    let killed = false
+    let resolveExited: (code: number) => void = () => {}
+    const exited = new Promise<number>((resolve) => {
+      resolveExited = resolve
+    })
+    let firstRead = true
+    const stderr = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (firstRead) {
+          firstRead = false
+          controller.enqueue(new TextEncoder().encode('some build output'))
+          return
+        }
+        throw new Error('stderr read failed')
+      },
+    })
+    const proc = {
+      stderr,
+      exited,
+      kill() {
+        killed = true
+        resolveExited(137)
+      },
+    }
+    const bun = { spawn: () => proc } as unknown as Parameters<typeof spawnInheritTeeStderr>[0]
+
+    await expect(spawnInheritTeeStderr(bun, ['docker', 'build'], undefined, undefined, undefined)).rejects.toThrow(
+      'stderr read failed',
+    )
+
+    // kill() resolving `exited` is what proves spawnInheritTeeStderr awaited the
+    // child rather than orphaning it — the promise below only settles once kill
+    // fires resolveExited.
+    expect(killed).toBe(true)
+    expect(await exited).toBe(137)
+    expect(stderr.locked).toBe(false)
   })
 })

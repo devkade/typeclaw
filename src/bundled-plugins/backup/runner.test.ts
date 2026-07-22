@@ -758,3 +758,40 @@ describe('runMaintenance', () => {
     }
   })
 })
+
+describe('makeDefaultGitSpawn', () => {
+  test('aborts and reaps the git child when a pipe drain rejects', async () => {
+    let aborted = false
+    const stubbedSpawn = ((opts: { signal?: AbortSignal }) => {
+      // `exited` only settles when the abort signal fires, so the test proves
+      // the drain-failure path aborts the child and waits for it rather than
+      // letting the outer timer clear while a stuck git process lives on.
+      const exited = new Promise<number>((resolve) => {
+        opts.signal?.addEventListener('abort', () => {
+          aborted = true
+          resolve(137)
+        })
+      })
+      return {
+        exited,
+        stdout: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error('stdout drain failed'))
+          },
+        }),
+        stderr: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.close()
+          },
+        }),
+      }
+    }) as unknown as typeof Bun.spawn
+
+    const spawn = makeDefaultGitSpawn({ spawn: stubbedSpawn })
+    const result = await spawn(['status'], { cwd: '/tmp', timeoutMs: 10_000 })
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toBe('stdout drain failed')
+    expect(aborted).toBe(true)
+  })
+})

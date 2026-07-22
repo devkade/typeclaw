@@ -399,9 +399,9 @@ function sanitizeCommitMessage(raw: string): string {
   return rest.length > 0 ? `${subject}\n\n${rest}` : subject
 }
 
-export function makeDefaultGitSpawn(): GitSpawn {
+export function makeDefaultGitSpawn(bunOverride?: { spawn: typeof Bun.spawn }): GitSpawn {
   return withIndexLockRetry(async (args, { cwd, timeoutMs, env }) => {
-    const bun = (globalThis as { Bun?: { spawn: typeof Bun.spawn } }).Bun
+    const bun = bunOverride ?? (globalThis as { Bun?: { spawn: typeof Bun.spawn } }).Bun
     if (!bun) {
       return { exitCode: 127, stdout: '', stderr: 'Bun runtime not available', timedOut: false }
     }
@@ -419,9 +419,23 @@ export function makeDefaultGitSpawn(): GitSpawn {
         env: { ...process.env, ...NONINTERACTIVE_ENV, ...env },
         signal: controller.signal,
       })
-      const exitCode = await proc.exited
-      const stdout = await new Response(proc.stdout).text()
-      const stderr = await new Response(proc.stderr).text()
+      const exitedDrain = proc.exited
+      const stdoutDrain = new Response(proc.stdout).text()
+      const stderrDrain = new Response(proc.stderr).text()
+      let exitCode: number
+      let stdout: string
+      let stderr: string
+      try {
+        ;[exitCode, stdout, stderr] = await Promise.all([exitedDrain, stdoutDrain, stderrDrain])
+      } catch (drainErr) {
+        // A pipe-read rejection must not escape while the git child is still
+        // running (the outer `finally` would clear the abort timer and leave a
+        // stuck child unbounded). Abort to kill it, then wait for exit and both
+        // drains to settle before surfacing the error.
+        controller.abort()
+        await Promise.allSettled([exitedDrain, stdoutDrain, stderrDrain])
+        throw drainErr
+      }
       const timedOut = controller.signal.aborted
       return { exitCode, stdout, stderr, timedOut }
     } catch (err) {

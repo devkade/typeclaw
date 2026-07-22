@@ -65,4 +65,33 @@ describe('resolveOriginPushUrl', () => {
   test('no repo at all (neither .git nor .gitstore): returns null', async () => {
     expect(await resolveOriginPushUrl(root)).toBeNull()
   })
+
+  test('kills and reaps the git child when the stdout drain rejects', async () => {
+    await git(root, ['init', '-b', 'main'])
+    await git(root, ['remote', 'add', 'origin', 'https://github.com/acme/standalone.git'])
+
+    let killed = false
+    let resolveExited: (code: number) => void = () => {}
+    const exited = new Promise<number>((resolve) => {
+      resolveExited = resolve
+    })
+    const stubbedSpawn = (() => ({
+      exited,
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.error(new Error('stdout drain failed'))
+        },
+      }),
+      // kill() settling `exited` proves resolveOriginPushUrl reaped the child on
+      // the drain-failure path instead of returning null while it lived on.
+      kill() {
+        killed = true
+        resolveExited(137)
+      },
+    })) as unknown as typeof Bun.spawn
+
+    expect(await resolveOriginPushUrl(root, { spawn: stubbedSpawn })).toBeNull()
+    expect(killed).toBe(true)
+    expect(await exited).toBe(137)
+  })
 })
