@@ -95,24 +95,28 @@ export class VectorStore {
   // Same cosine scan as `query` but returns every compatible row WITH its score
   // and unsliced, so a caller can reason about the full score distribution (the
   // relevance gate's per-query baseline) before deciding how many to keep.
+  queryScored(embedding: Float32Array, modelId: string): ScoredVectorRow[] {
+    return scoreRows(this.loadRows(modelId, embedding.length), embedding).sort((a, b) => b.score - a.score)
+  }
+
+  // Decodes every compatible row's embedding BLOB into a Float32Array ONCE. A
+  // multi-chunk query scores many embeddings against the SAME corpus, so callers
+  // that decode here once and reuse the result across chunks avoid re-reading and
+  // re-decoding the whole table per chunk (the per-turn allocation hot path). The
+  // returned rows are transient — held only for the current search, never cached
+  // across turns (that would trade collectable garbage for permanent resident
+  // memory, the opposite of what we want).
   //
   // Filter by embedding identity, not dims alone: a stale row from a different
   // model/dtype variant can share the same dims but lives in an incompatible
   // vector space, so cosine against it is garbage. Excluding it here keeps a
   // partial re-embed (mixed variants mid-rebuild) at reduced recall, never
   // wrong scores.
-  queryScored(embedding: Float32Array, modelId: string): ScoredVectorRow[] {
-    // The query vector's magnitude is identical for every row in this scan, so
-    // hoist it out of the per-row cosine instead of recomputing N times (each
-    // recompute is 768 multiply-adds + a sqrt). Behavior is unchanged — same
-    // cosine values, fewer operations on the brute-force hot path.
-    const queryMagnitude = magnitude(embedding)
+  loadRows(modelId: string, dims: number): VectorRow[] {
     return this.db
       .query<StoredVectorRow, [string, number]>('SELECT * FROM vectors WHERE model = ? AND dims = ?')
-      .all(modelId, embedding.length)
+      .all(modelId, dims)
       .map(toVectorRow)
-      .map((row) => ({ row, score: cosineSimilarity(embedding, queryMagnitude, row.embedding) }))
-      .sort((a, b) => b.score - a.score)
   }
 
   deleteOtherModels(modelId: string): void {
@@ -158,6 +162,14 @@ export class VectorStore {
   close(): void {
     this.db.close()
   }
+}
+
+// Scores pre-decoded rows against one query embedding. The query vector's
+// magnitude is identical for every row, so hoist it out of the per-row cosine
+// instead of recomputing N times (each recompute is 768 multiply-adds + a sqrt).
+export function scoreRows(rows: VectorRow[], embedding: Float32Array): ScoredVectorRow[] {
+  const queryMagnitude = magnitude(embedding)
+  return rows.map((row) => ({ row, score: cosineSimilarity(embedding, queryMagnitude, row.embedding) }))
 }
 
 function toVectorRow(row: StoredVectorRow): VectorRow {

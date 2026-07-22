@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { withGitLock } from '@/git/mutex'
 
 import { EMBEDDING_MODEL_ID } from './embedder'
-import { VectorStore, type VectorRow } from './store'
+import { scoreRows, VectorStore, type VectorRow } from './store'
 
 const MODEL = EMBEDDING_MODEL_ID
 const testDirs: string[] = []
@@ -51,6 +51,43 @@ describe('VectorStore', () => {
       const orthogonal = scored.find((s) => s.row.id === 'topic:orthogonal')
       expect(aligned?.score).toBeCloseTo(Math.SQRT1_2, 6)
       expect(orthogonal?.score).toBeCloseTo(0, 6)
+    } finally {
+      store.close()
+    }
+  })
+
+  it('decode-once: scoreRows(loadRows) matches queryScored for every embedding', () => {
+    // The multi-chunk retrieval path decodes the corpus once via loadRows and
+    // scores each chunk with scoreRows; this must equal the per-embedding
+    // queryScored it replaced, or MAX-across-chunks ranking would drift.
+    const store = openTestStore()
+    try {
+      store.upsert(row('topic:a', embedding(768, { 0: 1 })))
+      store.upsert(row('topic:b', embedding(768, { 1: 1 })))
+      store.upsert(row('stream:c', embedding(768, { 0: 0.5, 2: 0.5 })))
+
+      const rows = store.loadRows(MODEL, 768)
+      const queries = [embedding(768, { 0: 1, 1: 1 }), embedding(768, { 2: 1 })]
+
+      for (const q of queries) {
+        const viaLoad = scoreRows(rows, q)
+          .map(({ row: r, score }) => ({ id: r.id, score }))
+          .sort((a, b) => b.score - a.score)
+        const viaQuery = store.queryScored(q, MODEL).map(({ row: r, score }) => ({ id: r.id, score }))
+        expect(viaLoad).toEqual(viaQuery)
+      }
+    } finally {
+      store.close()
+    }
+  })
+
+  it('decode-once: loadRows excludes rows from a different model/dtype variant', () => {
+    const store = openTestStore()
+    try {
+      store.upsert({ ...row('topic:stale', embedding(768, { 0: 1 })), model: 'Xenova/multilingual-e5-base@fp32' })
+      store.upsert(row('topic:current', embedding(768, { 0: 1 })))
+
+      expect(store.loadRows(MODEL, 768).map((r) => r.id)).toEqual(['topic:current'])
     } finally {
       store.close()
     }
