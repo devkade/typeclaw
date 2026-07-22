@@ -407,29 +407,29 @@ describe('exportClaudeCredentialsFileIfApplicable', () => {
     })
   })
 
-  test('preserves the entrypoint shim symlink: writes through the link to the persistent target', async () => {
+  test('preserves a pre-existing symlink by writing through it instead of replacing it', async () => {
     await withHome((home) => {
-      // given: entrypoint shim has installed a symlink at $HOME/.claude/.credentials.json
-      // pointing at the persistent host-side path (mimicking link_persistent_home_files).
-      const persistRoot = join(home, 'persist', '.claude')
-      mkdirSync(persistRoot, { recursive: true })
+      // given: an operator or external tool installed a dangling symlink at the
+      // standard Claude credential path
+      const targetDir = join(home, 'external', '.claude')
+      mkdirSync(targetDir, { recursive: true })
       mkdirSync(join(home, '.claude'), { recursive: true })
       const symlinkPath = join(home, '.claude', '.credentials.json')
-      const persistPath = join(persistRoot, '.credentials.json')
-      symlinkSync(persistPath, symlinkPath)
+      const targetPath = join(targetDir, '.credentials.json')
+      symlinkSync(targetPath, symlinkPath)
 
-      // when: exporter fires on first boot (persist target is a dangling symlink).
+      // when: the exporter writes through the dangling symlink
       const result = exportClaudeCredentialsFileIfApplicable({
         claudeCodeEnabled: true,
         providers: oauthProviders({ refresh: 'first-boot-refresh' }),
         homeDir: home,
       })
 
-      // then: the symlink at $HOME/.claude/.credentials.json must still be a symlink.
+      // then: renameSync did not replace the symlink directory entry
       expect(result.action).toBe('wrote')
       expect(lstatSync(symlinkPath).isSymbolicLink()).toBe(true)
-      expect(existsSync(persistPath)).toBe(true)
-      const onDisk = JSON.parse(readFileSync(persistPath, 'utf8')) as {
+      expect(existsSync(targetPath)).toBe(true)
+      const onDisk = JSON.parse(readFileSync(targetPath, 'utf8')) as {
         claudeAiOauth: { refreshToken: string }
       }
       expect(onDisk.claudeAiOauth.refreshToken).toBe('first-boot-refresh')
@@ -438,16 +438,16 @@ describe('exportClaudeCredentialsFileIfApplicable', () => {
 
   test('symlink case: newer-wins compare still works because readFileSync follows symlinks', async () => {
     await withHome((home) => {
-      // given: symlink in place + persistent file already contains a fresher token.
-      const persistRoot = join(home, 'persist', '.claude')
-      mkdirSync(persistRoot, { recursive: true })
+      // given: a symlink target already contains a fresher token
+      const targetDir = join(home, 'external', '.claude')
+      mkdirSync(targetDir, { recursive: true })
       mkdirSync(join(home, '.claude'), { recursive: true })
       const symlinkPath = join(home, '.claude', '.credentials.json')
-      const persistPath = join(persistRoot, '.credentials.json')
-      symlinkSync(persistPath, symlinkPath)
+      const targetPath = join(targetDir, '.credentials.json')
+      symlinkSync(targetPath, symlinkPath)
       const fresherAccess = makeJwt({ exp: 3_000_000_000 })
       writeFileSync(
-        persistPath,
+        targetPath,
         JSON.stringify({
           claudeAiOauth: { accessToken: fresherAccess, refreshToken: 'claude-rotated', expiresAt: 3_000_000_000_000 },
         }),
@@ -460,9 +460,9 @@ describe('exportClaudeCredentialsFileIfApplicable', () => {
         homeDir: home,
       })
 
-      // then: skip, because the symlink resolves through to the fresher persistent file.
+      // then: skip, because the symlink resolves through to the fresher file.
       expect(result).toEqual({ action: 'skipped', reason: 'on-disk-is-fresher' })
-      const after = JSON.parse(readFileSync(persistPath, 'utf8')) as {
+      const after = JSON.parse(readFileSync(targetPath, 'utf8')) as {
         claudeAiOauth: { refreshToken: string }
       }
       expect(after.claudeAiOauth.refreshToken).toBe('claude-rotated')

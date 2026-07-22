@@ -43,11 +43,9 @@ export type ExportClaudeCredentialsFileOptions = {
 
 // Writes typeclaw's anthropic OAuth credential to
 // $CLAUDE_CONFIG_DIR/.credentials.json (or $HOME/.claude/.credentials.json
-// by default) when it's safe to do so. The Dockerfile entrypoint shim
-// symlinks the same resolved credentials path to
-// /agent/.typeclaw/home/.claude/.credentials.json on every boot, so the
-// write follows the symlink and lands on the persistent host-side path —
-// same contract as exportCodexAuthFile.
+// by default) when it's safe to do so. Container HOME is /home/agent and
+// ephemeral; this boot-time export reconstructs the CLI file from secrets.json
+// after provider OAuth refresh has updated the canonical credential.
 //
 // Three guards, cheapest first. The first two return without ever touching
 // the filesystem, which keeps the 90% case (users who don't enable
@@ -192,16 +190,11 @@ function resolveClaudeConfigDir(configDir: string | undefined): string | null {
 // rename is belt-and-suspenders: writeFileSync's `mode` is applied at
 // create time, but umask can mask it down on some filesystems.
 //
-// Symlink preservation: the entrypoint shim will install
-// $HOME/.claude/.credentials.json as a symlink to
-// /agent/.typeclaw/home/.claude/.credentials.json. POSIX rename(2)
-// replaces the directory entry at the destination atomically and does
-// NOT follow symlinks, so a naive renameSync against the symlink path
-// would replace the symlink with a regular file, leaving the persistent
-// path empty and Claude Code's in-place token refresh silently lost on
-// every restart. Resolve the symlink target with readlinkSync and rename
-// against the real path so the symlink itself is preserved. The temp
-// file MUST live alongside the real target (same filesystem) because
+// Symlink preservation remains a safety property even though TypeClaw no longer
+// plants one here. An operator or external tool may preconfigure the credentials
+// path as a symlink; POSIX rename(2) replaces that directory entry instead of
+// following it. Resolve the target and rename there so the caller's symlink
+// survives. The temp file MUST live alongside the real target because
 // renameSync across filesystems fails with EXDEV.
 function writeAtomic(targetPath: string, contents: string): void {
   const realTarget = resolveSymlinkTarget(targetPath)
@@ -227,13 +220,11 @@ function writeAtomic(targetPath: string, contents: string): void {
   }
 }
 
-// Returns the absolute path renameSync should target. When `path` is a
-// symlink (production: $HOME/.claude/.credentials.json -> /agent/...),
-// returns the resolved absolute target so we write through the link
-// instead of replacing it. Otherwise (tests, or first boot before the
-// shim installs the symlink), returns the path unchanged. readlinkSync
-// throws EINVAL when the path exists but isn't a symlink and ENOENT
-// when nothing is there — both cases fall through to the original path.
+// Returns the absolute path renameSync should target. When `path` is a symlink,
+// returns the resolved absolute target so we write through the link instead of
+// replacing it. Otherwise returns the path unchanged. readlinkSync throws EINVAL
+// when the path exists but isn't a symlink and ENOENT when nothing is there —
+// both cases fall through to the original path.
 function resolveSymlinkTarget(path: string): string {
   let link: string
   try {
