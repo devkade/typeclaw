@@ -3,7 +3,9 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { ViewerItem } from './item'
 import { listViewerItems } from './item-list'
+import { runViewerLoop, type TailController } from './loop'
 
 let agentDir: string
 let sessionsDir: string
@@ -43,7 +45,11 @@ describe('listViewerItems', () => {
     await seed(`b_${ID_B}.jsonl`, { kind: 'tui' }, 3000)
     await seed(`c_${ID_C}.jsonl`, { kind: 'cron', jobId: 'j', jobKind: 'prompt' }, 2000)
 
-    const { items, writableSessionId } = await listViewerItems({ sessionsDir, containerRunning: true })
+    const { items, writableSessionId } = await listViewerItems({
+      sessionsDir,
+      containerRunning: true,
+      interactive: true,
+    })
 
     expect(writableSessionId).toBe(ID_B)
     const writable = items.filter((i) => i.kind === 'tui')
@@ -57,7 +63,11 @@ describe('listViewerItems', () => {
     await seed(`a_${ID_A}.jsonl`, { kind: 'tui' }, 1000)
     await seed(`b_${ID_B}.jsonl`, { kind: 'tui' }, 2000)
 
-    const { items, writableSessionId } = await listViewerItems({ sessionsDir, containerRunning: false })
+    const { items, writableSessionId } = await listViewerItems({
+      sessionsDir,
+      containerRunning: false,
+      interactive: true,
+    })
 
     expect(writableSessionId).toBeNull()
     expect(items.filter((i) => i.kind === 'tui')).toHaveLength(0)
@@ -71,6 +81,7 @@ describe('listViewerItems', () => {
     const { items, writableSessionId } = await listViewerItems({
       sessionsDir,
       containerRunning: true,
+      interactive: true,
       allowWritable: false,
     })
 
@@ -82,17 +93,26 @@ describe('listViewerItems', () => {
   test('appends a logs row by default, suppressible via includeLogs:false', async () => {
     await seed(`a_${ID_A}.jsonl`, { kind: 'tui' }, 1000)
 
-    const withLogs = await listViewerItems({ sessionsDir, containerRunning: true })
+    const withLogs = await listViewerItems({ sessionsDir, containerRunning: true, interactive: true })
     expect(withLogs.items.at(-1)).toEqual({ kind: 'logs' })
 
-    const withoutLogs = await listViewerItems({ sessionsDir, containerRunning: true, includeLogs: false })
+    const withoutLogs = await listViewerItems({
+      sessionsDir,
+      containerRunning: true,
+      interactive: true,
+      includeLogs: false,
+    })
     expect(withoutLogs.items.some((i) => i.kind === 'logs')).toBe(false)
   })
 
   test('no writable item when container is up but no tui-origin session exists', async () => {
     await seed(`c_${ID_C}.jsonl`, { kind: 'cron', jobId: 'j', jobKind: 'prompt' }, 2000)
 
-    const { writableSessionId, items } = await listViewerItems({ sessionsDir, containerRunning: true })
+    const { writableSessionId, items } = await listViewerItems({
+      sessionsDir,
+      containerRunning: true,
+      interactive: true,
+    })
 
     expect(writableSessionId).toBeNull()
     expect(items.filter((i) => i.kind === 'tui')).toHaveLength(0)
@@ -105,6 +125,7 @@ describe('listViewerItems', () => {
     const { items } = await listViewerItems({
       sessionsDir,
       containerRunning: true,
+      interactive: true,
       liveSessions: [
         { sessionId: ID_B, origin: { kind: 'cron', jobId: 'j', jobKind: 'prompt' }, registeredAtMs: 9_000_000 },
       ],
@@ -125,6 +146,7 @@ describe('listViewerItems', () => {
     const { items } = await listViewerItems({
       sessionsDir,
       containerRunning: true,
+      interactive: true,
       liveSessions: [{ sessionId: ID_A, origin: { kind: 'tui' }, registeredAtMs: 9_000_000 }],
     })
 
@@ -133,5 +155,61 @@ describe('listViewerItems', () => {
     expect(rows).toHaveLength(1)
     if (rows[0]?.kind === 'logs') throw new Error('unreachable')
     expect(rows[0]?.summary.live).toBeUndefined()
+  })
+
+  test('non-TTY run classifies the most-recent tui-origin session read-only even with the container up', async () => {
+    await seed(`a_${ID_A}.jsonl`, { kind: 'tui' }, 3000)
+    await seed(`c_${ID_C}.jsonl`, { kind: 'cron', jobId: 'j', jobKind: 'prompt' }, 2000)
+
+    const { items, writableSessionId } = await listViewerItems({
+      sessionsDir,
+      containerRunning: true,
+      interactive: false,
+    })
+
+    expect(writableSessionId).toBeNull()
+    expect(items.filter((i) => i.kind === 'tui')).toHaveLength(0)
+    const tuiRow = items.find((i) => i.kind !== 'logs' && i.summary.sessionId === ID_A)
+    expect(tuiRow).toMatchObject({ kind: 'session', writable: false })
+  })
+})
+
+function fakeScope(): TailController {
+  const ctrl = new AbortController()
+  return { signal: ctrl.signal, intent: () => null, dispose: () => ctrl.abort() }
+}
+
+describe('non-TTY explicit tui-origin id (regression: PR #1285)', () => {
+  test('auto-opens as a read-only session and never launches the tui viewer or the picker', async () => {
+    // given a tui-origin session that IS the writable candidate when the
+    // container is up — the exact row that would dispatch to runTuiViewer
+    await seed(`a_${ID_A}.jsonl`, { kind: 'tui' }, 3000)
+    const { items } = await listViewerItems({ sessionsDir, containerRunning: true, interactive: false })
+
+    let opened: ViewerItem | undefined
+    let pickerCalls = 0
+
+    // when an explicit id preselects that session without a TTY
+    const result = await runViewerLoop<ViewerItem>({
+      listItems: async () => items,
+      keyOf: (item) => (item.kind === 'logs' ? 'logs' : item.summary.sessionId),
+      preselectKey: ID_A,
+      selectItem: async () => {
+        pickerCalls++
+        return { kind: 'cancelled' }
+      },
+      openItem: async (item) => {
+        opened = item
+        return { result: { ok: true, exitCode: 0 } }
+      },
+      createTailScope: fakeScope,
+      onEmpty: () => ({ ok: false, exitCode: 1, reason: 'empty' }),
+    })
+
+    // then it opens read-only (so openViewerItem bypasses its tui branch) and
+    // the clack picker is never reached
+    expect(result).toEqual({ ok: true, exitCode: 0 })
+    expect(pickerCalls).toBe(0)
+    expect(opened).toMatchObject({ kind: 'session', writable: false, summary: { sessionId: ID_A } })
   })
 })

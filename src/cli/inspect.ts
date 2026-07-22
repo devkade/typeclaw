@@ -150,6 +150,19 @@ export async function runInspectViewer(opts: RunInspectViewerOptions): Promise<n
   }
 
   const interactive = Boolean(process.stdin.isTTY)
+
+  // Without a TTY, clack's picker keypress loop busy-spins kevent64 at 100% CPU
+  // forever instead of resolving (e.g. `typeclaw inspect | head`, a daemon
+  // spawn). A resolved session arg auto-opens without the picker, so only the
+  // picker-mandatory case is refused — mirroring --json's explicit-id rule.
+  if (!interactive && preselectKey === undefined) {
+    process.stderr.write(`${errorLine('typeclaw inspect needs an interactive terminal to pick a session.')}\n`)
+    process.stderr.write(
+      'Pass an explicit session id (`typeclaw inspect <id>`) or use `--json <id>` for a scriptable stream.\n',
+    )
+    return 2
+  }
+
   const liveHint = interactive ? escHintLine(color) : undefined
   const inspectUrl = containerRunning ? await resolveInspectUrl(cwd) : undefined
   const liveSource = inspectUrl !== undefined ? buildLiveSource(inspectUrl) : undefined
@@ -181,6 +194,9 @@ export async function runInspectViewer(opts: RunInspectViewerOptions): Promise<n
       const listOpts: Parameters<typeof listViewerItems>[0] = {
         sessionsDir,
         containerRunning,
+        // listViewerItems also gates writable promotion on `interactive`, so a
+        // non-TTY explicit id can't auto-open a TUI it cannot drive.
+        interactive,
         // Compose the CLI-level permission (false on tui detach handoff) with
         // the loop-level one (false after returning to the picker from a viewer).
         allowWritable: cliAllowWritable && loopAllowWritable,

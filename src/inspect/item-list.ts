@@ -5,6 +5,11 @@ import { listSessions, type ListSessionsOptions, mergeLiveSessions, type Session
 
 export type ListViewerItemsOptions = ListSessionsOptions & {
   containerRunning: boolean
+  // A writable row dispatches to runTuiViewer, which drives a raw-mode pi-tui
+  // terminal — unusable without a TTY. Required (not defaulted) so a non-TTY
+  // caller can't silently promote a writable row it then can't drive, which
+  // would auto-open a TUI on an explicit id past the picker guard.
+  interactive: boolean
   includeLogs?: boolean
   // Defaults to true. The detach-to-list path (after `typeclaw tui` esc) sets
   // this false: detaching ENDS the server-side session, so the just-killed
@@ -22,18 +27,19 @@ export type ViewerList = {
 }
 
 // Builds the session-viewer list. The writable TUI row is a heuristic, not an
-// authoritative query: when the container is up, the single most-recent
-// tui-origin session becomes the read+write `tui` item; every other session is
-// read-only. With the container down there is no live session to drive, so all
-// sessions are read-only. The `logs` row is appended last (container stdout,
-// available offline) so it sits below the divider in the picker.
+// authoritative query: when the container is up AND stdin is a TTY, the single
+// most-recent tui-origin session becomes the read+write `tui` item; every other
+// session is read-only. With the container down (no live session to drive) or a
+// non-TTY stdin (no terminal to drive it), all sessions are read-only. The
+// `logs` row is appended last (container stdout, available offline) so it sits
+// below the divider in the picker.
 export async function listViewerItems(opts: ListViewerItemsOptions): Promise<ViewerList> {
   const diskSessions = await listSessions(opts)
   const sessions =
     opts.liveSessions !== undefined && opts.liveSessions.length > 0
       ? mergeLiveSessions(diskSessions, opts.liveSessions)
       : diskSessions
-  const allowWritable = opts.allowWritable !== false
+  const allowWritable = opts.interactive && opts.allowWritable !== false
   const writableSessionId = opts.containerRunning && allowWritable ? pickWritableSession(sessions) : null
 
   const items: ViewerItem[] = sessions.map((summary) =>
