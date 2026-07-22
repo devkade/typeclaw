@@ -17,6 +17,7 @@ const COMMAND_LOADERS: Record<BuiltinCommandName, () => Promise<MetaCarrier>> = 
   stop: () => import('./stop').then((m) => m.stopCommand),
   restart: () => import('./restart').then((m) => m.restartCommand),
   status: () => import('./status').then((m) => m.statusCommand),
+  stats: () => import('./stats').then((m) => m.statsCommand),
   reload: () => import('./reload').then((m) => m.reload),
   logs: () => import('./logs').then((m) => m.logsCommand),
   inspect: () => import('./inspect').then((m) => m.inspectCommand),
