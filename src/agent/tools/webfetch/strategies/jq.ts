@@ -1,5 +1,3 @@
-import { raw } from 'jq-wasm'
-
 export class JqError extends Error {
   constructor(message: string) {
     super(message)
@@ -17,6 +15,7 @@ export async function applyJq(content: string, query: string): Promise<string> {
   }
 
   try {
+    const { raw } = await import('jq-wasm')
     const result = await raw(parsed as string | object, query)
     if (result.exitCode !== 0 || result.stderr) {
       const detail = result.stderr.trim() || `exit code ${result.exitCode}`

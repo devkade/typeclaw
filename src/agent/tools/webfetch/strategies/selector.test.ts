@@ -14,24 +14,24 @@ const HTML = `
 </body></html>`
 
 describe('applySelector', () => {
-  test('extracts text from matching elements', () => {
-    const result = applySelector(HTML, '.item')
+  test('extracts text from matching elements', async () => {
+    const result = await applySelector(HTML, '.item')
     expect(result).toContain('Matched 3 element(s) for ".item"')
     expect(result).toContain('[1] Apple')
     expect(result).toContain('[2] Banana')
     expect(result).toContain('[3] Cherry')
   })
 
-  test('returns no-match message when selector finds nothing', () => {
-    expect(applySelector(HTML, '.nope')).toBe('No elements matched selector: .nope')
+  test('returns no-match message when selector finds nothing', async () => {
+    expect(await applySelector(HTML, '.nope')).toBe('No elements matched selector: .nope')
   })
 
-  test('targets a single element', () => {
-    const result = applySelector(HTML, '.price')
+  test('targets a single element', async () => {
+    const result = await applySelector(HTML, '.price')
     expect(result).toContain('[1] $9.99')
   })
 
-  test('throws SelectorError on invalid CSS selector', () => {
-    expect(() => applySelector(HTML, ':::')).toThrow(SelectorError)
+  test('throws SelectorError on invalid CSS selector', async () => {
+    await expect(applySelector(HTML, ':::')).rejects.toThrow(SelectorError)
   })
 })

@@ -226,7 +226,7 @@ async function runStrategy(
     case 'raw':
       return applyRaw(body)
     case 'readability':
-      return applyReadability(body, url)
+      return await applyReadability(body, url)
     case 'jq':
       try {
         return await applyJq(body, params.query ?? '')
@@ -236,7 +236,7 @@ async function runStrategy(
       }
     case 'selector':
       try {
-        return applySelector(body, params.selector ?? '')
+        return await applySelector(body, params.selector ?? '')
       } catch (error) {
         if (error instanceof SelectorError) throw new Error(error.message)
         throw error
@@ -255,7 +255,7 @@ async function runStrategy(
         throw error
       }
     case 'snapshot':
-      return applySnapshot(body)
+      return await applySnapshot(body)
   }
 }
 

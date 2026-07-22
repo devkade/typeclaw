@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { applySnapshot } from './snapshot'
 
 describe('applySnapshot', () => {
-  test('emits an indented semantic tree of headings, links, and forms', () => {
+  test('emits an indented semantic tree of headings, links, and forms', async () => {
     const html = `
 <html><body>
   <header><h1>Welcome</h1></header>
@@ -18,7 +18,7 @@ describe('applySnapshot', () => {
   </main>
 </body></html>`
 
-    const result = applySnapshot(html)
+    const result = await applySnapshot(html)
 
     expect(result).toContain('- banner')
     expect(result).toContain('- heading: Welcome')
@@ -34,15 +34,15 @@ describe('applySnapshot', () => {
     expect(result).toContain('- button: Submit')
   })
 
-  test('returns a clear message when no semantic structure exists', () => {
-    expect(applySnapshot('<html><body><script>void 0</script></body></html>')).toBe(
+  test('returns a clear message when no semantic structure exists', async () => {
+    expect(await applySnapshot('<html><body><script>void 0</script></body></html>')).toBe(
       'Page contains no semantic structure.',
     )
   })
 
-  test('produces hierarchical indentation', () => {
+  test('produces hierarchical indentation', async () => {
     const html = '<html><body><main><section><h1>Inside</h1></section></main></body></html>'
-    const result = applySnapshot(html)
+    const result = await applySnapshot(html)
     const lines = result.split('\n')
     const main = lines.find((l) => l.includes('main'))
     const section = lines.find((l) => l.includes('section'))
