@@ -137,6 +137,13 @@ export const CONTEXT_BUFFER_SIZE = 20
 // subsequent turn until it ages out. Cap each observed message's text; the
 // addressed current message is never capped (it's the actual request).
 export const OBSERVED_MESSAGE_MAX_CHARS = 800
+// A bare @mention (no text of its own) is a "wake up and look" ping, not a
+// question — the user is signalling that a recent un-responded message is what
+// they want a reply to. The wake-request nudge only fires when such a ping
+// lands within this window of a recent observed message, so a mention that
+// arrives long after the channel went quiet does not misread stale scrollback
+// as the thing to answer.
+export const WAKE_REQUEST_LOOKBACK_MS = 60_000
 // Discord's typing indicator expires after ~10s; an 8s heartbeat keeps it
 // continuously visible while we debounce + generate without spamming the API.
 // This is the default; an adapter whose platform expires the indicator sooner
@@ -705,6 +712,7 @@ type QueuedInbound = {
   reactionRef?: ReactionRef
   engageReaction?: Promise<ReactionRef | null>
   isBotMention: boolean
+  isBotMentionOnly?: boolean
   replyToBotMessageId: string | null
   isDm: boolean
   typingThread?: string
@@ -3637,6 +3645,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ...(event.reactionRef !== undefined ? { reactionRef: event.reactionRef } : {}),
       ...(engageReaction !== null ? { engageReaction } : {}),
       isBotMention: event.isBotMention,
+      ...(event.isBotMentionOnly !== undefined ? { isBotMentionOnly: event.isBotMentionOnly } : {}),
       replyToBotMessageId: event.replyToBotMessageId,
       isDm: event.isDm,
       ...(event.typingThread !== undefined ? { typingThread: event.typingThread } : {}),
@@ -5967,6 +5976,56 @@ function findAttachmentById(attachments: readonly InboundAttachment[], id: numbe
   return null
 }
 
+// Strips the platform's user/group-mention markup so a bare ping can be told
+// from a mention that also carries real text. Slack and Discord both encode
+// mentions as `<@id>` / `<@id|name>` (users) and `<!subteam^ID>` / `<!channel>`
+// (groups); GitHub and the plain-name adapters have no wrapping syntax to strip,
+// so their text is returned as-is and a mention there is never classified thin.
+// Content-blind and script-agnostic: it removes only fixed markup, never words,
+// so it works identically for Korean, CJK, Arabic, or any other input.
+function stripMentionMarkup(text: string, adapter: AdapterId): string {
+  switch (adapter) {
+    case 'slack':
+    case 'slack-bot':
+    case 'discord':
+    case 'discord-bot':
+      return text.replace(/<[@!][^>]*>/g, ' ')
+    default:
+      return text
+  }
+}
+
+// A "wake request" is a mention whose only payload IS the mention: once the
+// markup is stripped the remainder is empty. That shape means "wake up and look
+// at what was just said", not a self-contained question, so the caller nudges
+// the model toward the recent conversation instead of asking "what do you need?".
+function isThinMention(trigger: QueuedInbound, adapter: AdapterId): boolean {
+  if (!trigger.isBotMention) return false
+  if (trigger.attachments !== undefined && trigger.attachments.length > 0) return false
+  // Adapters whose visible text cannot reveal a bare ping (Telegram text_mention
+  // renders as a display name) carry the authoritative signal; trust it. Others
+  // fall back to stripping the platform's mention markup from the text.
+  if (trigger.isBotMentionOnly !== undefined) return trigger.isBotMentionOnly
+  return stripMentionMarkup(trigger.text, adapter).trim() === ''
+}
+
+// True when the engaged trigger is a bare ping AND a real (non-prefetch) message
+// was observed within the lookback window. Author-agnostic on purpose: in a group
+// one person can drop a message and a DIFFERENT teammate can ping the bot to loop
+// it in, so the recent message need not come from the pinger. The age must be
+// non-negative: a message that arrives DURING the mention's debounce window is
+// appended to contextBuffer after the ping, so `receivedAt - o.receivedAt` goes
+// negative — that message came AFTER the ping and is not what the user was
+// pointing back at, so it must not satisfy the "recent PRECEDING message" test.
+function isWakeRequest(observed: readonly ObservedInbound[], trigger: QueuedInbound, adapter: AdapterId): boolean {
+  if (!isThinMention(trigger, adapter)) return false
+  return observed.some((o) => {
+    if (o.source !== 'observed') return false
+    const age = trigger.receivedAt - o.receivedAt
+    return age >= 0 && age <= WAKE_REQUEST_LOOKBACK_MS
+  })
+}
+
 function composeTurnPrompt(
   observed: readonly ObservedInbound[],
   batch: readonly QueuedInbound[],
@@ -6079,6 +6138,45 @@ function composeTurnPrompt(
       'conversation, banter, or anything not actually waiting on you — reply with',
       '`NO_REPLY` (or call `skip_response`) to stay silent and keep watching.',
       'When unsure, prefer silence.',
+      '',
+      '---',
+      '',
+    )
+  }
+  // Wake-request nudge: same SYSTEM MESSAGE convention as the loop guard and
+  // group nudge. The trigger is a bare ping (mention with no text of its own),
+  // which the model would otherwise answer with "what do you need?" while the
+  // real request sits under "Recent context (not addressed to you)". This
+  // re-licenses the model to act on that recent conversation. Placed
+  // immediately BEFORE the Recent context block, and the nudge text points at
+  // that section BY NAME ("the Recent context section below") rather than by
+  // position, so the reference is unambiguous regardless of render order.
+  // Cache-neutral (user-turn suffix), and skipped when the loop guard already
+  // fired to avoid stacking two notices in one turn.
+  if (batch.length === 1 && !state.loopGuardActive && isWakeRequest(observed, batch[0]!, adapter)) {
+    parts.push(
+      '---',
+      '**[SYSTEM MESSAGE — not from a human]**',
+      '',
+      'You were just @-mentioned with little or no text — effectively a "wake up',
+      'and look" ping, not a question in itself. This is an automated signal from',
+      'the channel router, not a message from anyone in the chat. **Do not',
+      'acknowledge or reply to this notice.**',
+      '',
+      'A bare ping like this almost always means: "respond to what was just',
+      'said." Look at the "Recent context" section below (it shows who sent each',
+      'message):',
+      '- If a recent message clearly wants a response and is relevant to you —',
+      '  whether the person who pinged you sent it, or someone else did and the',
+      '  pinger is looping you in — treat THAT message as the real request and',
+      '  answer it directly. Do not ask "what do you need?" when the answer is',
+      '  already in that recent context.',
+      '- If several recent messages are relevant, address the substantive one(s).',
+      '- If nothing in that recent context actually needs you (the ping was a',
+      '  mistake, or the conversation moved on), a brief "what\'s up?" is fine.',
+      '',
+      'When in doubt, prefer answering the most recent substantive message over',
+      'asking what they meant.',
       '',
       '---',
       '',

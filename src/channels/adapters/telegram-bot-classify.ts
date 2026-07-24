@@ -62,6 +62,8 @@ export function classifyInbound(
 
   const thread = event.message_thread_id !== undefined ? String(event.message_thread_id) : null
 
+  const isBotMentionOnly = attachments.length === 0 && isOnlyBotMention(entities, fullText, bot.id, botUsername)
+
   return {
     kind: 'route',
     payload: {
@@ -76,6 +78,7 @@ export function classifyInbound(
       authorName: formatAuthorName(author),
       authorIsBot: author.is_bot === true,
       isBotMention,
+      isBotMentionOnly,
       replyToBotMessageId,
       mentionsOthers,
       replyToOtherMessageId,
@@ -83,6 +86,32 @@ export function classifyInbound(
       ts: event.date * 1000,
     },
   }
+}
+
+// A "bare ping" is a message whose entire body (ignoring surrounding
+// whitespace) is a SINGLE mention of the bot. The router cannot detect this
+// from `text` because a `text_mention` renders as the target's display name,
+// not `<@id>` markup, so the adapter must decide it here where the structured
+// entities are still available. Offsets are UTF-16 code units in both Telegram
+// entities and JS strings, so slicing lines up. Multiple mentions, any extra
+// words, or a mention that does not span the whole trimmed text are not bare.
+function isOnlyBotMention(
+  entities: readonly TelegramMessageEntity[],
+  fullText: string,
+  botId: number,
+  botUsername: string | undefined,
+): boolean {
+  const userMentions = entities.filter(isUserMentionEntity)
+  if (userMentions.length !== 1) return false
+  const entity = userMentions[0]!
+  const start = fullText.length - fullText.trimStart().length
+  const end = fullText.trimEnd().length
+  return (
+    start < end &&
+    entity.offset === start &&
+    entity.offset + entity.length === end &&
+    isUserMentionForBot(entity, fullText, botId, botUsername)
+  )
 }
 
 function formatAuthorName(user: TelegramBotUser): string {

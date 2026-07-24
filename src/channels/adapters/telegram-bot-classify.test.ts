@@ -81,6 +81,7 @@ describe('telegram-bot classifyInbound — routing', () => {
       authorName: 'alice',
       authorIsBot: false,
       isBotMention: false,
+      isBotMentionOnly: false,
       replyToBotMessageId: null,
       mentionsOthers: false,
       replyToOtherMessageId: null,
@@ -152,6 +153,69 @@ describe('telegram-bot classifyInbound — routing', () => {
     expect(verdict.kind).toBe('route')
     if (verdict.kind !== 'route') throw new Error('expected route')
     expect(verdict.payload.isBotMention).toBe(false)
+  })
+
+  test('a bare @-username mention (whole message) is isBotMentionOnly', () => {
+    const event = buildMessage({ text: '@typeclaw_bot', entities: [{ type: 'mention', offset: 0, length: 13 }] })
+
+    const verdict = classifyInbound(event, baseConfig, BOT)
+
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') throw new Error('expected route')
+    expect(verdict.payload.isBotMentionOnly).toBe(true)
+  })
+
+  test('a newline-padded bare @-username mention is isBotMentionOnly', () => {
+    const event = buildMessage({ text: '\n @typeclaw_bot \n', entities: [{ type: 'mention', offset: 2, length: 13 }] })
+
+    const verdict = classifyInbound(event, baseConfig, BOT)
+
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') throw new Error('expected route')
+    expect(verdict.payload.isBotMentionOnly).toBe(true)
+  })
+
+  test('a bare text_mention (rendered as a display name) is isBotMentionOnly', () => {
+    const botNoUsername: TelegramBotUser = { id: 999, is_bot: true, first_name: 'TypeClaw' }
+    const event = buildMessage({
+      text: '  TypeClaw  ',
+      entities: [{ type: 'text_mention', offset: 2, length: 8, user: botNoUsername }],
+    })
+
+    const verdict = classifyInbound(event, baseConfig, botNoUsername)
+
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') throw new Error('expected route')
+    expect(verdict.payload.isBotMentionOnly).toBe(true)
+  })
+
+  test('a mention with extra text is not isBotMentionOnly', () => {
+    const event = buildMessage({
+      text: '@typeclaw_bot please help',
+      entities: [{ type: 'mention', offset: 0, length: 13 }],
+    })
+
+    const verdict = classifyInbound(event, baseConfig, BOT)
+
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') throw new Error('expected route')
+    expect(verdict.payload.isBotMentionOnly).toBe(false)
+  })
+
+  test('the bot mention plus another mention is not isBotMentionOnly', () => {
+    const event = buildMessage({
+      text: '@typeclaw_bot @alice',
+      entities: [
+        { type: 'mention', offset: 0, length: 13 },
+        { type: 'mention', offset: 14, length: 6 },
+      ],
+    })
+
+    const verdict = classifyInbound(event, baseConfig, BOT)
+
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') throw new Error('expected route')
+    expect(verdict.payload.isBotMentionOnly).toBe(false)
   })
 
   test('reply to bot message surfaces replyToBotMessageId, not replyToOtherMessageId', () => {
