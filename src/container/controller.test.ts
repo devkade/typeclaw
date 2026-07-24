@@ -45,13 +45,17 @@ describe('LocalDockerController', () => {
         if (args[0] === 'inspect') {
           const seenInspects = calls.filter((c) => c[0] === 'inspect').length
           return seenInspects === 1
-            ? { exitCode: 0, stdout: 'false\n', stderr: '' }
+            ? { exitCode: 0, stdout: `${'a'.repeat(64)}|false\n`, stderr: '' }
             : { exitCode: 1, stdout: '', stderr: 'no such container' }
         }
         return { exitCode: 0, stdout: '', stderr: '' }
       })
 
-      const result = await createLocalDockerController().stop({ cwd: root, exec })
+      const result = await createLocalDockerController().stop({
+        cwd: root,
+        exec,
+        archiveLogs: async () => ({ ok: true, status: 'archived', path: '/archive.log' }),
+      })
 
       expect(result.ok).toBe(true)
       expect(calls.some((c) => c[0] === 'rm')).toBe(true)
