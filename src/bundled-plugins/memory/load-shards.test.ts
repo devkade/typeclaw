@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, rm, unlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, stat, unlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -161,15 +161,31 @@ describe('listShardSlugs', () => {
     await expect(loadAllShards(agentDir)).resolves.toHaveLength(1)
   })
 
-  test('topics path that is a regular file (ENOTDIR) degrades to empty', async () => {
+  test('missing topics dir self-heals: returns empty AND creates the directory', async () => {
+    // A fresh agent (or a wiped memory tree) has no memory/topics yet. Rather
+    // than merely swallowing the ENOENT, listShardSlugs recreates the dir so
+    // downstream readers see a real empty directory instead of a missing one.
+    const agentDir = await makeAgentDir()
+
+    await expect(listShardSlugs(agentDir)).resolves.toEqual([])
+
+    const created = await stat(topicsDir(agentDir))
+    expect(created.isDirectory()).toBe(true)
+  })
+
+  test('topics path that is a regular file (ENOTDIR) degrades to empty without self-healing', async () => {
     // A bind-mount/tmpfs coherency hiccup can momentarily replace memory/topics
-    // with a non-directory; readdir then throws ENOTDIR. It must degrade like a
-    // missing/empty topics dir rather than propagate a hard error.
+    // with a non-directory; readdir then throws ENOTDIR. mkdir can't safely heal
+    // a file-shaped path, so it must degrade like an empty topics dir rather
+    // than propagate a hard error -- and must NOT clobber the operator's file.
     const agentDir = await makeAgentDir()
     await mkdir(join(agentDir, 'memory'), { recursive: true })
     await writeFile(topicsDir(agentDir), 'not a directory', 'utf8')
 
     await expect(listShardSlugs(agentDir)).resolves.toEqual([])
+
+    const untouched = await stat(topicsDir(agentDir))
+    expect(untouched.isFile()).toBe(true)
   })
 
   test('a non-ENOENT/non-ENOTDIR readdir error still propagates', async () => {
