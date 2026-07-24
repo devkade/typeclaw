@@ -80,6 +80,13 @@ export type InboundMessage = {
   // bounded loop guard so two or more bots cannot ping-pong forever.
   authorIsBot: boolean
   isBotMention: boolean
+  // Adapter-authoritative "this inbound is a bare ping — the mention IS the whole
+  // message" signal. Set only by adapters whose visible `text` cannot reveal it:
+  // Telegram renders a `text_mention` as the target's display NAME (not `<@id>`),
+  // so the router's markup-stripping cannot tell a bare ping from real text. When
+  // present the wake-request detector trusts it; when absent (Slack/Discord) the
+  // router falls back to stripping the platform's mention markup from `text`.
+  isBotMentionOnly?: boolean
   // When true, engagement treats this inbound as explicit-only: it skips
   // content-blind sticky credit AND plain-text alias matching, leaving only
   // structural DM / @mention / reply triggers. Used for GitHub PR review-thread

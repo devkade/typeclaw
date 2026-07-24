@@ -1456,6 +1456,160 @@ describe('ChannelRouter engagement and prompt composition', () => {
     expect(prompt.indexOf('unrelated')).toBeLessThan(prompt.indexOf('hey bot'))
   })
 
+  test('nudges to answer the preceding message when a bare mention wakes the bot', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    // Prime carol as a second human so bob's non-mention message observes
+    // (multi-human strict-mention) instead of tripping the solo fallback.
+    await router.route(inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+    await router.route(
+      inbound({
+        isBotMention: false,
+        authorId: 'bob',
+        authorName: 'bob',
+        text: '3분기에 종료한다는 내용을 3분기에 보내는게 말이 돼?',
+      }),
+    )
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: '<@bot>' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).toContain('wake up')
+    expect(prompt).toContain('Do not ask "what do you need?"')
+    // the real question is still visible above under Recent context
+    expect(prompt).toContain('3분기에 종료한다는 내용을 3분기에 보내는게 말이 돼?')
+  })
+
+  // A bare ping is still bare when the mention is padded with whitespace,
+  // wrapped in newlines, or repeated — stripping the markup leaves only
+  // whitespace, which trims to empty.
+  test.each([
+    ['leading/trailing spaces', '  <@bot>  '],
+    ['surrounding newlines', '\n<@bot>\n'],
+    ['a tab before the mention', '\t<@bot>'],
+    ['the mention repeated', '<@bot> <@bot>'],
+  ])('fires the wake nudge for a whitespace-padded bare mention (%s)', async (_label, pingText) => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+    await router.route(
+      inbound({ isBotMention: false, authorId: 'bob', authorName: 'bob', text: 'the staging deploy is failing' }),
+    )
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: pingText }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).toContain('wake up')
+    expect(prompt).toContain('the staging deploy is failing')
+  })
+
+  test('fires the wake nudge when a DIFFERENT author pings about a message', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+    // alice drops a message (observed); bob pings the bot to loop it in
+    await router.route(
+      inbound({ isBotMention: false, authorId: 'alice', authorName: 'alice', text: 'anyone know the Q3 MRR?' }),
+    )
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: '<@bot>' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).toContain('wake up')
+    expect(prompt).toContain('anyone know the Q3 MRR?')
+  })
+
+  test('fires the wake nudge on a Telegram bare mention the router text cannot strip', async () => {
+    const dir = await tempDir()
+    const TG: ChannelKey = { adapter: 'telegram-bot', workspace: 't1', chat: 'c1', thread: null }
+    const { router, sessions } = makeRouter(dir)
+    const tg = (over: Partial<InboundMessage> = {}): InboundMessage =>
+      inbound({ adapter: 'telegram-bot', workspace: 't1', chat: 'c1', ...over })
+    await router.route(tg({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(TG)
+    sessions[0]!.prompts.length = 0
+    await router.route(
+      tg({ isBotMention: false, authorId: 'bob', authorName: 'bob', text: 'the deploy is stuck, can someone look?' }),
+    )
+    // A Telegram text_mention renders as the bot's display name ("TypeClaw"),
+    // which stripMentionMarkup cannot recognize — the adapter-set boolean is the
+    // only signal that this is a bare ping.
+    await router.route(tg({ isBotMentionOnly: true, authorId: 'bob', authorName: 'bob', text: 'TypeClaw' }))
+    await router.__testing!.flushDebounce(TG)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).toContain('wake up')
+    expect(prompt).toContain('the deploy is stuck, can someone look?')
+  })
+
+  test('does not fire the wake nudge for a bare mention with no recent context', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: '<@bot>' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).not.toContain('wake up')
+  })
+
+  test('does not fire the wake nudge for a message that arrived AFTER the ping (debounce-window race)', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    await router.route(inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+    // the bare mention lands first; a non-mention message from bob arrives
+    // DURING the debounce window (later receivedAt) and coalesces into the same
+    // drain — it came after the ping, so it is not what the ping points back at.
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: '<@bot>' }))
+    nowRef.value = 2000
+    await router.route(
+      inbound({ isBotMention: false, authorId: 'bob', authorName: 'bob', text: 'oh wait here is the thing' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).not.toContain('wake up')
+  })
+
+  test('does not fire the wake nudge when the mention carries its own text', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+    await router.route(
+      inbound({ isBotMention: false, authorId: 'bob', authorName: 'bob', text: 'some earlier chatter' }),
+    )
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: '<@bot> 이거 봐줘' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).not.toContain('wake up')
+  })
+
+  test('does not fire the wake nudge when the only recent context is prefetched scrollback', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    router.registerHistory('discord-bot', async () => ({
+      ok: true,
+      messages: [historyMessage({ externalMessageId: 'h1', text: 'old scrollback line' })],
+    }))
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: '<@bot>' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const prompt = sessions[0]!.prompts[0]!
+    expect(prompt).toContain('old scrollback line')
+    expect(prompt).not.toContain('wake up')
+  })
+
   test('caps observed Recent-context message text but never the addressed current message', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
