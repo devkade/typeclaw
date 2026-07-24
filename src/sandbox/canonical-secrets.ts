@@ -2,6 +2,7 @@ export const CANONICAL_AGENT_SECRET_DIRS = [
   'workspace/.config/gws',
   'workspace/.agent-messenger',
   '.typeclaw/home',
+  '.typeclaw/logs',
 ] as const
 
 export const CANONICAL_AGENT_SECRET_FILES = ['.env', 'secrets.json', 'auth.json'] as const

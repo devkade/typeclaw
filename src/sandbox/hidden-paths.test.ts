@@ -20,6 +20,7 @@ const hiddenDirs = (agentDir: string) => [
   join(agentDir, 'workspace', '.config', 'gws'),
   join(agentDir, 'workspace', '.agent-messenger'),
   join(agentDir, '.typeclaw', 'home'),
+  join(agentDir, '.typeclaw', 'logs'),
   join(agentDir, 'workspace'),
   join(agentDir, 'memory'),
   join(agentDir, 'sessions'),
@@ -28,6 +29,7 @@ const canonicalSecretDirs = (agentDir: string) => [
   join(agentDir, 'workspace', '.config', 'gws'),
   join(agentDir, 'workspace', '.agent-messenger'),
   join(agentDir, '.typeclaw', 'home'),
+  join(agentDir, '.typeclaw', 'logs'),
 ]
 const secretFiles = (agentDir: string) => [
   join(agentDir, '.env'),
