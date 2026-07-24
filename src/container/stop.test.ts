@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { DockerExec, DockerExecResult } from './shared'
 import { planStop, stop } from './stop'
+
+const CONTAINER_ID = 'a'.repeat(64)
+const archiveLogs = async () => ({ ok: true as const, status: 'archived' as const, path: '/archive.log' })
 
 let root: string
 
@@ -32,8 +35,10 @@ type FakeOptions = {
   stopFails?: boolean
   rmStderr?: string
   rmExitCode?: number
+  rmFindsRunning?: boolean
   inspectExitCode?: number
   inspectStderr?: string
+  inspectStdout?: string
   // Models Docker's async removal-drain after `docker rm`. The container
   // does NOT immediately disappear from `docker inspect`. It only transitions
   // to "no such container" after the inspect probe has been called this
@@ -64,7 +69,7 @@ function fakeDockerExec(options: FakeOptions): { exec: DockerExec; calls: string
         return { exitCode: options.inspectExitCode, stdout: '', stderr: options.inspectStderr ?? '' }
       }
       if (!scenario.exists) return { exitCode: 1, stdout: '', stderr: 'Error: No such container: x' }
-      return { exitCode: 0, stdout: `${scenario.running}\n`, stderr: '' }
+      return { exitCode: 0, stdout: options.inspectStdout ?? `${CONTAINER_ID}|${scenario.running}\n`, stderr: '' }
     }
     if (args[0] === 'stop') {
       if (options.stopFails) return { exitCode: 1, stdout: '', stderr: 'docker stop failed' }
@@ -72,10 +77,19 @@ function fakeDockerExec(options: FakeOptions): { exec: DockerExec; calls: string
       return { exitCode: 0, stdout: '', stderr: '' }
     }
     if (args[0] === 'rm') {
+      if (options.rmFindsRunning && !args.includes('-f')) {
+        scenario = { exists: true, running: true }
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr:
+            'Error response from daemon: You cannot remove a running container. Stop the container before attempting removal',
+        }
+      }
       const exitCode = options.rmExitCode ?? 0
       const stderr = options.rmStderr ?? ''
       rmReturned = true
-      // Exit 0 from `docker rm -f` does NOT mean the container is gone on
+      // Exit 0 from `docker rm` does NOT mean the container is gone on
       // OrbStack under load — the daemon acknowledges the rm before
       // draining. Defer the scenario transition to the inspect drain logic
       // above so tests with drainAfterInspectCalls > 0 model the real race
@@ -93,7 +107,7 @@ describe('stop (composition)', () => {
   test('returns ok with running=false when the container does not exist', async () => {
     const { exec, calls } = fakeDockerExec({ scenario: { exists: false } })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
@@ -105,7 +119,7 @@ describe('stop (composition)', () => {
   test('calls docker stop THEN docker rm when the container is running', async () => {
     const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: true } })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
@@ -116,16 +130,16 @@ describe('stop (composition)', () => {
     expect(rmIdx).toBeGreaterThan(stopIdx)
   })
 
-  test('skips docker stop but still issues docker rm -f when the container exists in stopped state (post-crash corpse)', async () => {
+  test('skips docker stop but still issues ID-keyed non-force rm when the container exists in stopped state', async () => {
     const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: false } })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.running).toBe(false)
     expect(calls.find((c) => c[0] === 'stop')).toBeUndefined()
-    expect(calls.find((c) => c[0] === 'rm' && c[1] === '-f')).toBeDefined()
+    expect(calls.find((c) => c[0] === 'rm')).toEqual(['rm', CONTAINER_ID])
   })
 
   test('tolerates "no such container" from docker rm (user removed it out-of-band)', async () => {
@@ -135,7 +149,7 @@ describe('stop (composition)', () => {
       rmStderr: 'Error: No such container: vanished',
     })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     expect(result.ok).toBe(true)
   })
@@ -152,7 +166,7 @@ describe('stop (composition)', () => {
     })
 
     // when
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     // then: stop reports success, AND we polled inspect at least until the
     // container actually disappeared — caller can safely docker run --name
@@ -165,7 +179,7 @@ describe('stop (composition)', () => {
   })
 
   test('waits for the drain when docker rm returns exit 0 but the container is still in inspect (OrbStack under load)', async () => {
-    // given: a running container. `docker rm -f` returns exit 0 but Docker
+    // given: a stopped container. `docker rm` returns exit 0 but Docker
     // has not yet finished draining — `inspect` still sees the container
     // for two more probes. This is the canonical OrbStack-under-load
     // failure mode behind `typeclaw compose restart`'s "Conflict. The
@@ -178,7 +192,7 @@ describe('stop (composition)', () => {
     })
 
     // when
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     // then: stop reports success only AFTER inspect confirmed the name is
     // free — at least one inspect probe must run between rm and return.
@@ -195,7 +209,7 @@ describe('stop (composition)', () => {
       rmStderr: 'permission denied',
     })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
@@ -208,7 +222,7 @@ describe('stop (composition)', () => {
       stopFails: true,
     })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
@@ -216,20 +230,42 @@ describe('stop (composition)', () => {
     expect(calls.find((c) => c[0] === 'rm')).toBeUndefined()
   })
 
-  test('force-removes the corpse when docker inspect fails with a non-"no such container" error', async () => {
+  test('preserves the container when inspect fails and its logs cannot be safely identified', async () => {
     const { exec, calls } = fakeDockerExec({
       scenario: { exists: true, running: false },
       inspectExitCode: 1,
       inspectStderr: 'Error response from daemon: removal of container abc is already in progress',
     })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
-    expect(result.ok).toBe(true)
-    if (!result.ok) return
-    expect(result.running).toBe(false)
-    expect(calls.find((c) => c[0] === 'rm' && c[1] === '-f')).toBeDefined()
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected failure')
+    expect(result.reason).toMatch(/preserving container.*logs/i)
+    expect(calls.find((c) => c[0] === 'rm')).toBeUndefined()
   })
+
+  test.each([`short|false\n`, `${CONTAINER_ID}|unknown\n`, `${'A'.repeat(64)}|true\n`])(
+    'preserves the container without stop/archive/rm for malformed inspect output: %s',
+    async (inspectStdout) => {
+      const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: true }, inspectStdout })
+      let archived = false
+
+      const result = await stop({
+        cwd: root,
+        exec,
+        archiveLogs: async () => {
+          archived = true
+          return { ok: true, status: 'archived', path: '/archive.log' }
+        },
+      })
+
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.reason).toMatch(/malformed.*preserving/i)
+      expect(archived).toBe(false)
+      expect(calls.some((call) => call[0] === 'stop' || call[0] === 'rm')).toBe(false)
+    },
+  )
 
   test('short-circuits without docker rm when docker inspect reports the container truly does not exist', async () => {
     const { exec, calls } = fakeDockerExec({
@@ -238,7 +274,7 @@ describe('stop (composition)', () => {
       inspectStderr: 'Error: No such container: anderson',
     })
 
-    const result = await stop({ cwd: root, exec })
+    const result = await stop({ cwd: root, exec, archiveLogs })
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
@@ -246,20 +282,85 @@ describe('stop (composition)', () => {
     expect(calls.find((c) => c[0] === 'rm')).toBeUndefined()
   })
 
-  test('surfaces a clear error when docker inspect fails AND the recovery docker rm -f also fails', async () => {
-    const { exec } = fakeDockerExec({
-      scenario: { exists: true, running: false },
-      inspectExitCode: 1,
-      inspectStderr: 'Error response from daemon: removal of container abc is already in progress',
-      rmExitCode: 1,
-      rmStderr: 'permission denied',
+  test('archives after graceful stop and before removal, targeting the inspected ID', async () => {
+    const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: true } })
+    const orderedArchive = async ({ containerId }: { containerId: string }) => {
+      calls.push(['archive', containerId])
+      return { ok: true as const, status: 'archived' as const, path: '/archive.log' }
+    }
+
+    const result = await stop({ cwd: root, exec, archiveLogs: orderedArchive })
+
+    expect(result.ok).toBe(true)
+    const stopIndex = calls.findIndex((call) => call[0] === 'stop')
+    const archiveIndex = calls.findIndex((call) => call[0] === 'archive')
+    const removeIndex = calls.findIndex((call) => call[0] === 'rm')
+    expect(archiveIndex).toBeGreaterThan(stopIndex)
+    expect(removeIndex).toBeGreaterThan(archiveIndex)
+    expect(calls[archiveIndex]).toEqual(['archive', CONTAINER_ID])
+    expect(calls[removeIndex]).toEqual(['rm', CONTAINER_ID])
+  })
+
+  test('passes the configured log retention period to archival', async () => {
+    const { exec } = fakeDockerExec({ scenario: { exists: true, running: false } })
+    await writeFile(join(root, 'typeclaw.json'), JSON.stringify({ logs: { retentionDays: 30 } }))
+    let archiveInput: { agentDir: string; containerId: string; retentionDays?: number } | undefined
+
+    const result = await stop({
+      cwd: root,
+      exec,
+      archiveLogs: async (input) => {
+        archiveInput = input
+        return { ok: true, status: 'archived', path: '/archive.log' }
+      },
     })
 
-    const result = await stop({ cwd: root, exec })
+    expect(result.ok).toBe(true)
+    expect(archiveInput).toEqual({ agentDir: root, containerId: CONTAINER_ID, retentionDays: 30 })
+  })
+
+  test.each([
+    ['malformed JSON', '{ not json'],
+    ['an unrelated schema error', JSON.stringify({ models: { default: 'not-a-known-model' } })],
+  ])('falls back to 14-day archival and removes the container when config has %s', async (_kind, config) => {
+    const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: false } })
+    await writeFile(join(root, 'typeclaw.json'), config)
+    let retentionDays: number | undefined
+
+    const result = await stop({
+      cwd: root,
+      exec,
+      archiveLogs: async (input) => {
+        retentionDays = input.retentionDays
+        return { ok: true, status: 'archived', path: '/archive.log' }
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(retentionDays).toBe(14)
+    expect(calls.find((call) => call[0] === 'rm')).toEqual(['rm', CONTAINER_ID])
+  })
+
+  test('preserves the same container ID if it resumes after archival', async () => {
+    const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: false }, rmFindsRunning: true })
+
+    const result = await stop({ cwd: root, exec, archiveLogs })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toMatch(/running container.*preserving/i)
+    expect(calls.find((call) => call[0] === 'rm')).toEqual(['rm', CONTAINER_ID])
+    expect(calls.some((call) => call[0] === 'rm' && call.includes('-f'))).toBe(false)
+  })
+
+  test('does not remove the container when archival fails', async () => {
+    const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: false } })
+    const failingArchive = async () => ({ ok: false as const, reason: 'disk full' })
+
+    const result = await stop({ cwd: root, exec, archiveLogs: failingArchive })
 
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
-    expect(result.reason).toMatch(/docker inspect failed/)
-    expect(result.reason).toMatch(/docker rm -f could not recover.*permission denied/)
+    expect(result.reason).toMatch(/archive.*disk full/i)
+    expect(calls.find((call) => call[0] === 'rm')).toBeUndefined()
   })
 })

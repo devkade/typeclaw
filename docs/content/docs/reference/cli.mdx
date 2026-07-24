@@ -13,7 +13,7 @@ TypeClaw runs code in three stages with different filesystems ([/concepts/archit
 | `typeclaw init`    | Interactive wizard. Scaffolds the agent folder; optionally wires the first provider + first channel.                             |
 | `typeclaw start`   | `docker run` with configured ports + mounts + env-file. Spawns `hostd` on first call per host. Flags: `--port`, `--build`.       |
 | `typeclaw restart` | `stop` + `start` with the same flag set as `start`.                                                                              |
-| `typeclaw stop`    | `docker stop` then `docker rm` so a clean stop leaves no trace.                                                                  |
+| `typeclaw stop`    | Stops the container, archives its timestamped logs under `.typeclaw/logs/`, then removes it.                                     |
 | `typeclaw status`  | Container + daemon registration state.                                                                                           |
 | `typeclaw stats`   | Live resource snapshot for the container: cpu %, memory usage, and pid count (a `docker stats --no-stream` for this one agent).  |
 | `typeclaw logs`    | Print container stdout/stderr with reformatted local timestamps. `-f` / `--follow` to stream; `-n` / `--tail <N\|all>` to limit. |
@@ -22,6 +22,8 @@ TypeClaw runs code in three stages with different filesystems ([/concepts/archit
 | `typeclaw reload`  | Re-read `typeclaw.json` and apply hot-reloadable fields. Reports which fields require a restart.                                 |
 
 `--port` is the **preferred** host port. On bind conflict, `start` allocates an ephemeral port; subsequent commands resolve the actual port by querying Docker. If Docker reports a published port but `typeclaw reload` cannot open that host websocket, reload falls back to a one-shot container-local websocket through `docker exec` and prints a repair hint; run `typeclaw restart --port 0` when safe to repair host TUI/reload connectivity.
+
+Lifecycle removal paths (`stop`, `restart`, and stale-container cleanup during `start`) first save `docker logs --timestamps` to a unique `<agent>/.typeclaw/logs/<container-id>-<timestamp>-<suffix>.log` snapshot. Archives are retained for 14 days by default; set `logs.retentionDays` in `typeclaw.json` to a whole number from 1 through 3650 to change the age limit. Capture or retention failure preserves the Docker container instead of removing the only remaining log source. The local-only archive directory is gitignored and hidden from model-driven tools; the live `typeclaw logs` command continues to read the current Docker container.
 
 ## Providers
 

@@ -287,6 +287,17 @@ export const gitSchema = z
 
 export type GitConfig = z.infer<typeof gitSchema>
 
+export const DEFAULT_LOG_RETENTION_DAYS = 14
+export const MAX_LOG_RETENTION_DAYS = 3650
+
+const logsObjectSchema = z.object({
+  retentionDays: z.number().int().min(1).max(MAX_LOG_RETENTION_DAYS).default(DEFAULT_LOG_RETENTION_DAYS),
+})
+
+export const logsSchema = logsObjectSchema.default(() => logsObjectSchema.parse({}))
+
+export type LogsConfig = z.infer<typeof logsSchema>
+
 const IPV4_CIDR_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d{1,2}))?$/
 
 const ipv4CidrSchema = z.string().refine(
@@ -784,6 +795,7 @@ export const configSchema = z
     sandbox: sandboxSchema,
     docker: dockerSchema,
     git: gitSchema,
+    logs: logsSchema,
     roles: rolesConfigSchema.optional(),
     tunnels: tunnelsArraySchema,
     // When `true` (default), the system prompt tells the agent it runs on
@@ -1010,6 +1022,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   tunnels: 'restart-required',
   'docker.file': 'restart-required',
   'git.ignore': 'restart-required',
+  logs: 'ignored',
   // Split: `match` lists are reload-safe (typeclaw role claim, hand-edits
   // adding/removing match rules apply without a container restart);
   // `permissions` lists are restart-required (changing what a role can DO
@@ -1104,6 +1117,7 @@ export function extractPluginConfigs(raw: unknown): Record<string, unknown> {
     'network',
     'docker',
     'git',
+    'logs',
     'roles',
     'permissions',
     'tunnels',

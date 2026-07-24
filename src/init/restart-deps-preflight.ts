@@ -5,8 +5,8 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { PACKAGE_FILE } from './packagejson'
 import { PACKAGES_DIR } from './paths'
 
-// The hostd restart path is destroy-then-recreate: it `docker rm -f`s the live
-// container BEFORE `start()` runs `bun install`. A bad agent edit to
+// The hostd restart path is destroy-then-recreate: stop() archives logs, then
+// non-force-removes the inspected container ID BEFORE `start()` runs `bun install`. A bad agent edit to
 // typeclaw.json#plugins or a packages/* manifest aborts that install AFTER the
 // old container is gone, with no rollback and no client to report to — the agent
 // self-locks out. This runs BEFORE stop() (via RestartPreflight) so a bad edit

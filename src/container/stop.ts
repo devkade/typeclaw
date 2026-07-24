@@ -1,10 +1,13 @@
+import { DEFAULT_LOG_RETENTION_DAYS, loadConfigSync } from '@/config'
 import { isDaemonReachable, send as sendToDaemon } from '@/hostd/client'
 
+import { archiveContainerLogs, type DockerLogArchiver } from './log-archive'
 import {
   classifyRmStderr,
   containerNameFromCwd,
   defaultDockerExec,
   type DockerExec,
+  parseContainerInspectOutput,
   sanitizeDockerStderr,
   waitForRemoval,
 } from './shared'
@@ -18,9 +21,14 @@ export type StopResult = { ok: true; containerName: string; running: boolean } |
 export type StopOptions = {
   cwd: string
   exec?: DockerExec
+  archiveLogs?: DockerLogArchiver
 }
 
-export async function stop({ cwd, exec = defaultDockerExec }: StopOptions): Promise<StopResult> {
+export async function stop({
+  cwd,
+  exec = defaultDockerExec,
+  archiveLogs = archiveContainerLogs,
+}: StopOptions): Promise<StopResult> {
   const { containerName } = planStop(cwd)
 
   if (await isDaemonReachable()) {
@@ -28,70 +36,74 @@ export async function stop({ cwd, exec = defaultDockerExec }: StopOptions): Prom
   }
 
   try {
-    const inspect = await exec(['inspect', '--format', '{{.State.Running}}', containerName], { cwd })
+    const retentionDays = resolveLogRetentionDays(cwd)
+    const inspect = await exec(['inspect', '--format', '{{.Id}}|{{.State.Running}}', containerName], { cwd })
     if (inspect.exitCode !== 0) {
       // `docker inspect` exits non-zero both when the container does not
       // exist AND when it exists but is in a transient state docker cannot
       // inspect (Removal In Progress, Dead, daemon hiccup). Discriminate by
-      // stderr — same approach used for `docker rm` below — and attempt a
-      // force-remove in the latter case so a corpse holding the name does
-      // not collide with the next `docker run --name <same>`.
       if (inspect.stderr.toLowerCase().includes('no such container')) {
         return { ok: true, containerName, running: false }
       }
-      const recover = await exec(['rm', '-f', containerName], { cwd })
-      if (recover.exitCode !== 0) {
-        const kind = classifyRmStderr(recover.stderr)
-        if (kind === null) {
-          return {
-            ok: false,
-            reason: `docker inspect failed (${sanitizeDockerStderr(inspect.stderr) || 'no stderr'}) and docker rm -f could not recover: ${sanitizeDockerStderr(recover.stderr) || 'no stderr'}`,
-          }
-        }
-        if (kind === 'in-progress' && !(await waitForRemoval(exec, containerName))) {
-          return {
-            ok: false,
-            reason: `Container ${containerName} is still being removed by docker after 10s.`,
-          }
-        }
+      return {
+        ok: false,
+        reason: `docker inspect failed (${sanitizeDockerStderr(inspect.stderr) || 'no stderr'}); preserving container ${containerName} because its ID and logs could not be safely identified for archival.`,
       }
-      return { ok: true, containerName, running: false }
     }
-    const running = inspect.stdout.trim() === 'true'
+    const parsed = parseContainerInspectOutput(inspect.stdout)
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        reason: `docker inspect returned malformed container identity/state (${parsed.reason}); preserving container ${containerName} and its logs.`,
+      }
+    }
+    const { containerId, running } = parsed
 
     // Only call `docker stop` when the container is actually running. A stopped
     // corpse from a prior crash is left around by design (no `--rm`), and
     // `docker stop` on an exited container would still succeed but emit a
     // noisy warning to stderr — skip it.
     if (running) {
-      const stopResult = await exec(['stop', containerName], { cwd })
+      const stopResult = await exec(['stop', containerId], { cwd })
       if (stopResult.exitCode !== 0) {
         return { ok: false, reason: `docker stop failed: ${sanitizeDockerStderr(stopResult.stderr) || 'no stderr'}` }
       }
     }
 
-    // Containers run without `--rm`, so `docker stop` only stops them — the
-    // record stays in `docker ps -a` until we remove it explicitly. Remove now
-    // so a subsequent `docker run --name <same>` (e.g. from `typeclaw restart`)
-    // does not collide on the name. Use `-f` for symmetry with the start.ts
-    // preflight and because `docker stop` occasionally returns exit 0 before
-    // the container is fully out of `Running` state on OrbStack under load —
-    // bare `docker rm` would then refuse a still-running container. See
-    // classifyRmStderr for the benign-failure contract; when 'in-progress',
-    // wait for the drain so stop()'s ok-return actually means "name is free"
-    // (which compose's restart and any subsequent start() depend on).
+    const archive = await archiveLogs({ agentDir: cwd, containerId, retentionDays })
+    if (!archive.ok) {
+      return {
+        ok: false,
+        reason: `Could not archive logs for container ${containerId}: ${archive.reason}. Preserving the Docker container as the source of truth.`,
+      }
+    }
+
+    // Containers run without `--rm`, so `docker stop` only stops them. Remove
+    // the inspected ID without force after archival. If that same ID resumed,
+    // Docker refuses the removal and we preserve it rather than killing a live
+    // container whose post-archive output is no longer represented by the
+    // snapshot. See classifyRmStderr for the benign-failure contract; when
+    // 'in-progress', wait for the drain so stop()'s ok-return actually means
+    // "name is free" (which compose restart and subsequent start depend on).
     //
     // Same waitForRemoval call on the exit-0 path for the same reason as the
     // start.ts preflight: OrbStack and Docker Desktop under load acknowledge
-    // `rm -f` before the daemon has finished draining the removal, so an
+    // `rm` before the daemon has finished draining the removal, so an
     // immediate `docker run --name <same>` (from `typeclaw compose restart`,
     // which fires stop→start sequentially per agent) races the drain and
     // fails with "Conflict. The container name … is already in use by
     // container <ID>". stop()'s contract is that the name is free on return,
     // and the only way to honor that against Docker's async removal is to
-    // poll inspect until the container actually disappears.
-    const rmResult = await exec(['rm', '-f', containerName], { cwd })
+    // poll inspect until the container actually disappears. Removal stays keyed
+    // by the inspected ID so a same-name replacement cannot be deleted.
+    const rmResult = await exec(['rm', containerId], { cwd })
     if (rmResult.exitCode !== 0) {
+      if (isRunningContainerRemovalError(rmResult.stderr)) {
+        return {
+          ok: false,
+          reason: `Docker refused to remove running container ${containerId} after archival; preserving it because it resumed during stop.`,
+        }
+      }
       const kind = classifyRmStderr(rmResult.stderr)
       if (kind === null) {
         return { ok: false, reason: `docker rm failed: ${sanitizeDockerStderr(rmResult.stderr) || 'no stderr'}` }
@@ -117,4 +129,19 @@ export async function stop({ cwd, exec = defaultDockerExec }: StopOptions): Prom
 
 export function planStop(cwd: string): StopPlan {
   return { containerName: containerNameFromCwd(cwd) }
+}
+
+function resolveLogRetentionDays(cwd: string): number {
+  try {
+    return loadConfigSync(cwd).logs.retentionDays
+  } catch {
+    // Stop must remain a recovery path when unrelated config is broken. The
+    // schema default is the conservative host policy until config is repaired.
+    return DEFAULT_LOG_RETENTION_DAYS
+  }
+}
+
+function isRunningContainerRemovalError(stderr: string): boolean {
+  const lower = stderr.toLowerCase()
+  return lower.includes('cannot remove a running container') || lower.includes('container is running')
 }

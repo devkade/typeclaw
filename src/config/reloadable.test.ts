@@ -230,6 +230,26 @@ describe('createConfigReloadable', () => {
     expect(diff.ignored.map((c) => c.path)).toEqual(['$schema'])
   })
 
+  test('field fence: host-only logs changes are ignored', async () => {
+    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A, logs: { retentionDays: 14 } }))
+    const reloadable = createConfigReloadable({ cwd })
+    await reloadable.reload()
+
+    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A, logs: { retentionDays: 30 } }))
+    const result = await reloadable.reload()
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const diff = result.details as {
+      applied: unknown[]
+      restartRequired: unknown[]
+      ignored: { path: string }[]
+    }
+    expect(diff.applied).toHaveLength(0)
+    expect(diff.restartRequired).toHaveLength(0)
+    expect(diff.ignored.map((change) => change.path)).toEqual(['logs'])
+  })
+
   test('field fence: customModels changes land in `applied`', async () => {
     await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'openai/gpt-6-live' } }))
     const reloadable = createConfigReloadable({ cwd })

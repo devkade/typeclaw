@@ -27,6 +27,7 @@ import {
   start,
   type HostDaemonRegisterPayload,
 } from './start'
+import { stop } from './stop'
 
 type ParsedBindMount = { src: string; dst: string; readonly: boolean }
 
@@ -134,6 +135,7 @@ type ScaffoldedConfig = {
   git?: { ignore?: GitignoreBlock }
   network?: { blockInternal?: boolean; autoAllowResolvers?: boolean; allow?: string[] }
   sandbox?: { realProc?: boolean; writablePaths?: string[]; symlinks?: Array<{ from: string; to: string }> }
+  logs?: { retentionDays?: number }
   memory?: Record<string, unknown>
 }
 
@@ -146,6 +148,7 @@ async function writeTypeclawConfig(dir: string, overrides: ScaffoldedConfig = {}
     ...(overrides.git ? { git: overrides.git } : {}),
     ...(overrides.network ? { network: overrides.network } : {}),
     ...(overrides.sandbox ? { sandbox: overrides.sandbox } : {}),
+    ...(overrides.logs ? { logs: overrides.logs } : {}),
     ...(overrides.memory ? { memory: overrides.memory } : {}),
   }
   await writeFile(join(dir, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
@@ -161,6 +164,7 @@ const deterministicAllocator = async (preferred: number): Promise<number> => (pr
 // tests and would slow each one by ~hundreds of ms.
 const noEnsureDeps = async (): Promise<{ ok: true; installed: false }> => ({ ok: true, installed: false })
 const noEnsureModels = async (): Promise<void> => {}
+const noArchiveLogs = async () => ({ ok: true as const, status: 'archived' as const, path: '/archive.log' })
 
 // The real autoUpgrade detector sees the test runner itself as a LOCAL typeclaw
 // checkout and would relink each agent's package.json — disruptive to tests that
@@ -172,7 +176,11 @@ const noAutoUpgrade = async () => ({ kind: 'up-to-date', installedVersion: '0.1.
 // pay the production 1.5s wait. Verification has its own dedicated test file
 // (verify-running.test.ts); start.test.ts only proves start() routes a
 // failing verifier into the documented failure response.
-const bypassVerify = { verifyRunning: async () => ({ ok: true as const }), ensureModels: noEnsureModels }
+const bypassVerify = {
+  verifyRunning: async () => ({ ok: true as const }),
+  ensureModels: noEnsureModels,
+  archiveLogs: noArchiveLogs,
+}
 
 function labelValue(runArgs: string[], key: string): string | undefined {
   for (let i = 0; i < runArgs.length - 1; i++) {
@@ -1456,6 +1464,7 @@ type ContainerScenario =
       running: boolean
       rmFails?: boolean
       rmStderr?: string
+      rmFindsRunning?: boolean
       // Models Docker's async removal-drain after a `docker rm` that
       // returned with "removal in progress" stderr: the container keeps
       // showing up in `inspect` until N post-rm inspect probes have run,
@@ -1475,6 +1484,7 @@ function fakeDockerExec(scenario: {
   // found stderr UNTIL the call is made with DOCKER_CONFIG set in its env (the
   // sanitized-config retry), at which point the build succeeds.
   credHelperMissingUntilSanitized?: boolean
+  containerInspectOutputs?: string[]
 }): {
   exec: DockerExec
   calls: RecordedCall[]
@@ -1483,6 +1493,7 @@ function fakeDockerExec(scenario: {
   let containerState = scenario.container
   let rmReturned = false
   let inspectsAfterRm = 0
+  let runningRacePending = scenario.container.exists && scenario.container.rmFindsRunning === true
   const exec: DockerExec = async (args, options) => {
     let dockerfileSnapshot: string | null = null
     if (options?.cwd) {
@@ -1521,6 +1532,13 @@ function fakeDockerExec(scenario: {
       // The idempotent path probes `inspect --format {{.Id}}` after seeing
       // the container is up; mirror that here so the fake stays sufficient.
       const format = args[args.indexOf('--format') + 1] ?? ''
+      if (format === '{{.Id}}|{{.State.Running}}') {
+        return {
+          exitCode: 0,
+          stdout: scenario.containerInspectOutputs?.shift() ?? `${'a'.repeat(64)}|${containerState.running}\n`,
+          stderr: '',
+        }
+      }
       if (format.includes('.Id')) {
         return { exitCode: 0, stdout: 'fake-running-id-123456\n', stderr: '' }
       }
@@ -1534,10 +1552,15 @@ function fakeDockerExec(scenario: {
       return { exitCode: 0, stdout: '0.0.0.0:8973\n', stderr: '' }
     }
     if (args[0] === 'rm') {
-      rmReturned = true
       if (!containerState.exists) {
         return { exitCode: 1, stdout: '', stderr: 'Error: No such container: x' }
       }
+      if (runningRacePending && args[1] !== '-f') {
+        runningRacePending = false
+        containerState = { ...containerState, running: true }
+        return { exitCode: 1, stdout: '', stderr: 'cannot remove a running container' }
+      }
+      rmReturned = true
       if (containerState.rmFails) {
         const stderr = containerState.rmStderr ?? 'rm failed'
         // "No such container" rm-failures mean the container is in fact gone
@@ -1549,7 +1572,7 @@ function fakeDockerExec(scenario: {
         }
         return { exitCode: 1, stdout: '', stderr }
       }
-      // Exit 0 from `docker rm -f` does NOT mean the name is free under
+      // Exit 0 from `docker rm` does NOT mean the name is free under
       // OrbStack load — the daemon acknowledges the rm before draining. The
       // inspect block above already advances containerState to "gone" after
       // drainAfterInspectCalls post-rm probes, so leaving the state alone
@@ -3038,8 +3061,8 @@ describe('start (composition)', () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
     const exec: DockerExec = async (args) => {
-      if (args[0] === 'inspect' && args.includes('{{.State.Running}}')) {
-        return { exitCode: 0, stdout: 'true\n', stderr: '' }
+      if (args[0] === 'inspect' && args.includes('{{.Id}}|{{.State.Running}}')) {
+        return { exitCode: 0, stdout: `${'a'.repeat(64)}|true\n`, stderr: '' }
       }
       if (args[0] === 'inspect' && args.includes('{{.Id}}')) {
         return { exitCode: 0, stdout: 'id\n', stderr: '' }
@@ -3064,8 +3087,46 @@ describe('start (composition)', () => {
     if (!result.ok) expect(result.reason).toMatch(/published host port could not be resolved/)
   })
 
-  test('force-removes a stale stopped container with the same name and proceeds to docker run', async () => {
-    // given: a previous crash or `typeclaw stop` left a stopped container holding the name
+  test('removes a stale stopped container with the same name and proceeds to docker run', async () => {
+    // given: a crash or failed archival/removal left a stopped container holding the name
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeTypeclawConfig(root, { logs: { retentionDays: 30 } })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      container: { exists: true, running: false },
+    })
+
+    // when
+    const orderedArchive = async ({ containerId, retentionDays }: { containerId: string; retentionDays?: number }) => {
+      calls.push({ args: ['archive', containerId, String(retentionDays)], dockerfileSnapshot: null })
+      return { ok: true as const, status: 'archived' as const, path: '/archive.log' }
+    }
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: orderedArchive,
+    })
+
+    // then: rm was issued before run, and run proceeded
+    expect(result.ok).toBe(true)
+    const archiveIdx = calls.findIndex((c) => c.args[0] === 'archive')
+    const rmIdx = calls.findIndex((c) => c.args[0] === 'rm')
+    const runIdx = calls.findIndex((c) => c.args[0] === 'run')
+    expect(archiveIdx).toBeGreaterThanOrEqual(0)
+    expect(calls[archiveIdx]?.args).toEqual(['archive', 'a'.repeat(64), '30'])
+    expect(rmIdx).toBeGreaterThan(archiveIdx)
+    expect(runIdx).toBeGreaterThan(rmIdx)
+    expect(calls[rmIdx]?.args.at(-1)).toBe('a'.repeat(64))
+    expect(calls[rmIdx]?.args).toEqual(['rm', 'a'.repeat(64)])
+  })
+
+  test('preserves a stale stopped container when its logs cannot be archived', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
     const { exec, calls } = fakeDockerExec({
@@ -3073,7 +3134,62 @@ describe('start (composition)', () => {
       container: { exists: true, running: false },
     })
 
-    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: async () => ({ ok: false, reason: 'disk full' }),
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toMatch(/archive.*disk full.*preserving/i)
+    expect(calls.find((call) => call.args[0] === 'rm')).toBeUndefined()
+    expect(calls.find((call) => call.args[0] === 'run')).toBeUndefined()
+  })
+
+  test('preserves a stale container that becomes running on the immediate re-probe', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const id = 'a'.repeat(64)
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      container: { exists: true, running: false },
+      containerInspectOutputs: [`${id}|false\n`, `${id}|true\n`],
+    })
+    let archived = false
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: async () => {
+        archived = true
+        return { ok: true, status: 'archived', path: '/archive.log' }
+      },
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toMatch(/became running.*preserving/i)
+    expect(archived).toBe(false)
+    expect(calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false)
+  })
+
+  test('uses non-force rm so Docker preserves a stale container that starts after archival', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      container: { exists: true, running: false, rmFindsRunning: true },
+    })
+
     const result = await start({
       cwd: root,
       preferredHostPort: 8973,
@@ -3084,12 +3200,116 @@ describe('start (composition)', () => {
       ...bypassVerify,
     })
 
-    // then: rm was issued before run, and run proceeded
-    expect(result.ok).toBe(true)
-    const rmIdx = calls.findIndex((c) => c.args[0] === 'rm' && c.args[1] === '-f')
-    const runIdx = calls.findIndex((c) => c.args[0] === 'run')
-    expect(rmIdx).toBeGreaterThanOrEqual(0)
-    expect(runIdx).toBeGreaterThan(rmIdx)
+    expect(result.ok).toBe(false)
+    const rmCall = calls.find((call) => call.args[0] === 'rm')
+    expect(rmCall?.args).toEqual(['rm', 'a'.repeat(64)])
+    expect(calls.find((call) => call.args[0] === 'run')).toBeUndefined()
+  })
+
+  test('captures fresh logs on later stop after stale cleanup archived but non-force rm refused', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const fake = fakeDockerExec({
+      imageExists: true,
+      container: { exists: true, running: false, rmFindsRunning: true },
+    })
+    const events: string[] = []
+    const exec: DockerExec = async (args, options) => {
+      events.push(args[0] ?? '')
+      return await fake.exec(args, options)
+    }
+    let captures = 0
+    const archiveLogs = async () => {
+      captures += 1
+      events.push('archive')
+      return { ok: true as const, status: 'archived' as const, path: `/archive-${captures}.log` }
+    }
+
+    const startResult = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs,
+    })
+    expect(startResult.ok).toBe(false)
+
+    const stopResult = await stop({ cwd: root, exec, archiveLogs })
+
+    expect(stopResult.ok).toBe(true)
+    expect(captures).toBe(2)
+    const stopIndex = events.lastIndexOf('stop')
+    const finalArchiveIndex = events.lastIndexOf('archive')
+    const finalRemoveIndex = events.lastIndexOf('rm')
+    expect(finalArchiveIndex).toBeGreaterThan(stopIndex)
+    expect(finalRemoveIndex).toBeGreaterThan(finalArchiveIndex)
+  })
+
+  test.each([`short|false\n`, `${'a'.repeat(64)}|unknown\n`, `${'A'.repeat(64)}|false\n`])(
+    'preserves without archive/removal when initial inspect output is malformed: %s',
+    async (inspectOutput) => {
+      await writeDockerfile(root)
+      await writePackageJson(root, { typeclaw: '^0.1.0' })
+      const { exec, calls } = fakeDockerExec({
+        imageExists: true,
+        container: { exists: true, running: false },
+        containerInspectOutputs: [inspectOutput],
+      })
+      let archived = false
+
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        archiveLogs: async () => {
+          archived = true
+          return { ok: true, status: 'archived', path: '/archive.log' }
+        },
+      })
+
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.reason).toMatch(/malformed.*preserving/i)
+      expect(archived).toBe(false)
+      expect(calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false)
+    },
+  )
+
+  test('preserves without archive/removal when the immediate stale re-probe is malformed', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const id = 'a'.repeat(64)
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      container: { exists: true, running: false },
+      containerInspectOutputs: [`${id}|false\n`, 'malformed\n'],
+    })
+    let archived = false
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: async () => {
+        archived = true
+        return { ok: true, status: 'archived', path: '/archive.log' }
+      },
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toMatch(/safely inspected.*preserving/i)
+    expect(archived).toBe(false)
+    expect(calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false)
   })
 
   test('tolerates "no such container" from docker rm (auto-removal finished between inspect and rm)', async () => {
@@ -3161,7 +3381,7 @@ describe('start (composition)', () => {
   })
 
   test('waits for Docker to finish removal when rm returns exit 0 but container is still draining (OrbStack under load)', async () => {
-    // given: a stopped corpse. The preflight `docker rm -f` returns exit 0
+    // given: a stopped corpse. The preflight `docker rm` returns exit 0
     // — i.e. Docker acknowledged the request — but the daemon has not yet
     // finished draining. `inspect` still sees the container for two more
     // probes after rm. This is the canonical failure mode behind the
@@ -3226,16 +3446,16 @@ describe('start (composition)', () => {
     })
 
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toMatch(/exists but is not running/)
+    if (!result.ok) expect(result.reason).toMatch(/could not be safely inspected or removed/)
     expect(calls.find((c) => c.args[0] === 'run')).toBeUndefined()
   })
 
-  test('retries docker run after force-removing the non-running corpse that holds the name', async () => {
+  test('retries docker run after removing the non-running corpse that holds the name', async () => {
     // given: the preflight `docker inspect` says the name is free, so
     // start() proceeds to `docker run`. The first run fails with the
     // user-visible name-conflict error referencing a concrete corpse ID —
     // exactly the failure mode behind the reported `typeclaw compose
-    // restart` bug. Once the retry path force-removes the corpse, the
+    // restart` bug. Once the retry path removes the corpse, the
     // next `docker run --name <same>` succeeds.
     //
     // Mutation check: revert the cleanupRunCorpse call inside
@@ -3262,10 +3482,9 @@ describe('start (composition)', () => {
       if (args[0] === 'image' && args[1] === 'inspect') return { exitCode: 0, stdout: '', stderr: '' }
       if (args[0] === 'inspect') {
         if (!corpseExists) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
-        // cleanupRunCorpse asks for `{{.Id}}|{{.State.Running}}`; everything
-        // else (preflight, waitForRemoval) only asks for State.Running. Both
-        // formats are emitted here — the production parser ignores the
-        // extra field, and the cleanupRunCorpse parser splits on '|'.
+        // cleanupRunCorpse asks for `{{.Id}}|{{.State.Running}}`; removal-drain
+        // probes only ask for State.Running. Emit the exact format each strict
+        // production parser expects.
         if (args.includes('{{.Id}}|{{.State.Running}}')) {
           return { exitCode: 0, stdout: `${corpseId}|false\n`, stderr: '' }
         }
@@ -3313,9 +3532,52 @@ describe('start (composition)', () => {
     const lastRunIdx = calls.length - 1 - [...calls].reverse().findIndex((c) => c.args[0] === 'run')
     expect(rmIdx).toBeGreaterThan(firstRunIdx)
     expect(rmIdx).toBeLessThan(lastRunIdx)
+    expect(calls[rmIdx]?.args).toEqual(['rm', corpseId])
   })
 
-  test('does NOT force-remove a RUNNING same-name container when docker run reports conflict', async () => {
+  test('does not remove or retry a failed-run corpse when archival fails', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const corpseId = 'c'.repeat(64)
+    let inspectCalls = 0
+    let runCalls = 0
+    let rmCalls = 0
+    const conflictStderr =
+      `docker: Error response from daemon: Conflict. The container name "/x" is already in use by container "${corpseId}". ` +
+      'You have to remove (or rename) that container to be able to reuse that name.'
+    const exec: DockerExec = async (args) => {
+      if (args[0] === 'image' && args[1] === 'inspect') return { exitCode: 0, stdout: '', stderr: '' }
+      if (args[0] === 'inspect') {
+        inspectCalls++
+        if (inspectCalls === 1) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
+        return { exitCode: 0, stdout: `${corpseId}|false\n`, stderr: '' }
+      }
+      if (args[0] === 'run') {
+        runCalls++
+        return { exitCode: 125, stdout: '', stderr: conflictStderr }
+      }
+      if (args[0] === 'rm') rmCalls++
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: async () => ({ ok: false, reason: 'read-only filesystem' }),
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toMatch(/logs could not be archived.*read-only filesystem.*preserving/i)
+    expect(rmCalls).toBe(0)
+    expect(runCalls).toBe(1)
+  })
+
+  test('does NOT remove a RUNNING same-name container when docker run reports conflict', async () => {
     // given: a docker run hits a name conflict but the named container is
     // currently RUNNING. The destructive retry path MUST refuse to kill a
     // live container — that would either murder a concurrent legitimate
@@ -3330,6 +3592,7 @@ describe('start (composition)', () => {
     let runAttempts = 0
     let rmAttempts = 0
     let probeAttempts = 0
+    const liveId = 'd'.repeat(64)
     const conflictStderr =
       'docker: Error response from daemon: Conflict. The container name "/x" is already in use by container "abc". You have to remove (or rename) that container to be able to reuse that name.'
     const exec: DockerExec = async (args) => {
@@ -3342,7 +3605,7 @@ describe('start (composition)', () => {
         // cleanupRunCorpse uses `{{.Id}}|{{.State.Running}}`; non-cleanupRunCorpse
         // callers use just State.Running. Emit both formats so either parser works.
         if (args.includes('{{.Id}}|{{.State.Running}}')) {
-          return { exitCode: 0, stdout: 'live-id|true\n', stderr: '' }
+          return { exitCode: 0, stdout: `${liveId}|true\n`, stderr: '' }
         }
         return { exitCode: 0, stdout: 'true\n', stderr: '' }
       }
@@ -3377,7 +3640,7 @@ describe('start (composition)', () => {
     // given: the first `docker run -p 8973:...` fails because another
     // process claimed 8973 between our probe and the run, AND Docker
     // already created the named container record before the port bind
-    // failed. The port-TOCTOU retry must force-remove the corpse before
+    // failed. The port-TOCTOU retry must remove the corpse before
     // re-running `docker run --name <same>` with the new port, or the
     // retry hits the user-visible Conflict error against its own corpse
     // — exactly the bug `typeclaw compose restart` was hitting.
@@ -3390,17 +3653,17 @@ describe('start (composition)', () => {
     let runAttempts = 0
     let rmAttempts = 0
     let corpseExists = false
+    const corpseId = 'e'.repeat(64)
     const calls: { args: string[] }[] = []
     const portStderr = 'docker: Bind for :::8973 failed: port is already allocated'
-    const conflictStderr =
-      'docker: Error response from daemon: Conflict. The container name "/x" is already in use by container "deadbeef". You have to remove (or rename) that container to be able to reuse that name.'
+    const conflictStderr = `docker: Error response from daemon: Conflict. The container name "/x" is already in use by container "${corpseId}". You have to remove (or rename) that container to be able to reuse that name.`
     const exec: DockerExec = async (args) => {
       calls.push({ args })
       if (args[0] === 'image' && args[1] === 'inspect') return { exitCode: 0, stdout: '', stderr: '' }
       if (args[0] === 'inspect') {
         if (!corpseExists) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
         if (args.includes('{{.Id}}|{{.State.Running}}')) {
-          return { exitCode: 0, stdout: 'deadbeef|false\n', stderr: '' }
+          return { exitCode: 0, stdout: `${corpseId}|false\n`, stderr: '' }
         }
         return { exitCode: 0, stdout: 'false\n', stderr: '' }
       }
@@ -3445,6 +3708,7 @@ describe('start (composition)', () => {
     const lastRunIdx = calls.length - 1 - [...calls].reverse().findIndex((c) => c.args[0] === 'run')
     expect(rmIdx).toBeGreaterThan(firstRunIdx)
     expect(rmIdx).toBeLessThan(lastRunIdx)
+    expect(calls[rmIdx]?.args).toEqual(['rm', corpseId])
     // The retry used the new port.
     const runCalls = calls.filter((c) => c.args[0] === 'run')
     expect(runCalls[0]!.args).toContain('127.0.0.1:8973:8973')
@@ -3453,7 +3717,7 @@ describe('start (composition)', () => {
 
   test('waits for "removal in progress" to drain during conflict-retry cleanup', async () => {
     // given: docker run reports name conflict; the retry path calls
-    // `docker rm -f` which itself returns "removal of container … is
+    // `docker rm` which itself returns "removal of container … is
     // already in progress". The cleanup must call waitForRemoval to
     // confirm the container actually disappears before retrying
     // `docker run`, or the retry races the drain and fails again.
@@ -3468,6 +3732,7 @@ describe('start (composition)', () => {
     let inspectAfterRm = 0
     let rmReturned = false
     let runAttempts = 0
+    const corpseId = 'f'.repeat(64)
     const conflictStderr =
       'docker: Error response from daemon: Conflict. The container name "/x" is already in use by container "abc". You have to remove (or rename) that container to be able to reuse that name.'
     const exec: DockerExec = async (args) => {
@@ -3480,7 +3745,7 @@ describe('start (composition)', () => {
           // has populated the corpse — it must see the corpse to issue rm.
           if (inspectsBeforeRm === 1) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
           if (args.includes('{{.Id}}|{{.State.Running}}')) {
-            return { exitCode: 0, stdout: 'abc|false\n', stderr: '' }
+            return { exitCode: 0, stdout: `${corpseId}|false\n`, stderr: '' }
           }
           return { exitCode: 0, stdout: 'false\n', stderr: '' }
         }
@@ -3592,11 +3857,11 @@ describe('start (composition)', () => {
     // ID "corpse-A", we remove only the corpse we measured.
     //
     // This test asserts the rm command is invoked with the corpse ID, not
-    // the container name. Mutation check: switch rm back to `rm -f <name>`
+    // the container name. Mutation check: switch rm back to `rm <name>`
     // and this assertion fails directly.
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
-    const corpseId = 'corpse-A-1234'
+    const corpseId = '9'.repeat(64)
     const containerName = basename(root)
     let rmTarget: string | undefined
     let runAttempts = 0
@@ -3638,11 +3903,11 @@ describe('start (composition)', () => {
 
   test('surfaces the docker run name-conflict error when cleanup cannot free the name', async () => {
     // given: Docker keeps returning the name-conflict error AND the
-    // cleanup `docker rm -f` cannot complete — a wedged daemon or a
+    // cleanup `docker rm` cannot complete — a wedged daemon or a
     // protected container that no amount of cleanup-then-retry will fix.
     // start() must eventually give up and surface the original error so
-    // the user can act (`docker rm -f <name>` manually, restart Docker)
-    // instead of looping forever.
+    // the user can inspect the container or restart Docker instead of
+    // bypassing archive-before-remove safety or looping forever.
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
     let runAttempts = 0

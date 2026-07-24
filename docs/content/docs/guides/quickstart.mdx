@@ -142,7 +142,7 @@ typeclaw logs -f       # watch the agent's output live
 typeclaw status        # is it running?
 ```
 
-If the agent ever crashes, the container is left in place on purpose so you can read `typeclaw logs` to see what happened.
+If the agent crashes, the container remains available to `typeclaw logs`. Before a later stop or restart removes it, TypeClaw saves its timestamped output under `.typeclaw/logs/` in the agent folder.
 
 </Accordion>
 

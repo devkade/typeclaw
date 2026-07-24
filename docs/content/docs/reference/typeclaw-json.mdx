@@ -24,6 +24,7 @@ JSON Schema–validated. `typeclaw init` scaffolds a `$schema` pointer at `./nod
 | `docker.file`           | `DockerFileOptions`                             | rebuild via `start`                          | Dockerfile feature toggles + append lines                                                |
 | `docker.runArgs.append` | `string[]`                                      | rebuild via `start`                          | extra `docker run` flags                                                                 |
 | `git.ignore.append`     | `string[]`                                      | rebuild via `start`                          | extra `.gitignore` lines                                                                 |
+| `logs.retentionDays`    | `number`                                        | host-only                                    | age limit for lifecycle log archives; default `14`, range `1`–`3650`                     |
 | `updateCheck`           | `{ enabled }`                                   | host-only                                    | toggle the once-a-day "newer typeclaw available" CLI notice; default `{ enabled: true }` |
 | `branding`              | `boolean`                                       | live                                         | disclose the TypeClaw runtime in the system prompt; default `true`                       |
 
@@ -32,6 +33,18 @@ Plugin-owned config blocks live at the top level under their plugin name and are
 The `updateCheck` notice is host-stage only — the container never reads it. Every CLI command does a cheap disk read of a cached "latest" version under `~/.typeclaw/` and prints a single line to stderr when a newer release exists; a detached, throttled (once per 24h) background process refreshes that cache off the hot path. The check never blocks or fails a command. Disable it persistently with `"updateCheck": { "enabled": false }`, or per-invocation with the `TYPECLAW_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` / `CI` env vars.
 
 `branding` controls whether the system prompt discloses the runtime. With the default `true`, the prompt tells the agent it runs "inside TypeClaw" and includes a `## Runtime` block stamping the TypeClaw version. Set `"branding": false` to strip both: the base prompt opens generically ("a general-purpose AI agent" / "an AI agent" for slim sessions) and the runtime-version block is omitted — including on the subagent prompt path. It is read fresh per session, so it applies on `typeclaw reload` without a restart. Functional identifiers the agent still needs — the `typeclaw.json` filename and the `typeclaw-render-pdf` / `typeclaw-troubleshooting` skill names — are unaffected; they are system-defined tokens, not runtime disclosure.
+
+## `logs`
+
+```json
+{
+  "logs": {
+    "retentionDays": 14
+  }
+}
+```
+
+`logs.retentionDays` is a host-stage lifecycle policy for snapshots under `<agent>/.typeclaw/logs/`. Before TypeClaw removes a stopped container, it streams up to 64 MiB of `docker logs --timestamps` into a private temporary file and atomically renames it to a unique `.log` snapshot. It removes recognized snapshots older than the configured cutoff and prunes the oldest remaining snapshots to built-in 512-file / 512 MiB safety limits; unrelated files and directories are left alone. Capture, publication, or retention failure preserves the Docker container as the remaining log source. The default age is `14`; values must be whole days from `1` through `3650`. The container runtime does not consume this setting, and reload reports it as host-only/ignored because each lifecycle command reads it directly.
 
 ## `models`
 

@@ -19,6 +19,7 @@ import {
   imageTagFromCwd,
   isContainerNameConflict,
   isMissingDockerCredentialHelper,
+  parseContainerInspectOutput,
   resolveDockerBinary,
   sanitizeDockerConfigJson,
   sanitizeDockerStderr,
@@ -27,6 +28,9 @@ import {
 } from './shared'
 
 let root: string
+const beforeRemove = async () => ({ ok: true as const })
+const CORPSE_ID = 'a'.repeat(64)
+const LIVE_ID = 'b'.repeat(64)
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'typeclaw-container-shared-'))
@@ -333,6 +337,26 @@ describe('classifyRmStderr', () => {
   })
 })
 
+describe('parseContainerInspectOutput', () => {
+  test.each([
+    [`${CORPSE_ID}|false\n`, { ok: true, containerId: CORPSE_ID, running: false } as const],
+    [`${LIVE_ID}|true\n`, { ok: true, containerId: LIVE_ID, running: true } as const],
+  ])('parses exact full-ID and running-state output', (output, expected) => {
+    expect(parseContainerInspectOutput(output)).toEqual(expected)
+  })
+
+  test.each([
+    'short-id|false',
+    `${'A'.repeat(64)}|false`,
+    `${CORPSE_ID}|yes`,
+    `${CORPSE_ID}|`,
+    `|false`,
+    `${CORPSE_ID}|false|extra`,
+  ])('rejects malformed inspect output: %s', (output) => {
+    expect(parseContainerInspectOutput(output).ok).toBe(false)
+  })
+})
+
 describe('isContainerNameConflict', () => {
   test('detects the canonical "container name is already in use" error from docker run', () => {
     const stderr =
@@ -416,11 +440,11 @@ describe('cleanupRunCorpse', () => {
       return { exitCode: 0, stdout: '', stderr: '' }
     }
 
-    expect(await cleanupRunCorpse(exec, 'x')).toBe('gone')
+    expect(await cleanupRunCorpse(exec, 'x', beforeRemove)).toBe('gone')
     expect(rmIssued).toBe(false)
   })
 
-  test('returns "removed" after force-removing a non-running corpse and waiting for the drain', async () => {
+  test('returns "removed" after removing a non-running corpse and waiting for the drain', async () => {
     // The probe uses `{{.Id}}|{{.State.Running}}` so cleanupRunCorpse can
     // issue rm by ID (closes the TOCTOU window where a peer might create
     // a different live container with the same name between probe and rm).
@@ -428,14 +452,16 @@ describe('cleanupRunCorpse', () => {
     let inspectCalls = 0
     let rmDone = false
     let rmTarget: string | undefined
+    let rmArgs: string[] | undefined
     const exec: DockerExec = async (args) => {
       if (args[0] === 'inspect') {
         inspectCalls++
-        if (!rmDone) return { exitCode: 0, stdout: 'corpse-id-abc|false\n', stderr: '' }
+        if (!rmDone) return { exitCode: 0, stdout: `${CORPSE_ID}|false\n`, stderr: '' }
         return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
       }
       if (args[0] === 'rm') {
         rmCalls++
+        rmArgs = args
         rmTarget = args[args.length - 1]
         rmDone = true
         return { exitCode: 0, stdout: '', stderr: '' }
@@ -443,11 +469,12 @@ describe('cleanupRunCorpse', () => {
       return { exitCode: 0, stdout: '', stderr: '' }
     }
 
-    expect(await cleanupRunCorpse(exec, 'x')).toBe('removed')
+    expect(await cleanupRunCorpse(exec, 'x', beforeRemove)).toBe('removed')
     expect(rmCalls).toBe(1)
     // rm MUST target the probed ID, not the name — otherwise a same-name
     // peer created between probe and rm would be killed.
-    expect(rmTarget).toBe('corpse-id-abc')
+    expect(rmTarget).toBe(CORPSE_ID)
+    expect(rmArgs).toEqual(['rm', CORPSE_ID])
     // probe inspect + at least one waitForRemoval inspect = 2+
     expect(inspectCalls).toBeGreaterThanOrEqual(2)
   })
@@ -455,7 +482,7 @@ describe('cleanupRunCorpse', () => {
   test('returns "running" and does NOT issue rm when the named container is currently running', async () => {
     let rmIssued = false
     const exec: DockerExec = async (args) => {
-      if (args[0] === 'inspect') return { exitCode: 0, stdout: 'live-id-abc|true\n', stderr: '' }
+      if (args[0] === 'inspect') return { exitCode: 0, stdout: `${LIVE_ID}|true\n`, stderr: '' }
       if (args[0] === 'rm') {
         rmIssued = true
         return { exitCode: 0, stdout: '', stderr: '' }
@@ -463,7 +490,7 @@ describe('cleanupRunCorpse', () => {
       return { exitCode: 0, stdout: '', stderr: '' }
     }
 
-    expect(await cleanupRunCorpse(exec, 'x')).toBe('running')
+    expect(await cleanupRunCorpse(exec, 'x', beforeRemove)).toBe('running')
     expect(rmIssued).toBe(false)
   })
 
@@ -472,7 +499,7 @@ describe('cleanupRunCorpse', () => {
     let postRmInspects = 0
     const exec: DockerExec = async (args) => {
       if (args[0] === 'inspect') {
-        if (!rmDone) return { exitCode: 0, stdout: 'corpse-id|false\n', stderr: '' }
+        if (!rmDone) return { exitCode: 0, stdout: `${CORPSE_ID}|false\n`, stderr: '' }
         postRmInspects++
         if (postRmInspects <= 1) return { exitCode: 0, stdout: 'false\n', stderr: '' }
         return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
@@ -488,40 +515,76 @@ describe('cleanupRunCorpse', () => {
       return { exitCode: 0, stdout: '', stderr: '' }
     }
 
-    expect(await cleanupRunCorpse(exec, 'x')).toBe('removed')
+    expect(await cleanupRunCorpse(exec, 'x', beforeRemove)).toBe('removed')
     expect(postRmInspects).toBeGreaterThanOrEqual(2)
   })
 
   test('returns "gone" when rm reports the container is already gone', async () => {
     const exec: DockerExec = async (args) => {
-      if (args[0] === 'inspect') return { exitCode: 0, stdout: 'corpse-id|false\n', stderr: '' }
+      if (args[0] === 'inspect') return { exitCode: 0, stdout: `${CORPSE_ID}|false\n`, stderr: '' }
       if (args[0] === 'rm') return { exitCode: 1, stdout: '', stderr: 'Error: No such container: x' }
       return { exitCode: 0, stdout: '', stderr: '' }
     }
 
-    expect(await cleanupRunCorpse(exec, 'x')).toBe('gone')
+    expect(await cleanupRunCorpse(exec, 'x', beforeRemove)).toBe('gone')
   })
 
   test('returns "stuck" when rm fails with a non-benign error', async () => {
     const exec: DockerExec = async (args) => {
-      if (args[0] === 'inspect') return { exitCode: 0, stdout: 'corpse-id|false\n', stderr: '' }
+      if (args[0] === 'inspect') return { exitCode: 0, stdout: `${CORPSE_ID}|false\n`, stderr: '' }
       if (args[0] === 'rm') return { exitCode: 1, stdout: '', stderr: 'permission denied' }
       return { exitCode: 0, stdout: '', stderr: '' }
     }
 
-    expect(await cleanupRunCorpse(exec, 'x')).toBe('stuck')
+    expect(await cleanupRunCorpse(exec, 'x', beforeRemove)).toBe('stuck')
   })
 
+  test.each(['\n', `short|false\n`, `${CORPSE_ID}|unknown\n`, `${'A'.repeat(64)}|false\n`])(
+    'returns "stuck" without archival or removal for malformed inspect output: %s',
+    async (stdout) => {
+      let archiveIssued = false
+      let rmIssued = false
+      const exec: DockerExec = async (args) => {
+        if (args[0] === 'inspect') return { exitCode: 0, stdout, stderr: '' }
+        if (args[0] === 'rm') rmIssued = true
+        return { exitCode: 0, stdout: '', stderr: '' }
+      }
+      const archive = async () => {
+        archiveIssued = true
+        return { ok: true as const }
+      }
+
+      expect(await cleanupRunCorpse(exec, 'x', archive)).toBe('stuck')
+      expect(archiveIssued).toBe(false)
+      expect(rmIssued).toBe(false)
+    },
+  )
+
   test('returns "stuck" when probe stdout is malformed (no ID, defensive)', async () => {
-    // Defensive: a daemon hiccup returning exit 0 with empty stdout
-    // should not let us issue rm without an ID — we'd fall back to
-    // killing by name and that's the very TOCTOU we're closing.
     const exec: DockerExec = async (args) => {
       if (args[0] === 'inspect') return { exitCode: 0, stdout: '\n', stderr: '' }
       return { exitCode: 0, stdout: '', stderr: '' }
     }
 
-    expect(await cleanupRunCorpse(exec, 'x')).toBe('stuck')
+    expect(await cleanupRunCorpse(exec, 'x', beforeRemove)).toBe('stuck')
+  })
+
+  test('runs the pre-remove hook before rm and preserves the corpse when it fails', async () => {
+    const calls: string[] = []
+    const exec: DockerExec = async (args) => {
+      calls.push(args[0] ?? '')
+      if (args[0] === 'inspect') return { exitCode: 0, stdout: `${'b'.repeat(64)}|false\n`, stderr: '' }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    const failArchive = async () => {
+      calls.push('archive')
+      return { ok: false as const, reason: 'disk full' }
+    }
+
+    const result = await cleanupRunCorpse(exec, 'x', failArchive)
+
+    expect(result).toEqual({ archiveFailed: 'disk full' })
+    expect(calls).toEqual(['inspect', 'archive'])
   })
 })
 

@@ -24,6 +24,16 @@ export type DockerExecOptions = {
 
 export type DockerExec = (args: string[], options?: DockerExecOptions) => Promise<DockerExecResult>
 
+export type ParsedContainerInspect = { ok: true; containerId: string; running: boolean } | { ok: false; reason: string }
+
+export function parseContainerInspectOutput(output: string): ParsedContainerInspect {
+  const match = /^([0-9a-f]{64})\|(true|false)$/.exec(output.trim())
+  if (match === null) {
+    return { ok: false, reason: 'expected <64 lowercase hex container ID>|<true|false>' }
+  }
+  return { ok: true, containerId: match[1]!, running: match[2] === 'true' }
+}
+
 export const defaultDockerExec: DockerExec = async (args, options) => {
   const bun = getBun()
   if (!bun) return { exitCode: -1, stdout: '', stderr: 'bun runtime not available' }
@@ -388,9 +398,8 @@ export function classifyRmStderr(stderr: string): BenignRmKind {
 // sleep-only retries cannot make it go away.
 //
 // The fix is destructive: when this error fires for a non-running same-name
-// container, force-remove it before retrying. See cleanupRunCorpse for the
-// safety contract (only force-remove containers that are NOT running, so a
-// concurrent legitimate start of the same name is never killed).
+// container, remove it before retrying. cleanupRunCorpse uses non-force rm so
+// Docker still refuses if that same ID starts after the inspect probe.
 //
 // Matches case-insensitively on the canonical phrasing across Docker
 // Engine, Docker Desktop, and OrbStack. The (or rename) clause is the
@@ -403,7 +412,7 @@ export function isContainerNameConflict(stderr: string): boolean {
 // Result of probing whether a previous `docker run --name <X>` left a corpse
 // blocking the next run:
 //   - 'gone'     — no container with that name. Safe to `docker run --name`.
-//   - 'removed'  — corpse existed and was force-removed (and waitForRemoval
+//   - 'removed'  — corpse existed and was removed (and waitForRemoval
 //                  confirmed it disappeared). Safe to `docker run --name`.
 //   - 'running'  — a container with that name is currently RUNNING. We did
 //                  NOT remove it. Caller must NOT proceed with `docker run
@@ -412,11 +421,13 @@ export function isContainerNameConflict(stderr: string): boolean {
 //   - 'stuck'    — corpse existed but did not disappear within waitForRemoval
 //                  budget. Caller should surface a clear error rather than
 //                  loop forever.
-export type CorpseCleanupOutcome = 'gone' | 'removed' | 'running' | 'stuck'
+export type BeforeContainerRemove = (containerId: string) => Promise<{ ok: true } | { ok: false; reason: string }>
 
-// Inspects the named container; if a non-running corpse is holding the
-// name (the failure mode behind `typeclaw compose restart`'s persistent
-// Conflict errors), force-removes it and waits for the removal to drain.
+export type CorpseCleanupOutcome = 'gone' | 'removed' | 'running' | 'stuck' | { archiveFailed: string }
+
+// Inspects the named container; if a non-running corpse is holding the name,
+// runs the caller's required archival hook, removes it without force, and waits for the
+// removal to drain. An archival failure leaves the corpse untouched.
 // Explicitly refuses to touch a RUNNING container so that a concurrent
 // legitimate start of the same name (or a foreign-but-named container the
 // user wants kept alive) is never killed by this cleanup path. Errors from
@@ -433,13 +444,19 @@ export type CorpseCleanupOutcome = 'gone' | 'removed' | 'running' | 'stuck'
 // container" which classifyRmStderr folds into 'gone'. waitForRemoval
 // is still keyed on name because that's what the caller's next
 // `docker run --name <name>` will actually collide on.
-export async function cleanupRunCorpse(exec: DockerExec, name: string): Promise<CorpseCleanupOutcome> {
+export async function cleanupRunCorpse(
+  exec: DockerExec,
+  name: string,
+  beforeRemove: BeforeContainerRemove,
+): Promise<CorpseCleanupOutcome> {
   const probe = await exec(['inspect', '--format', '{{.Id}}|{{.State.Running}}', name])
   if (probe.exitCode !== 0) return 'gone'
-  const [id = '', running = ''] = probe.stdout.trim().split('|')
-  if (running === 'true') return 'running'
-  if (id === '') return 'stuck'
-  const rm = await exec(['rm', '-f', id])
+  const parsed = parseContainerInspectOutput(probe.stdout)
+  if (!parsed.ok) return 'stuck'
+  if (parsed.running) return 'running'
+  const prepared = await beforeRemove(parsed.containerId)
+  if (!prepared.ok) return { archiveFailed: prepared.reason }
+  const rm = await exec(['rm', parsed.containerId])
   if (rm.exitCode !== 0) {
     const kind = classifyRmStderr(rm.stderr)
     if (kind === 'gone') return 'gone'
