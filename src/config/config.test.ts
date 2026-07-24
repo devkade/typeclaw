@@ -1129,6 +1129,23 @@ describe('docker.file schema', () => {
   })
 })
 
+describe('logs schema', () => {
+  test('defaults retentionDays to 14 when logs or retentionDays is omitted', () => {
+    expect(configSchema.parse({ models: { default: VALID_MODEL } }).logs).toEqual({ retentionDays: 14 })
+    expect(configSchema.parse({ models: { default: VALID_MODEL }, logs: {} }).logs).toEqual({ retentionDays: 14 })
+  })
+
+  test('accepts a custom positive integer retention period', () => {
+    expect(configSchema.parse({ models: { default: VALID_MODEL }, logs: { retentionDays: 30 } }).logs).toEqual({
+      retentionDays: 30,
+    })
+  })
+
+  test.each([0, -1, 1.5, '14', 3651])('rejects invalid retentionDays: %p', (retentionDays) => {
+    expect(() => configSchema.parse({ models: { default: VALID_MODEL }, logs: { retentionDays } })).toThrow()
+  })
+})
+
 describe('git.ignore schema', () => {
   test('defaults to an empty append array when omitted', () => {
     const parsed = configSchema.parse({ models: { default: VALID_MODEL } })
@@ -2252,12 +2269,13 @@ describe('plugin config layout', () => {
     })
   })
 
-  test('extractPluginConfigs treats portForward, docker, and git as known top-level keys (not plugin blocks)', () => {
+  test('extractPluginConfigs treats portForward, docker, git, and logs as known top-level keys', () => {
     const result = extractPluginConfigs({
       models: { default: VALID_MODEL },
       portForward: { allow: '*' },
       docker: { file: { append: [] } },
       git: { ignore: { append: [] } },
+      logs: { retentionDays: 14 },
       'standup-log': { schedule: '0 17 * * 5' },
     })
     expect(result).toEqual({ 'standup-log': { schedule: '0 17 * * 5' } })
