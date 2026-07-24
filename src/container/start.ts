@@ -32,10 +32,10 @@ import { linkWindowsDevTypeclaw, resolveBunLinkedPackage, type RunBunLink } from
 import { isWindows } from '@/shared'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
 
+import { archiveContainerLogs, type DockerLogArchiver } from './log-archive'
 import { CONTAINER_PORT, TUI_TOKEN_LABEL, findFreePort, isPortAllocatedError, resolveTuiToken } from './port'
 import {
   buildxAvailable,
-  classifyRmStderr,
   cleanupRunCorpse,
   containerNameFromCwd,
   defaultDockerExec,
@@ -46,9 +46,9 @@ import {
   imageTagFromCwd,
   isContainerNameConflict,
   isMissingDockerCredentialHelper,
+  parseContainerInspectOutput,
   sanitizeDockerConfigJson,
   sanitizeDockerStderr,
-  waitForRemoval,
 } from './shared'
 import { buildCrashReason, createVerifyRunning, type VerifyRunningFn } from './verify-running'
 
@@ -175,6 +175,7 @@ export type StartOptions = {
   hostIdentity?: { uid: number; gid: number } | null
   // Test seam for the host-stage writable-config preflight.
   assertConfigWritable?: (cwd: string) => void
+  archiveLogs?: DockerLogArchiver
 }
 
 export type HostDaemonStatus =
@@ -194,8 +195,8 @@ export type StartResult =
       // True when the container was already running and start() became a no-op.
       // Callers that want to distinguish "I just launched it" from "it was up
       // already" (CLI output, compose summaries) gate on this flag. False on
-      // every fresh launch, including the post-stale-corpse `--rm` recovery
-      // path — that one rebuilds the container from scratch.
+      // every fresh launch, including post-stale-corpse archival and ID-keyed
+      // non-force removal — that path rebuilds the container from scratch.
       alreadyRunning: boolean
       autoUpgrade: AutoUpgradeOutcome
       // npm plugins dropped this start because their package 404s in the
@@ -228,10 +229,17 @@ export async function start({
   platform = process.platform,
   hostIdentity = currentHostIdentity(),
   assertConfigWritable = assertAgentConfigWritable,
+  archiveLogs = archiveContainerLogs,
 }: StartOptions): Promise<StartResult> {
   try {
     const containerName = containerNameFromCwd(cwd)
     const imageTagValue = imageTagFromCwd(cwd)
+    const archiveBeforeRemove = async (containerId: string) =>
+      await archiveLogs({
+        agentDir: cwd,
+        containerId,
+        retentionDays: (await loadTypeclawConfig(cwd)).logs.retentionDays,
+      })
 
     // Probe container state BEFORE refreshing Dockerfile/.gitignore: when the
     // container is already running, start() is a no-op and must not produce
@@ -248,7 +256,14 @@ export async function start({
     // return — no surprise for `compose start` against a partially-up tree.
     await applyBoundGcConfig(cwd)
 
-    if (state.exists && state.running) {
+    if (state.kind === 'malformed') {
+      return {
+        ok: false,
+        reason: `docker inspect returned malformed container identity/state (${state.reason}); preserving container ${containerName} and its logs.`,
+      }
+    }
+
+    if (state.kind === 'present' && state.running) {
       return await reportAlreadyRunning(exec, cwd, containerName)
     }
 
@@ -413,49 +428,29 @@ export async function start({
     const modelsReady = ensureModels()
     modelsReady.catch(() => {})
 
-    if (state.exists) {
-      // Container holds the name but is not running. Without `--rm`, this is
-      // now the normal post-stop / post-crash state: the corpse stays around
-      // for `docker logs` so users can debug a crashed agent. Force-remove
-      // before `docker run --name <same>` so the new launch doesn't collide
-      // on the name. See classifyRmStderr for the benign-failure contract:
-      // 'gone' means the name is already free; 'in-progress' means Docker is
-      // still draining a prior removal and we must wait it out before docker
-      // run, or we'd hit `Conflict. The container name "/<name>" is already
-      // in use` even though our rm "succeeded".
-      //
-      // Even when `docker rm -f` returns exit 0 we MUST wait for the inspect
-      // probe to confirm the name is free. On OrbStack (and occasionally
-      // Docker Desktop) under concurrent load — the canonical case being
-      // `typeclaw compose restart`, which fires N parallel stop→start pairs
-      // — `rm -f` acknowledges the request before the daemon has finished
-      // draining the removal. The container is still listed by `docker ps -a`
-      // (with the same ID Docker reports back in the "Conflict. The container
-      // name … is already in use by container <ID>" error) for tens to
-      // hundreds of milliseconds, and `docker run --name <same>` issued
-      // inside that window deterministically loses the race. waitForRemoval
-      // returns on the first inspect probe in the happy path (one extra
-      // `docker inspect` per start when there was a corpse), so the cost
-      // here is bounded and small.
-      const rm = await exec(['rm', '-f', containerName])
-      if (rm.exitCode !== 0) {
-        const kind = classifyRmStderr(rm.stderr)
-        if (kind === null) {
-          return {
-            ok: false,
-            reason: `Container ${containerName} exists but is not running, and could not be removed: ${sanitizeDockerStderr(rm.stderr) || 'no stderr'}`,
-          }
-        }
-        if (kind === 'in-progress' && !(await waitForRemoval(exec, containerName))) {
-          return {
-            ok: false,
-            reason: `Container ${containerName} is still being removed by docker after 10s; refusing to docker run --name to avoid a name conflict.`,
-          }
-        }
-      } else if (!(await waitForRemoval(exec, containerName))) {
+    if (state.kind === 'present') {
+      // Setup above can take long enough for the historical stopped state to
+      // change. Re-probe immediately before archival/removal and route through
+      // the same ID-keyed, non-force cleanup used by failed docker-run paths.
+      // A container that became running is preserved, while a successful rm is
+      // still followed by waitForRemoval before reusing the name.
+      const cleanup = await cleanupRunCorpse(exec, containerName, archiveBeforeRemove)
+      if (typeof cleanup === 'object') {
         return {
           ok: false,
-          reason: `Container ${containerName} is still being removed by docker after 10s; refusing to docker run --name to avoid a name conflict.`,
+          reason: `Could not archive logs for the stale container: ${cleanup.archiveFailed}. Preserving the Docker container as the source of truth.`,
+        }
+      }
+      if (cleanup === 'running') {
+        return {
+          ok: false,
+          reason: `Container ${containerName} became running during start preflight; preserving it and refusing to launch a replacement.`,
+        }
+      }
+      if (cleanup === 'stuck') {
+        return {
+          ok: false,
+          reason: `Container ${containerName} could not be safely inspected or removed; preserving it and refusing to docker run --name to avoid a conflict.`,
         }
       }
     }
@@ -515,7 +510,7 @@ export async function start({
       }
     }
 
-    let run = await execRunWithConflictRetry(exec, plan.runArgs, cwd, containerName)
+    let run = await execRunWithConflictRetry(exec, plan.runArgs, cwd, containerName, archiveBeforeRemove)
 
     // TOCTOU: another process may have grabbed the port between our probe and
     // `docker run`, or the kernel-assigned port may itself have been claimed.
@@ -529,10 +524,17 @@ export async function start({
     // start but leaves the corpse holding the name. The port-TOCTOU retry
     // would then re-run `docker run --name <same>` and hit a name conflict
     // against that corpse. Clean it up before the retry so the new run sees
-    // a free name. cleanupRunCorpse is safe (only force-removes non-running
-    // same-name containers) and a no-op when the name is already free.
+    // a free name. cleanupRunCorpse is safe: it only targets a freshly-inspected
+    // non-running ID and uses non-force removal, so Docker rejects a running race.
     if (run.exitCode !== 0 && isPortAllocatedError(run.stderr)) {
-      const cleanup = await cleanupRunCorpse(exec, containerName)
+      const cleanup = await cleanupRunCorpse(exec, containerName, archiveBeforeRemove)
+      if (typeof cleanup === 'object') {
+        await cleanupHostDaemonRegistration(containerName, hostd)
+        return {
+          ok: false,
+          reason: `docker run failed (${sanitizeDockerStderr(run.stderr) || 'port bind'}) and its container logs could not be archived: ${cleanup.archiveFailed}. Preserving the failed-run container.`,
+        }
+      }
       if (cleanup === 'running') {
         await cleanupHostDaemonRegistration(containerName, hostd)
         return {
@@ -569,7 +571,7 @@ export async function start({
         tuiToken,
         platform,
       })
-      run = await execRunWithConflictRetry(exec, plan.runArgs, cwd, containerName)
+      run = await execRunWithConflictRetry(exec, plan.runArgs, cwd, containerName, archiveBeforeRemove)
     }
 
     if (run.exitCode !== 0) {
@@ -659,11 +661,10 @@ export async function planStart({
   const cfg = await loadTypeclawConfig(cwd)
   const mounts = cfg.mounts
 
-  // No `--rm`: a crashed container's logs MUST survive past exit so users can
-  // debug the failure. `typeclaw stop` removes the container explicitly, and
-  // the start() preflight force-removes any lingering corpse before the next
-  // launch — so the only state Docker ever sees in `docker ps -a` is either
-  // a running container or one the user has not started again yet.
+  // No `--rm`: a crashed container's logs MUST survive past exit. Lifecycle
+  // cleanup archives them under host-stage <agent>/.typeclaw/logs/ before
+  // removing the container, so restart preserves diagnostics without leaving
+  // a name-blocking corpse in Docker.
   //
   // `--shm-size=2g` is mandatory for the bundled Chrome (agent-browser) to
   // survive heavy pages. Docker's default /dev/shm is 64MB; Chrome uses
@@ -998,15 +999,20 @@ async function imageExists(exec: DockerExec, tag: string): Promise<boolean> {
   return result.exitCode === 0
 }
 
-type InspectedState = { exists: false } | { exists: true; running: boolean }
+type InspectedState =
+  | { kind: 'missing' }
+  | { kind: 'present'; running: boolean; containerId: string }
+  | { kind: 'malformed'; reason: string }
 
 async function inspectContainer(exec: DockerExec, name: string): Promise<InspectedState> {
-  const result = await exec(['inspect', '--format', '{{.State.Running}}', name])
-  if (result.exitCode !== 0) return { exists: false }
-  return { exists: true, running: result.stdout.trim() === 'true' }
+  const result = await exec(['inspect', '--format', '{{.Id}}|{{.State.Running}}', name])
+  if (result.exitCode !== 0) return { kind: 'missing' }
+  const parsed = parseContainerInspectOutput(result.stdout)
+  if (!parsed.ok) return { kind: 'malformed', reason: parsed.reason }
+  return { kind: 'present', running: parsed.running, containerId: parsed.containerId }
 }
 
-// Retries `docker run` on name-conflict responses by FIRST force-removing
+// Retries `docker run` on name-conflict responses by first removing
 // the non-running same-name corpse that's blocking the name. Sleep-only
 // retries (PR #121's earlier approach) cannot recover when the corpse is
 // stable — see isContainerNameConflict's comment for why corpses survive
@@ -1014,12 +1020,13 @@ async function inspectContainer(exec: DockerExec, name: string): Promise<Inspect
 // container record behind, and start()'s own port-TOCTOU retry triggers
 // this path against that corpse).
 //
-// cleanupRunCorpse refuses to touch a running container, so a concurrent
+// cleanupRunCorpse refuses to touch a running container and uses non-force rm,
+// so a container that starts after its inspect probe is also preserved. A concurrent
 // legitimate start of the same name (or a foreign-but-named container the
 // user wants alive) is surfaced as a hard failure rather than silently
 // killed. 'stuck' likewise surfaces — a wedged daemon that won't drain a
-// removal needs the user to act (`docker rm -f <name>` manually, or restart
-// Docker) instead of looping forever.
+// removal needs the user to inspect the container or restart Docker instead of
+// bypassing archive-before-remove safety or looping forever.
 //
 // A bounded backoff (100/200/400/800/1200ms) follows each cleanup before the
 // next `docker run`. waitForRemoval polls `docker inspect`, which can
@@ -1038,12 +1045,20 @@ async function execRunWithConflictRetry(
   runArgs: string[],
   cwd: string,
   containerName: string,
+  beforeRemove: (containerId: string) => Promise<{ ok: true } | { ok: false; reason: string }>,
 ): Promise<DockerExecResult> {
   let last = await exec(runArgs, { cwd })
   for (const backoffMs of CONFLICT_RETRY_BACKOFFS_MS) {
     if (last.exitCode === 0) return last
     if (!isContainerNameConflict(last.stderr)) return last
-    const outcome = await cleanupRunCorpse(exec, containerName)
+    const outcome = await cleanupRunCorpse(exec, containerName, beforeRemove)
+    if (typeof outcome === 'object') {
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: `Container logs could not be archived: ${outcome.archiveFailed}. Preserving the failed-run container.`,
+      }
+    }
     if (outcome === 'running' || outcome === 'stuck') return last
     await new Promise((resolve) => setTimeout(resolve, backoffMs))
     last = await exec(runArgs, { cwd })
