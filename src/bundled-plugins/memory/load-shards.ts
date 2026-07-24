@@ -121,7 +121,10 @@ export async function listShardSlugs(agentDir: string): Promise<string[]> {
   try {
     names = await readdir(topicsDir(agentDir))
   } catch (err) {
-    if (isEnoent(err)) return []
+    // ENOTDIR: a bind-mount/tmpfs coherency hiccup can momentarily replace the
+    // topics dir with a non-directory. Treat it like ENOENT -- not a readable
+    // directory right now -- and degrade to empty instead of hard-erroring.
+    if (isEnoent(err) || isEnotdir(err)) return []
     throw err
   }
 
@@ -179,4 +182,8 @@ function getOrCreateCache(agentDir: string): Map<string, ShardCacheEntry> {
 
 function isEnoent(err: unknown): boolean {
   return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT'
+}
+
+function isEnotdir(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOTDIR'
 }

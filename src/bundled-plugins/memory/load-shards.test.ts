@@ -160,6 +160,24 @@ describe('listShardSlugs', () => {
     await expect(listShardSlugs(agentDir)).resolves.toEqual(['apple'])
     await expect(loadAllShards(agentDir)).resolves.toHaveLength(1)
   })
+
+  test('topics path that is a regular file (ENOTDIR) degrades to empty', async () => {
+    // A bind-mount/tmpfs coherency hiccup can momentarily replace memory/topics
+    // with a non-directory; readdir then throws ENOTDIR. It must degrade like a
+    // missing/empty topics dir rather than propagate a hard error.
+    const agentDir = await makeAgentDir()
+    await mkdir(join(agentDir, 'memory'), { recursive: true })
+    await writeFile(topicsDir(agentDir), 'not a directory', 'utf8')
+
+    await expect(listShardSlugs(agentDir)).resolves.toEqual([])
+  })
+
+  test('a non-ENOENT/non-ENOTDIR readdir error still propagates', async () => {
+    // Guards against over-broadening the catch: only ENOENT and ENOTDIR return
+    // []. A NUL byte in the path makes readdir throw a real, deterministic
+    // ERR_INVALID_ARG_VALUE (no mock, no leak); it must still propagate.
+    await expect(listShardSlugs('/tmp/typeclaw-\u0000-bad')).rejects.toThrow('null bytes')
+  })
 })
 
 describe('loadAllShards shard cache', () => {
