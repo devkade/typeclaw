@@ -6,6 +6,7 @@ import { formatLocalDate } from '@/shared'
 
 import { advanceWatermarkTool, createAppendTool, type FragmentsAppendedHook } from './append-tool'
 import { findEntryTool } from './find-entry-tool'
+import { formatMemorySnapshot } from './memory-snapshot'
 import { streamFilePath, streamsDir } from './paths'
 import { listReferenceSlugs } from './references/load-references'
 import { createStoreReferenceTool, type ReferenceStoredHook } from './references/store-reference-tool'
@@ -352,7 +353,7 @@ export function createMemoryLoggerSubagent(
         await runSession({ userPrompt: buildInitialPrompt(ctx.payload, streamFile, watermark) })
         const fragmentsWritten = (await countFragments(streamFile)) - fragmentsBefore
         logger.info(
-          `[memory-logger] ${ctx.payload.parentSessionId} done fragments_written=${fragmentsWritten} elapsed_ms=${Date.now() - start}`,
+          `[memory-logger] ${ctx.payload.parentSessionId} done fragments_written=${fragmentsWritten} elapsed_ms=${Date.now() - start} ${formatMemorySnapshot()}`,
         )
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)

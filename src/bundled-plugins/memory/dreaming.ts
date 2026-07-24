@@ -26,6 +26,7 @@ import {
 } from './dreaming-state'
 import { parseShard, renderShard, type ShardFrontmatter } from './frontmatter'
 import { listShardSlugs, loadAllShards, loadShard, type TopicShard } from './load-shards'
+import { formatMemorySnapshot } from './memory-snapshot'
 import { referencesDir, streamFilePath, streamsDir, topicShardPath, topicsDir } from './paths'
 import { renderReference } from './references/frontmatter'
 import { loadAllReferences, type Reference } from './references/load-references'
@@ -1477,7 +1478,7 @@ export function createDreamingSubagent(options: CreateDreamingSubagentOptions = 
       try {
         await commit(ctx.payload.agentDir)
         logger.info(
-          `[dreaming] done topics_created=${metrics.topicsCreated} topics_removed=${metrics.topicsRemoved} superseded_new=${metrics.supersededDelta} fragments_dropped=${compaction.fragmentsDropped} over_budget=${overBudget.length} references_demoted=${referencesDemoted} references_evicted=${referencesEvicted} elapsed_ms=${Date.now() - start}`,
+          `[dreaming] done topics_created=${metrics.topicsCreated} topics_removed=${metrics.topicsRemoved} superseded_new=${metrics.supersededDelta} fragments_dropped=${compaction.fragmentsDropped} over_budget=${overBudget.length} references_demoted=${referencesDemoted} references_evicted=${referencesEvicted} elapsed_ms=${Date.now() - start} ${formatMemorySnapshot()}`,
         )
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)

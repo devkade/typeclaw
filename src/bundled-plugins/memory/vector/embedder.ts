@@ -17,6 +17,7 @@ import {
 import { getResolvedTransformersVersion } from '@/models/transformers-version'
 
 import { homeRoot } from '../../../hostd/paths'
+import { formatMemorySnapshot } from '../memory-snapshot'
 import { resolveEmbedThreadCount } from './embed-threads'
 import { type BoundedText, boundEmbeddableText, MAX_MODEL_TOKENS } from './truncation'
 
@@ -231,7 +232,7 @@ function warnIfBounded(results: readonly BoundedText[], type: EmbedType): void {
 const LARGE_EMBED = 256
 
 function logEmbedBatch(count: number, type: EmbedType): void {
-  const line = `[memory] vector embedding: ${count} ${type} input(s) (chunked at ${EMBED_BATCH_SIZE}/pass)`
+  const line = `[memory] vector embedding: ${count} ${type} input(s) (chunked at ${EMBED_BATCH_SIZE}/pass) ${formatMemorySnapshot()}`
   if (count >= LARGE_EMBED) {
     console.info(`${line} — large build, this may take a while`)
   } else {
