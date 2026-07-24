@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { mkdir, readdir, readFile, stat } from 'node:fs/promises'
 
 import { parseShard, type ShardFrontmatter } from './frontmatter'
 import { topicShardPath, topicsDir } from './paths'
@@ -117,14 +117,23 @@ export async function loadShard(
 }
 
 export async function listShardSlugs(agentDir: string): Promise<string[]> {
+  const dir = topicsDir(agentDir)
   let names: string[]
   try {
-    names = await readdir(topicsDir(agentDir))
+    names = await readdir(dir)
   } catch (err) {
+    // ENOENT: the topics dir doesn't exist yet (fresh agent, or a wiped memory
+    // tree). Self-heal by recreating it so every downstream reader -- per-turn
+    // injection, memory_search, dreaming, the startup index build, and the
+    // doctor vector-index check -- sees a real, empty directory instead of a
+    // missing one. mkdir is idempotent, so a lost race just no-ops.
+    if (isEnoent(err)) return healMissingTopicsDir(dir)
     // ENOTDIR: a bind-mount/tmpfs coherency hiccup can momentarily replace the
-    // topics dir with a non-directory. Treat it like ENOENT -- not a readable
-    // directory right now -- and degrade to empty instead of hard-erroring.
-    if (isEnoent(err) || isEnotdir(err)) return []
+    // topics dir (or a parent path component) with a non-directory; readdir
+    // then throws ENOTDIR. We can't self-heal this -- mkdir over a regular file
+    // would either fail or clobber operator data -- so degrade to empty and let
+    // the transient host state resolve itself, exactly as before.
+    if (isEnotdir(err)) return []
     throw err
   }
 
@@ -132,6 +141,18 @@ export async function listShardSlugs(agentDir: string): Promise<string[]> {
     .filter((name) => name.endsWith('.md'))
     .map((name) => name.slice(0, -'.md'.length))
     .sort()
+}
+
+async function healMissingTopicsDir(dir: string): Promise<string[]> {
+  try {
+    await mkdir(dir, { recursive: true })
+  } catch (err) {
+    // A concurrent healer already created it, or the parent briefly became a
+    // non-directory. Either way the empty-list contract still holds; never let
+    // the heal attempt turn a self-healing state into a hard error.
+    if (!isEnotdir(err)) throw err
+  }
+  return []
 }
 
 // Test-only helper. Clears the in-memory shard cache so tests that exercise
