@@ -807,4 +807,63 @@ describe('git-exfil guard', () => {
       expect(push?.reason).not.toContain('A'.repeat(500))
     })
   })
+
+  // -- directory-independence regression suite --------------------------------
+  // The guard sees only the command string; it has no working directory and no
+  // resolved git repository identity. A `/tmp` checkout is NOT a trusted
+  // boundary (an earlier turn may have copied identity files/secrets into it),
+  // and the effective repository is unknowable from the string (`git -C`,
+  // `--git-dir`, `GIT_DIR`, `cd`, subshells). These assert the guard stays
+  // blanket — any attempt to "scope" the push block by cwd/path must fail one
+  // of these before it ships.
+  describe('directory independence (no cwd/path scoping)', () => {
+    test('blocks push after cd to an external clone', () => {
+      const result = checkGitExfilGuard({ tool: 'bash', args: { command: 'cd /tmp/some-clone && git push' } })
+      expect(result?.block).toBe(true)
+      expect(result?.reason).toContain(GUARD_GIT_EXFIL)
+    })
+
+    test('blocks git -C <external-path> push', () => {
+      expect(checkGitExfilGuard({ tool: 'bash', args: { command: 'git -C /tmp/some-clone push' } })?.block).toBe(true)
+    })
+
+    test('blocks git -C into a path that may symlink back to the agent folder', () => {
+      expect(checkGitExfilGuard({ tool: 'bash', args: { command: 'git -C /tmp/link-to-agent push' } })?.block).toBe(
+        true,
+      )
+    })
+
+    test('blocks --git-dir / --work-tree redirection at the agent folder', () => {
+      expect(
+        checkGitExfilGuard({
+          tool: 'bash',
+          args: { command: 'git --git-dir=/agent/.git --work-tree=/agent push' },
+        })?.block,
+      ).toBe(true)
+    })
+
+    test('blocks GIT_DIR env-var redirection before git push', () => {
+      expect(checkGitExfilGuard({ tool: 'bash', args: { command: 'GIT_DIR=/agent/.git git push' } })?.block).toBe(true)
+    })
+
+    test('blocks gh repo create --source=/agent --push from any cwd', () => {
+      expect(
+        checkGitExfilGuard({
+          tool: 'bash',
+          args: { command: 'gh repo create my-backup --source=/agent --push' },
+        })?.block,
+      ).toBe(true)
+    })
+
+    test('blocks push after pushd to an external path', () => {
+      expect(checkGitExfilGuard({ tool: 'bash', args: { command: 'pushd /tmp/x && git push' } })?.block).toBe(true)
+    })
+
+    test('block reason no longer claims the command necessarily concerns the agent folder', () => {
+      const result = checkGitExfilGuard({ tool: 'bash', args: { command: 'git push origin main' } })
+      expect(result?.block).toBe(true)
+      expect(result?.reason).not.toContain('agent-folder exfiltration')
+      expect(result?.reason).toContain('regardless of working directory')
+    })
+  })
 })
