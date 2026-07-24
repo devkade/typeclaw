@@ -6,6 +6,7 @@ import { join } from 'node:path'
 // values are pulled lazily via `loadTransformers()` below.
 import type { env as TransformersEnvValue, pipeline as TransformersPipeline } from '@huggingface/transformers'
 
+import { createKeyedSemaphore } from '@/agent/tools/keyed-semaphore'
 import {
   assertModelCacheCompatible,
   EMBEDDING_DIMS,
@@ -35,6 +36,21 @@ export type EmbedType = 'query' | 'passage'
 // caps peak memory at one batch's worth regardless of corpus size; the model is
 // loaded once and reused across chunks, so the only cost is sequential passes.
 const EMBED_BATCH_SIZE = 64
+
+// Concurrent embeds inside inference at once, process-wide. The intra-op thread
+// cap (embed-threads.ts) bounds ONE embed's footprint, but nothing bounded how
+// MANY embeds run at once: a busy channel turn's hybridSearch, a dreaming pass,
+// and a memory-logger append can all be inside the shared ONNX session
+// simultaneously (concurrent `Run()` is allowed on the Node backend), stacking
+// their activation memory into one RSS spike that the OOM killer takes with a
+// bare SIGKILL. This caps that stack. Chosen 2, not 1: the workload is
+// latency-sensitive per-turn query embeds, so a hard serial would park a live
+// turn behind a whole dreaming batch; 2 keeps one lane free while still bounding
+// the worst-case multiplier. Single fixed key — the limit is global, not
+// per-key.
+const EMBED_CONCURRENCY = 2
+const EMBED_SEMAPHORE_KEY = 'embed'
+const embedSemaphore = createKeyedSemaphore({ concurrency: EMBED_CONCURRENCY })
 
 type TransformersEnv = typeof TransformersEnvValue
 type FeatureExtractor = Awaited<ReturnType<typeof TransformersPipeline<'feature-extraction'>>>
@@ -154,14 +170,16 @@ export class Embedder {
     // upserts) finish in a pass or two and would only spam the logs.
     const reportProgress = prefixed.length >= LARGE_EMBED
 
-    const embeddings: Float32Array[] = []
-    for (let start = 0; start < prefixed.length; start += EMBED_BATCH_SIZE) {
-      const batch = prefixed.slice(start, start + EMBED_BATCH_SIZE)
-      const output = await this.extractor(batch, { pooling: 'mean', normalize: true })
-      embeddings.push(...toEmbeddings(output.data, batch.length))
-      if (reportProgress) logEmbedProgress(embeddings.length, prefixed.length, type)
-    }
-    return embeddings
+    return embedSemaphore.run(EMBED_SEMAPHORE_KEY, async () => {
+      const embeddings: Float32Array[] = []
+      for (let start = 0; start < prefixed.length; start += EMBED_BATCH_SIZE) {
+        const batch = prefixed.slice(start, start + EMBED_BATCH_SIZE)
+        const output = await this.extractor(batch, { pooling: 'mean', normalize: true })
+        embeddings.push(...toEmbeddings(output.data, batch.length))
+        if (reportProgress) logEmbedProgress(embeddings.length, prefixed.length, type)
+      }
+      return embeddings
+    })
   }
 }
 
