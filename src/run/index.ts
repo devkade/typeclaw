@@ -88,6 +88,7 @@ import { buildChannelSessionFactory } from './channel-session-factory'
 import { installFatalGuard } from './fatal-guard'
 import { installLlmFetchObserver } from './llm-fetch-observer'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
+import { logResourceReport } from './resource-report'
 
 type BunServer = ReturnType<Server['start']>
 
@@ -302,6 +303,10 @@ async function startAgentRuntime(
     getGithubAppSelfLogin: githubTokenBridge.getAppSelfLogin,
     ...(cwdConfig.roles !== undefined ? { roles: cwdConfig.roles } : {}),
   })
+  // Emit the container's fixed resource limits BEFORE vector startup. The
+  // startup index build is itself an OOM path; if it kills the process, this
+  // line must already be in the log so the ceiling is still recorded.
+  logResourceReport(cwd)
   const vectorStartupPromise = runVectorStartup(cwd)
   let pluginsLoaded: LoadPluginsResult
   try {
