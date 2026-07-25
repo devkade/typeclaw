@@ -106,21 +106,27 @@ const slackChannelRootOrigin: ChannelReplyOrigin = {
 type ChannelReplyParams = {
   text?: string
   attachments?: { path: string; filename?: string }[]
-  continue: boolean
+  more_work_this_turn: boolean
   resolve_review_thread?: boolean
 }
 
 const fakeCtx = {} as Parameters<ReturnType<typeof createChannelReplyTool>['execute']>[4]
 
-// `continue` is schema-required; this helper defaults it to `false` (terminal) so
-// tests not exercising the continue path stay terse. Keep the divergence.
+// `more_work_this_turn` is schema-required; this helper defaults it to `false` (terminal) so
+// tests not exercising the more_work_this_turn path stay terse. Keep the divergence.
 async function runTool(
   tool: ReturnType<typeof createChannelReplyTool>,
-  params: Omit<ChannelReplyParams, 'continue'> & {
-    continue?: boolean
+  params: Omit<ChannelReplyParams, 'more_work_this_turn'> & {
+    more_work_this_turn?: boolean
   },
 ) {
-  return tool.execute('id', { ...params, continue: params.continue ?? false }, undefined, undefined, fakeCtx)
+  return tool.execute(
+    'id',
+    { ...params, more_work_this_turn: params.more_work_this_turn ?? false },
+    undefined,
+    undefined,
+    fakeCtx,
+  )
 }
 
 describe('createChannelReplyTool', () => {
@@ -172,13 +178,13 @@ describe('createChannelReplyTool', () => {
     expect(result.details).toMatchObject({ ok: true })
   })
 
-  test('combines continue with messageId when a mid-turn ack carries an id', async () => {
+  test('combines more_work_this_turn with messageId when a mid-turn ack carries an id', async () => {
     const tool = createChannelReplyTool({
       router: fakeRouter(async () => ({ ok: true, messageId: 'ts9', messageIds: ['ts9'] })),
       origin: slackThreadOrigin,
     })
-    const result = await runTool(tool, { text: 'working on it', continue: true })
-    expect(result.details).toEqual({ ok: true, continue: true, messageId: 'ts9', messageIds: ['ts9'] })
+    const result = await runTool(tool, { text: 'working on it', more_work_this_turn: true })
+    expect(result.details).toEqual({ ok: true, more_work_this_turn: true, messageId: 'ts9', messageIds: ['ts9'] })
   })
 
   test('passes thread=null verbatim when origin is a channel-root session', async () => {
@@ -428,17 +434,17 @@ describe('createChannelReplyTool', () => {
     expect(tool.description).toContain('default way to respond')
   })
 
-  describe('continue flag (mid-turn status reply)', () => {
-    test('surfaces continue: true in details so the router keeps the turn alive', async () => {
+  describe('more_work_this_turn flag (mid-turn status reply)', () => {
+    test('surfaces more_work_this_turn: true in details so the router keeps the turn alive', async () => {
       const tool = createChannelReplyTool({
         router: fakeRouter(async () => ({ ok: true })),
         origin: slackThreadOrigin,
       })
-      const result = await runTool(tool, { text: 'working on it…', continue: true })
-      expect(result.details).toEqual({ ok: true, continue: true })
+      const result = await runTool(tool, { text: 'working on it…', more_work_this_turn: true })
+      expect(result.details).toEqual({ ok: true, more_work_this_turn: true })
     })
 
-    test('omits continue from details by default so the reply stays terminal', async () => {
+    test('omits more_work_this_turn from details by default so the reply stays terminal', async () => {
       const tool = createChannelReplyTool({
         router: fakeRouter(async () => ({ ok: true })),
         origin: slackThreadOrigin,
@@ -447,30 +453,30 @@ describe('createChannelReplyTool', () => {
       expect(result.details).toEqual({ ok: true })
     })
 
-    test('continue: false stays terminal (only true keeps the turn alive)', async () => {
+    test('more_work_this_turn: false stays terminal (only true keeps the turn alive)', async () => {
       const tool = createChannelReplyTool({
         router: fakeRouter(async () => ({ ok: true })),
         origin: slackThreadOrigin,
       })
-      const result = await runTool(tool, { text: 'done', continue: false })
+      const result = await runTool(tool, { text: 'done', more_work_this_turn: false })
       expect(result.details).toEqual({ ok: true })
     })
 
-    test('a denied reply never carries continue (no turn to keep alive)', async () => {
+    test('a denied reply never carries more_work_this_turn (no turn to keep alive)', async () => {
       const tool = createChannelReplyTool({
         router: fakeRouter(async () => ({ ok: false, error: 'denied by allow rules' })),
         origin: slackThreadOrigin,
       })
-      const result = await runTool(tool, { text: 'nope', continue: true })
+      const result = await runTool(tool, { text: 'nope', more_work_this_turn: true })
       expect(result.details).toEqual({ ok: false, error: 'denied by allow rules' })
     })
 
-    test('continue is the one required parameter (so the schema rejects a reply that omits it)', () => {
+    test('more_work_this_turn is the one required parameter (so the schema rejects a reply that omits it)', () => {
       const tool = createChannelReplyTool({
         router: fakeRouter(async () => ({ ok: true })),
         origin: slackThreadOrigin,
       })
-      expect((tool.parameters as { required?: readonly string[] }).required).toEqual(['continue'])
+      expect((tool.parameters as { required?: readonly string[] }).required).toEqual(['more_work_this_turn'])
     })
   })
 
@@ -969,7 +975,7 @@ describe('channel_reply resolve_review_thread required-choice enforcement', () =
     expect(result.details).toEqual({ ok: true })
   })
 
-  test('exempts a mid-turn status reply (continue:true) from the required choice', async () => {
+  test('exempts a mid-turn status reply (more_work_this_turn:true) from the required choice', async () => {
     const calls: OutboundMessage[] = []
     const tool = createChannelReplyTool({
       router: fakeRouter(async (msg) => {
@@ -979,10 +985,10 @@ describe('channel_reply resolve_review_thread required-choice enforcement', () =
       origin: githubThreadOrigin,
     })
 
-    const result = await runTool(tool, { text: 'On it — checking the diff now.', continue: true })
+    const result = await runTool(tool, { text: 'On it — checking the diff now.', more_work_this_turn: true })
 
     expect(calls).toHaveLength(1)
-    expect(result.details).toEqual({ ok: true, continue: true })
+    expect(result.details).toEqual({ ok: true, more_work_this_turn: true })
   })
 
   test('exempts an attachments-only github review-thread reply (no text to acknowledge)', async () => {

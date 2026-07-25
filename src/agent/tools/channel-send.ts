@@ -185,7 +185,7 @@ export function createChannelSendTool({
       // via channel_send, and the model kept acknowledging "addressed" without
       // the flag, stranding the thread — channel_reply forced the choice but
       // channel_send did not, so the most-used resolve path was the least
-      // guarded. A send is always terminal, so there is no continue exemption.
+      // guarded. A send is always terminal, so there is no more-work exemption.
       const missingResolveChoice = missingReviewThreadResolveChoiceError({
         adapter,
         chat: params.chat,
@@ -209,7 +209,7 @@ export function createChannelSendTool({
         chat: params.chat,
         thread: params.thread ?? null,
         text: bodyText,
-        isContinue: false,
+        moreWorkThisTurn: false,
         resolveReviewThread: wantsResolve,
       })
       if (falseReceipt.kind === 'block') {
@@ -231,7 +231,7 @@ export function createChannelSendTool({
         thread: params.thread ?? null,
         text: bodyText,
         wantsResolve,
-        isContinue: false,
+        moreWorkThisTurn: false,
         getReviewState: (req) => router.getReviewState(req),
       })
       if (rereview.block) {

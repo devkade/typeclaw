@@ -86,7 +86,7 @@ const prOrigin: ChannelReplyOrigin = { adapter: 'github', workspace: WS, chat: '
 type ChannelReplyParams = {
   text?: string
   attachments?: { path: string; filename?: string }[]
-  continue: boolean
+  more_work_this_turn: boolean
   resolve_review_thread?: boolean
 }
 
@@ -98,11 +98,17 @@ function tool(onSend?: (msg: OutboundMessage) => SendResult, origin: ChannelRepl
 
 async function run(
   t: ReturnType<typeof createChannelReplyTool>,
-  params: Omit<ChannelReplyParams, 'continue'> & {
-    continue?: boolean
+  params: Omit<ChannelReplyParams, 'more_work_this_turn'> & {
+    more_work_this_turn?: boolean
   },
 ) {
-  return t.execute('id', { ...params, continue: params.continue ?? false }, undefined, undefined, fakeCtx)
+  return t.execute(
+    'id',
+    { ...params, more_work_this_turn: params.more_work_this_turn ?? false },
+    undefined,
+    undefined,
+    fakeCtx,
+  )
 }
 
 describe('channel_reply false-receipt guard', () => {
