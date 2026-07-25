@@ -1,5 +1,5 @@
-import { hooklessGitArgs } from '@/git/hookless'
 import { resolveAgentGit } from '@/git/resolve-agent-git'
+import { runGit } from '@/git/run'
 
 const MAX_LISTED_PATHS = 10
 
@@ -65,22 +65,14 @@ function filterAgentOwned(paths: readonly string[]): string[] {
   return paths.filter((p) => !RUNTIME_OWNED_PREFIXES.some((prefix) => p.startsWith(prefix)))
 }
 
-// Mirrors the spawn pattern in `src/container/start.ts` `commitSystemFile`.
 const defaultDeps: GitNudgeDeps = {
   async readStatus(agentDir, gitArgs) {
     const bun = getBun()
     if (!bun) return null
     try {
-      const proc = bun.spawn({
-        cmd: ['git', ...hooklessGitArgs([...gitArgs, 'status', '--porcelain=v1'])],
-        cwd: agentDir,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      })
-      const exit = await proc.exited
-      if (exit !== 0) return null
-      const text = await new Response(proc.stdout).text()
-      return parsePorcelain(text)
+      const { exitCode, stdout } = await runGit(bun, agentDir, [...gitArgs, 'status', '--porcelain=v1'])
+      if (exitCode !== 0) return null
+      return parsePorcelain(stdout)
     } catch {
       return null
     }

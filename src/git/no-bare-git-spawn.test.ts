@@ -54,7 +54,11 @@ describe('runtime git invocation guard', () => {
     for (const file of RUNTIME_COMMIT_PATHS) {
       const source = await readFile(join(process.cwd(), file), 'utf8')
       expect(source, file).toContain("'commit'")
-      expect(source, file).toContain('hooklessGitArgs')
+      // The hookless invariant is satisfied either directly (a raw spawn using
+      // hooklessGitArgs) or via the shared `runGit` helper, which applies
+      // hooklessGitArgs internally AND drains both pipes to avoid fd leaks.
+      const hookless = source.includes('hooklessGitArgs') || source.includes('runGit(')
+      expect(hookless, file).toBe(true)
     }
   })
 

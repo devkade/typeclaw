@@ -5,9 +5,9 @@ import { basename, join } from 'node:path'
 
 import { z } from 'zod'
 
-import { hooklessGitArgs } from '@/git/hookless'
 import { withGitLock } from '@/git/mutex'
 import { type AgentGit, resolveAgentGit } from '@/git/resolve-agent-git'
+import { runGit } from '@/git/run'
 import { defineTool, lsTool, readTool, type Subagent, writeTool } from '@/plugin'
 import { formatLocalDate, formatLocalDateTime } from '@/shared'
 
@@ -774,13 +774,8 @@ async function commitMemorySnapshotUnlocked(cwd: string): Promise<void> {
     return
   }
 
-  const add = bun.spawn({
-    cmd: ['git', ...hooklessGitArgs([...repo.gitArgs, 'add', '-f', '--', ...presentPaths])],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  if ((await add.exited) !== 0) {
+  const add = await runGit(bun, cwd, [...repo.gitArgs, 'add', '-f', '--', ...presentPaths])
+  if (add.exitCode !== 0) {
     await applySkipWorktree(bun, cwd, repo)
     return
   }
@@ -789,21 +784,20 @@ async function commitMemorySnapshotUnlocked(cwd: string): Promise<void> {
   // pathspec only references files git knows about. `git commit -- foo bar/`
   // fails outright when `bar/` matches no tracked file, even if `foo` is
   // staged.
-  const stagedNames = bun.spawn({
-    cmd: [
-      'git',
-      ...hooklessGitArgs([...repo.gitArgs, 'diff', '--cached', '--name-only', '-z', '--', ...SNAPSHOT_PATHS]),
-    ],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  const stagedRaw = await new Response(stagedNames.stdout).text()
-  if ((await stagedNames.exited) !== 0) {
+  const stagedNames = await runGit(bun, cwd, [
+    ...repo.gitArgs,
+    'diff',
+    '--cached',
+    '--name-only',
+    '-z',
+    '--',
+    ...SNAPSHOT_PATHS,
+  ])
+  if (stagedNames.exitCode !== 0) {
     await applySkipWorktree(bun, cwd, repo)
     return
   }
-  const staged = stagedRaw.split('\0').filter((p) => p.length > 0)
+  const staged = stagedNames.stdout.split('\0').filter((p) => p.length > 0)
   if (staged.length === 0) {
     await applySkipWorktree(bun, cwd, repo)
     return
@@ -811,13 +805,7 @@ async function commitMemorySnapshotUnlocked(cwd: string): Promise<void> {
 
   const message = await buildCommitMessage(bun, cwd, staged, undefined, repo.gitArgs)
 
-  const commit = bun.spawn({
-    cmd: ['git', ...hooklessGitArgs([...repo.gitArgs, 'commit', '-m', message, '--only', '--', ...staged])],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  await commit.exited
+  await runGit(bun, cwd, [...repo.gitArgs, 'commit', '-m', message, '--only', '--', ...staged])
 
   await applySkipWorktree(bun, cwd, repo)
 }
@@ -868,14 +856,9 @@ async function buildDreamSummary(
 ): Promise<string> {
   // numstat: `<added>\t<deleted>\t<path>` per line. Use NUL-terminated so paths
   // with whitespace round-trip; -z switches the record separator to NUL.
-  const numstat = bun.spawn({
-    cmd: ['git', ...hooklessGitArgs([...gitArgs, 'diff', '--cached', '--numstat', '-z', '--', ...staged])],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  const raw = await new Response(numstat.stdout).text()
-  if ((await numstat.exited) !== 0) return 'snapshot'
+  const numstat = await runGit(bun, cwd, [...gitArgs, 'diff', '--cached', '--numstat', '-z', '--', ...staged])
+  if (numstat.exitCode !== 0) return 'snapshot'
+  const raw = numstat.stdout
 
   let fragmentLines = 0
   const streamPaths = new Set<string>()
@@ -925,14 +908,9 @@ async function listNewlyAddedSkills(
   staged: string[],
   gitArgs: readonly string[] = [],
 ): Promise<string[]> {
-  const proc = bun.spawn({
-    cmd: ['git', ...hooklessGitArgs([...gitArgs, 'diff', '--cached', '--name-status', '-z', '--', ...staged])],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  const raw = await new Response(proc.stdout).text()
-  if ((await proc.exited) !== 0) return []
+  const proc = await runGit(bun, cwd, [...gitArgs, 'diff', '--cached', '--name-status', '-z', '--', ...staged])
+  if (proc.exitCode !== 0) return []
+  const raw = proc.stdout
 
   // `--name-status -z` interleaves status and path as separate NUL records:
   // `A\0path\0M\0other\0...`. Pair them up.
@@ -953,39 +931,21 @@ async function listTrackedSnapshotFiles(
   cwd: string,
   repo: AgentGit,
 ): Promise<string[]> {
-  const ls = bun.spawn({
-    cmd: ['git', ...hooklessGitArgs([...repo.gitArgs, 'ls-files', '-z', '--', ...SNAPSHOT_PATHS])],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  if ((await ls.exited) !== 0) return []
-  const raw = await new Response(ls.stdout).text()
-  return raw.split('\0').filter((p) => p.length > 0)
+  const ls = await runGit(bun, cwd, [...repo.gitArgs, 'ls-files', '-z', '--', ...SNAPSHOT_PATHS])
+  if (ls.exitCode !== 0) return []
+  return ls.stdout.split('\0').filter((p) => p.length > 0)
 }
 
 async function clearSkipWorktree(bun: { spawn: typeof Bun.spawn }, cwd: string, repo: AgentGit): Promise<void> {
   const files = await listTrackedSnapshotFiles(bun, cwd, repo)
   if (files.length === 0) return
-  const proc = bun.spawn({
-    cmd: ['git', ...hooklessGitArgs([...repo.gitArgs, 'update-index', '--no-skip-worktree', '--', ...files])],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  await proc.exited
+  await runGit(bun, cwd, [...repo.gitArgs, 'update-index', '--no-skip-worktree', '--', ...files])
 }
 
 async function applySkipWorktree(bun: { spawn: typeof Bun.spawn }, cwd: string, repo: AgentGit): Promise<void> {
   const files = await listTrackedSnapshotFiles(bun, cwd, repo)
   if (files.length === 0) return
-  const proc = bun.spawn({
-    cmd: ['git', ...hooklessGitArgs([...repo.gitArgs, 'update-index', '--skip-worktree', '--', ...files])],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  await proc.exited
+  await runGit(bun, cwd, [...repo.gitArgs, 'update-index', '--skip-worktree', '--', ...files])
 }
 
 export const DREAMING_SYSTEM_PROMPT = `You are typeclaw's dreaming subagent.
