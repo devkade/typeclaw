@@ -16,7 +16,7 @@ function base(over: Partial<Parameters<typeof checkFalseReceipt>[0]> = {}): Para
     chat: 'pr:12',
     thread: null,
     text: '',
-    isContinue: false,
+    moreWorkThisTurn: false,
     resolveReviewThread: false,
     ...over,
   }
@@ -51,8 +51,8 @@ describe('checkFalseReceipt — verdict false receipts', () => {
     expect(checkFalseReceipt(base({ text: 'Requesting changes here.' })).kind).toBe('block')
   })
 
-  test('continue:true downgrades a hard verdict claim to a warn', () => {
-    expect(checkFalseReceipt(base({ text: 'Approved!', isContinue: true })).kind).toBe('warn')
+  test('more_work_this_turn:true downgrades a hard verdict claim to a warn', () => {
+    expect(checkFalseReceipt(base({ text: 'Approved!', moreWorkThisTurn: true })).kind).toBe('warn')
   })
 
   test('soft signal warns, never blocks', () => {

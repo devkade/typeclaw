@@ -6625,7 +6625,7 @@ describe('ChannelRouter channel-turn protocol', () => {
   })
 
   test('leaf recovery: DOES fire when a progress reply landed but the final answer ended as plain prose', async () => {
-    // The production bug: a `continue: true` progress reply lands, the model
+    // The production bug: a `more_work_this_turn: true` progress reply lands, the model
     // keeps working, then ENDS the turn with its conclusion as plain assistant
     // text (a `stopReason: 'stop'` leaf) and never calls a channel tool again.
     // The conclusion must be recovered and delivered, not dropped.
@@ -6954,7 +6954,7 @@ describe('ChannelRouter channel-turn protocol', () => {
   })
 
   // Regression for the "I'll check right now" → silence bug (Discord channel,
-  // 2026-06-15). The model posted a `continue: true` status reply ("지금 바로
+  // 2026-06-15). The model posted a `more_work_this_turn: true` status reply ("지금 바로
   // 확인할게"), kept working through several tool calls, then its post-tool
   // follow-up stream was aborted before it could conclude. The session leaf was
   // a toolResult under an unanswered `stopReason: 'toolUse'` assistant carrying
@@ -7028,7 +7028,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     sessions[0]!.onPrompt = async (text) => {
       attempt++
       if (attempt === 1) {
-        // The status reply (the `continue: true` "I'll check now") lands as a
+        // The status reply (the `more_work_this_turn: true` "I'll check now") lands as a
         // real send, then the turn strands on the unanswered toolUse.
         await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '지금 바로 확인할게.' })
         strandOnUnansweredToolUse()
@@ -13500,7 +13500,7 @@ describe('ChannelRouter per-turn live role anchor', () => {
 describe('ChannelRouter post-tool follow-up suppression', () => {
   function afterToolContext(
     toolName: string,
-    result: { ok: boolean; continue?: boolean },
+    result: { ok: boolean; more_work_this_turn?: boolean },
     isError: boolean,
     replyText?: string,
   ): AfterToolCallContext {
@@ -13538,9 +13538,9 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     expect(agent.signal.aborted).toBe(true)
   })
 
-  test('does NOT abort when channel_reply opts out with continue: true', async () => {
+  test('does NOT abort when channel_reply opts out with more_work_this_turn: true', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true, continue: true }, false))
+    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false))
     expect(agent.signal.aborted).toBe(false)
   })
 
@@ -13574,10 +13574,10 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     expect(agent.signal.aborted).toBe(true)
   })
 
-  test('does NOT stash when continue:true (the turn stays alive, no nudge needed)', async () => {
+  test('does NOT stash when more_work_this_turn:true (the turn stays alive, no nudge needed)', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
     await agent.afterToolCall!(
-      afterToolContext('channel_reply', { ok: true, continue: true }, false, '바로 계속 확인하겠습니다'),
+      afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false, '바로 계속 확인하겠습니다'),
     )
     expect(agent.signal.aborted).toBe(false)
   })
@@ -13612,7 +13612,7 @@ describe('ChannelRouter continuation willingness nudge', () => {
     session.setAssistantMidTurn(replyText, 'aborted')
   }
 
-  test('queues a nudge when a terminal reply promises to continue without continue:true', async () => {
+  test('queues a nudge when a terminal reply promises to continue without more_work_this_turn:true', async () => {
     const dir = await tempDir()
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir)
@@ -13625,7 +13625,7 @@ describe('ChannelRouter continuation willingness nudge', () => {
     let attempt = 0
     sessions[0]!.onPrompt = async (text) => {
       attempt++
-      // given: first turn replies with a continuation promise (no continue:true)
+      // given: first turn replies with a continuation promise (no more_work_this_turn:true)
       if (attempt === 1) {
         await replyTurn(sessions[0]!, router, '바로 계속 확인하겠습니다')
         return
@@ -13660,7 +13660,7 @@ describe('ChannelRouter continuation willingness nudge', () => {
 
     await router.route(inbound({ text: '확인해봐' }))
     sessions[0]!.onPrompt = async () => {
-      // Every turn promises to continue without continue:true. Bound = 1, so
+      // Every turn promises to continue without more_work_this_turn:true. Bound = 1, so
       // only the first reply turn may queue a nudge; the nudge turn's own reply
       // must NOT queue a second one.
       await replyTurn(sessions[0]!, router, '바로 계속 확인하겠습니다')
@@ -13838,7 +13838,7 @@ describe('ChannelRouter channel_send willingness nudge', () => {
   })
 })
 
-describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)', () => {
+describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-independent)', () => {
   function continueReplyContext(replyText: string): AfterToolCallContext {
     return {
       assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
@@ -13851,14 +13851,14 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
       args: { text: replyText },
       result: {
         content: [{ type: 'text' as const, text: 'ignored' }],
-        details: { ok: true, continue: true },
+        details: { ok: true, more_work_this_turn: true },
       } as AfterToolCallContext['result'],
       isError: false,
       context: { systemPrompt: '', messages: [], tools: [] },
     }
   }
 
-  // Reproduce the production order for a channel_reply({ continue: true }): the tool's
+  // Reproduce the production order for a channel_reply({ more_work_this_turn: true }): the tool's
   // execute() calls router.send() (which bumps successfulChannelSends) BEFORE the
   // runtime fires afterToolCall (which stamps continueReplyTurn with that post-send
   // count). Then install a fresh empty-stop-after-tool-work leaf — the degeneration.
@@ -13873,7 +13873,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     emptyStopAfterToolWork(session, id)
   }
 
-  test('recovers a continue:true ack whose phrasing is OUTSIDE the willingness table', async () => {
+  test('recovers a more_work_this_turn:true ack whose phrasing is OUTSIDE the willingness table', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
@@ -13888,7 +13888,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     sessions[0]!.onPrompt = async (text) => {
       attempt++
       if (attempt === 1) {
-        // given: a continue:true progress ack with NO willingness phrase (casual
+        // given: a more_work_this_turn:true progress ack with NO willingness phrase (casual
         // Korean "훑어볼게" is not in the phrase table), then tool work, then a
         // fresh empty stop — the phrase-gated path can't see this promise.
         await continueReplyThenStrand(sessions[0]!, router, '응 persona 흔적 파일들 훑어볼게', String(attempt))
@@ -13908,7 +13908,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     ).toBe(true)
   })
 
-  test('posts the fallback instead of looping when the continue:true retry re-strands', async () => {
+  test('posts the fallback instead of looping when the more_work_this_turn:true retry re-strands', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
@@ -13922,7 +13922,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     let attempt = 0
     sessions[0]!.onPrompt = async () => {
       attempt++
-      // Every turn re-acks continue:true (distinct text to dodge the send dup-guard)
+      // Every turn re-acks more_work_this_turn:true (distinct text to dodge the send dup-guard)
       // and re-strands on an empty stop. Bound = MAX_WILLINGNESS_NUDGES: one nudge,
       // then the visible fallback instead of silence.
       await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${attempt})`, String(attempt))
@@ -13937,7 +13937,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
   })
 
   test('self-recovery: a continuation that lands the real answer after willingness exhaustion discards the staged fallback', async () => {
-    // Reproduces the production Discord false alarm: the model acked continue:true,
+    // Reproduces the production Discord false alarm: the model acked more_work_this_turn:true,
     // did tool work, stranded on an empty stop, exhausted the single willingness
     // nudge — then the idle/todo continuation re-prompted the SAME logical turn and
     // delivered the real answer. The staged fallback must be discarded, never posted.
@@ -14065,7 +14065,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
 
   test('cross-turn escalation: a willingness-exhaustion staged fallback question turn does not seed the next turn', async () => {
     // Mirrors the retry-exhausted fallback question-turn test through the STAGED
-    // willingness path. given: turn A is a question whose continue:true ack strands
+    // willingness path. given: turn A is a question whose more_work_this_turn:true ack strands
     // on every attempt until the willingness budget is exhausted and — with NO
     // continuation queued — the staged fallback posts (no usable reply). turn B is a
     // question. The staged-then-posted fallback must NOT commit A's question signal,
@@ -14080,7 +14080,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
       return { ok: true }
     })
 
-    // turn A — a question that acks continue:true then re-strands until exhaustion
+    // turn A — a question that acks more_work_this_turn:true then re-strands until exhaustion
     await router.route(inbound({ text: 'why did the deployment fail on the staging cluster?' }))
     let aAttempt = 0
     sessions[0]!.onPrompt = async () => {
@@ -14214,7 +14214,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     expect(sessions[0]!.thinkingLevels).not.toContain('xhigh')
   })
 
-  test('retries once after a continue:true progress reply and suppresses the warning when the final reply succeeds', async () => {
+  test('retries once after a more_work_this_turn:true progress reply and suppresses the warning when the final reply succeeds', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
@@ -14254,7 +14254,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     expect(logs.some((m) => m.includes('send_willingness_nudge'))).toBe(false)
   })
 
-  test('/stop during post-tool retry backoff invalidates the continue:true authorization', async () => {
+  test('/stop during post-tool retry backoff invalidates the more_work_this_turn:true authorization', async () => {
     const dir = await tempDir()
     const sent: string[] = []
     let signalBackoffStart: () => void = () => {}
@@ -14398,7 +14398,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     expect(sent.some((text) => text.startsWith('⚠️'))).toBe(false)
   })
 
-  test('suppresses a provider error after a final reply follows the continue:true progress reply', async () => {
+  test('suppresses a provider error after a final reply follows the more_work_this_turn:true progress reply', async () => {
     const dir = await tempDir()
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir)
@@ -14425,7 +14425,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     expect(sent).toEqual(['찾아볼게.', '지난 기록은 이 내용이야.'])
   })
 
-  test('does NOT recover when the continue:true ack leaf is unchanged since the send (ack-then-await-user)', async () => {
+  test('does NOT recover when the more_work_this_turn:true ack leaf is unchanged since the send (ack-then-await-user)', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
@@ -14434,7 +14434,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     await router.route(inbound({ text: '확인 좀' }))
     sessions[0]!.onPrompt = async () => {
       // Install the leaf BEFORE the send so lastSendLeafId === the turn-end leaf:
-      // the model acked continue:true and stopped to await the user, no post-ack
+      // the model acked more_work_this_turn:true and stopped to await the user, no post-ack
       // work — must stay on the historical no_reply path, not recover.
       const entry: SessionEntry = {
         type: 'message',
@@ -14454,7 +14454,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     expect(logs.some((m) => m.includes('send_willingness_nudge'))).toBe(false)
   })
 
-  test('does NOT recover when a substantive channel_send answered the user after the continue:true ack', async () => {
+  test('does NOT recover when a substantive channel_send answered the user after the more_work_this_turn:true ack', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
@@ -14466,7 +14466,7 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
 
     await router.route(inbound({ text: '레포 확인해줘' }))
     sessions[0]!.onPrompt = async () => {
-      // given: continue:true ack (stamps continueReplyTurn with the ack's send count),
+      // given: more_work_this_turn:true ack (stamps continueReplyTurn with the ack's send count),
       // tool work, then a SUBSTANTIVE channel_send final answer — which bumps
       // successfulChannelSends past the stamped count — and finally a fresh empty stop.
       // The user was already answered, so the trailing empty stop must NOT be nudged.

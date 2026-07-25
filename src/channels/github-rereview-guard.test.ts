@@ -9,7 +9,7 @@ function input(overrides: Partial<RereviewGuardInput> = {}): RereviewGuardInput 
     thread: '12345',
     text: 'Verified — that closes it, thanks!',
     wantsResolve: true,
-    isContinue: false,
+    moreWorkThisTurn: false,
     workspace: 'acme/widgets',
     getReviewState: async () => ({ ok: true, selfBlocking: true, approve: true }),
     ...overrides,
@@ -172,13 +172,13 @@ describe('re-review stranding guard', () => {
     if (decision.block) expect(decision.reason).toContain('Could not verify')
   })
 
-  it('exempts a mid-turn warn-tier status reply (continue:true) from the state query', async () => {
+  it('exempts a mid-turn warn-tier status reply (more_work_this_turn:true) from the state query', async () => {
     let queried = false
     const decision = await evaluateRereviewGuard(
       input({
         thread: null,
         wantsResolve: false,
-        isContinue: true,
+        moreWorkThisTurn: true,
         text: 'Looks good so far — spawning the reviewer now, back shortly.',
         getReviewState: async () => {
           queried = true
@@ -190,9 +190,15 @@ describe('re-review stranding guard', () => {
     expect(queried).toBe(false)
   })
 
-  it('still resolves-blocks an explicit thread resolve even mid-turn (continue:true)', async () => {
+  it('still resolves-blocks an explicit thread resolve even mid-turn (more_work_this_turn:true)', async () => {
     const decision = await evaluateRereviewGuard(
-      input({ thread: '999', wantsResolve: true, isContinue: true, text: 'one sec', getReviewState: stateOk(true) }),
+      input({
+        thread: '999',
+        wantsResolve: true,
+        moreWorkThisTurn: true,
+        text: 'one sec',
+        getReviewState: stateOk(true),
+      }),
     )
     expect(decision.block).toBe(true)
   })

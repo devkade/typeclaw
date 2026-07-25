@@ -486,15 +486,17 @@ function renderChannelOrigin(
     ...(origin.adapter === 'github'
       ? [
           'tool call, keep working and post the answer with a single final',
-          '`channel_reply`. Do not post an "On it" ack comment first — the runtime',
+          '`channel_reply({ text, more_work_this_turn: false })`.',
+          'Do not post an "On it" ack comment first — the runtime',
           'already added an :eyes: reaction; use `channel_react` for explicit ack.',
         ]
       : [
           'tool call, send a one-line ack first via `channel_reply({ text: "On it.",',
-          'continue: true })`, keep working, then send the answer with a final',
-          '`channel_reply`. The ack is not your reply; the answer is. Once the answer',
-          'lands, end your turn. `continue: true` is mandatory or the turn ends at',
-          'the ack and drops the fetch/subagent/actual answer.',
+          'more_work_this_turn: true })`, keep working, then send the answer with a',
+          'final `channel_reply({ text, more_work_this_turn: false })`.',
+          'The ack is not your reply; the answer is. Once the answer lands, end your turn.',
+          '`more_work_this_turn: true` is mandatory on the ack or the turn ends there',
+          'and drops the fetch/subagent/actual answer.',
         ]),
     '',
     '**Backgrounded work does not end the obligation.** If you spawn a',
@@ -508,7 +510,7 @@ function renderChannelOrigin(
     '',
     'Do not send a second reply just to rephrase, restate, or "confirm" what you already said.',
     '',
-    'To reply here, call `channel_reply({ text })`. Addressing (including the',
+    'To reply here, call `channel_reply({ text, more_work_this_turn })`. Addressing (including the',
     `thread${origin.thread !== null ? '' : ' — none here, this is a channel-root session'}) is filled in; you don't need`,
     'to copy these fields:',
     '',

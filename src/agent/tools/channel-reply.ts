@@ -83,17 +83,17 @@ export function createChannelReplyTool({
           },
         ),
       ),
-      continue: Type.Boolean({
+      more_work_this_turn: Type.Boolean({
         description:
-          'REQUIRED on every channel_reply — you must explicitly choose, there is no default. Set `true` when this reply is a mid-turn status update (e.g. "working on it…") and you still have work to do THIS turn — fetching data, running a tool, spawning a subagent, then replying again; `true` keeps the turn alive so that follow-up actually runs. ' +
+          'REQUIRED on every channel_reply — you must explicitly choose, there is no default. Set `true` when this reply is a mid-turn status update (e.g. "working on it…") and you still have MORE WORK to do THIS turn — fetching data, running a tool, spawning a subagent, then replying again; `true` keeps the turn alive so that follow-up actually runs. ' +
           'Set `false` when this reply is your final message for the turn (the common case). ' +
-          'This choice is mandatory precisely because a missing value used to default to ending the turn silently: a successful reply ends the turn unless `continue` is `true`, so a `false` on an ack you meant to keep working from drops the work you promised. ' +
+          'This choice is mandatory precisely because a missing value used to default to ending the turn silently: a successful reply ends the turn unless `more_work_this_turn` is `true`, so a `false` on an ack you meant to keep working from drops the work you promised. ' +
           'Do not set `true` just to seem responsive; only when genuine multi-step work follows in the same turn.',
       }),
       resolve_review_thread: Type.Optional(
         Type.Boolean({
           description:
-            'GitHub PR review threads ONLY. On a TERMINAL (`continue:false`) github PR review-thread reply that carries `text`, this is REQUIRED: you must set it to `true` or `false` and omitting it is rejected — you will be told to re-call with an explicit choice. (It stays a normal optional field everywhere else: ignored on Slack/Discord/Telegram/KakaoTalk and any non-github session, on github replies outside a review thread, on attachments-only replies, and on mid-turn `continue:true` status updates — leave it unset there.) ' +
+            'GitHub PR review threads ONLY. On a TERMINAL (`more_work_this_turn:false`) github PR review-thread reply that carries `text`, this is REQUIRED: you must set it to `true` or `false` and omitting it is rejected — you will be told to re-call with an explicit choice. (It stays a normal optional field everywhere else: ignored on Slack/Discord/Telegram/KakaoTalk and any non-github session, on github replies outside a review thread, on attachments-only replies, and on mid-turn `more_work_this_turn:true` status updates — leave it unset there.) ' +
             'Set `true` when your `text` acknowledges the concern is fixed/verified/addressed (e.g. "verified at <sha>", "thanks, that resolves it"): the runtime resolves the thread BEFORE posting, so the close-out actually happens in this same turn — a successful reply ends the turn, so a resolve deferred to "later" never runs. ' +
             "Set `false` when the thread should stay open (partial fix, disagreement, mid-discussion). It is safe to set `true` by default: the runtime resolves ONLY if the thread's root comment is yours — it refuses (and blocks the reply) on a human reviewer's thread, so you never close someone else's open question. You need not pre-check authorship; let the runtime enforce ownership.",
         }),
@@ -103,7 +103,7 @@ export function createChannelReplyTool({
     async execute(_toolCallId, params) {
       let text = params.text
       const attachments = params.attachments
-      const keepTurnAlive = params.continue === true
+      const keepTurnAlive = params.more_work_this_turn === true
       if ((text === undefined || text === '') && (attachments === undefined || attachments.length === 0)) {
         logger.warn(formatChannelToolFailure('channel_reply', 'missing text and attachments'))
         return {
@@ -164,7 +164,7 @@ export function createChannelReplyTool({
       const missingResolveChoice = missingReviewThreadResolveChoiceError({
         origin,
         text,
-        isContinue: keepTurnAlive,
+        moreWorkThisTurn: keepTurnAlive,
         resolveReviewThread: params.resolve_review_thread,
       })
       if (missingResolveChoice) {
@@ -185,7 +185,7 @@ export function createChannelReplyTool({
         chat: origin.chat,
         thread: origin.thread,
         text,
-        isContinue: keepTurnAlive,
+        moreWorkThisTurn: keepTurnAlive,
         resolveReviewThread: params.resolve_review_thread === true,
       })
       if (falseReceipt.kind === 'block') {
@@ -208,7 +208,7 @@ export function createChannelReplyTool({
         thread: origin.thread,
         text,
         wantsResolve: params.resolve_review_thread === true,
-        isContinue: keepTurnAlive,
+        moreWorkThisTurn: keepTurnAlive,
         getReviewState: (req) => router.getReviewState(req),
       })
       if (rereview.block) {
@@ -259,19 +259,19 @@ export function createChannelReplyTool({
           ),
         )
       }
-      // `continue` is read by the router's terminal hook (installChannelReplyTerminalHook),
+      // `more_work_this_turn` is read by the router's terminal hook (installChannelReplyTerminalHook),
       // not by this tool — it suppresses the post-reply abort so a multi-step turn
       // keeps going. Success-only: a denied reply never ran, so there is no turn to keep.
       const details: {
         ok: boolean
         error?: string
-        continue?: boolean
+        more_work_this_turn?: boolean
         messageId?: string
         messageIds?: readonly string[]
       } = result.ok
         ? {
             ok: true,
-            ...(keepTurnAlive ? { continue: true } : {}),
+            ...(keepTurnAlive ? { more_work_this_turn: true } : {}),
             ...(result.messageId !== undefined ? { messageId: result.messageId } : {}),
             ...(result.messageIds !== undefined ? { messageIds: result.messageIds } : {}),
           }
@@ -329,13 +329,13 @@ export function createChannelReplyTool({
 function missingReviewThreadResolveChoiceError(input: {
   origin: ChannelReplyOrigin
   text: string | undefined
-  isContinue: boolean
+  moreWorkThisTurn: boolean
   resolveReviewThread: boolean | undefined
 }): string {
   const isGithubPrReviewThread =
     input.origin.adapter === 'github' && /^pr:\d+$/.test(input.origin.chat) && input.origin.thread !== null
   const hasText = input.text !== undefined && input.text.trim() !== ''
-  if (!isGithubPrReviewThread || !hasText || input.isContinue || input.resolveReviewThread !== undefined) {
+  if (!isGithubPrReviewThread || !hasText || input.moreWorkThisTurn || input.resolveReviewThread !== undefined) {
     return ''
   }
   return (

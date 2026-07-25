@@ -186,7 +186,7 @@ describe('PR line comment → channel_reply → /pulls/{N}/comments/{T}/replies'
 
     const result = await tool.execute(
       'id',
-      { text: 'sure, here is the rationale', continue: false, resolve_review_thread: false },
+      { text: 'sure, here is the rationale', more_work_this_turn: false, resolve_review_thread: false },
       undefined,
       undefined,
       fakeCtx,
@@ -232,7 +232,7 @@ describe('PR line comment → channel_reply → /pulls/{N}/comments/{T}/replies'
     })
     await tool.execute(
       'id',
-      { text: 'got it', continue: false, resolve_review_thread: false },
+      { text: 'got it', more_work_this_turn: false, resolve_review_thread: false },
       undefined,
       undefined,
       fakeCtx,
@@ -270,7 +270,7 @@ describe('PR line comment → channel_reply → /pulls/{N}/comments/{T}/replies'
     })
     await tool.execute(
       'id',
-      { text: 'reply', continue: false, resolve_review_thread: false },
+      { text: 'reply', more_work_this_turn: false, resolve_review_thread: false },
       undefined,
       undefined,
       fakeCtx,
