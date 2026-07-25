@@ -24,6 +24,7 @@ import { waitFor } from '@/test-helpers/wait-for'
 
 import type { ChannelSessionRecord } from './persistence'
 import { channelsSessionsPath, loadChannelSessions, saveChannelSessions } from './persistence'
+import type { CreateChannelRouterOptions } from './router'
 import {
   CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS,
   CHANNEL_MAX_OUTPUT_TOKENS,
@@ -376,6 +377,7 @@ function makeRouter(
     saveChannelSessions?: (agentDir: string, sessions: readonly ChannelSessionRecord[]) => Promise<void>
     newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
     listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+    runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
@@ -399,6 +401,7 @@ function makeRouter(
     ...(options.listRunningBackgroundSubagentNames !== undefined
       ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
+    ...(options.runIdleContinuation !== undefined ? { runIdleContinuation: options.runIdleContinuation } : {}),
     permissions: options.permissions ?? grantAllPermissions,
     now: () => nowRef.value,
     logger: {
@@ -13931,6 +13934,284 @@ describe('ChannelRouter continue:true empty-stop recovery (phrase-independent)',
     expect(
       logs.some((m) => m.includes('empty_turn_fallback cause=empty_stop_after_continue_reply_nudges_exhausted')),
     ).toBe(true)
+  })
+
+  test('self-recovery: a continuation that lands the real answer after willingness exhaustion discards the staged fallback', async () => {
+    // Reproduces the production Discord false alarm: the model acked continue:true,
+    // did tool work, stranded on an empty stop, exhausted the single willingness
+    // nudge — then the idle/todo continuation re-prompted the SAME logical turn and
+    // delivered the real answer. The staged fallback must be discarded, never posted.
+    //
+    // The continuation is delivered through the injected runIdleContinuation seam
+    // (fired by maybeContinueTodosChannel AFTER validateChannelTurn stages), NOT
+    // pre-seeded from onPrompt. This locks in the load-bearing drain ordering: the
+    // fallback is still staged (not resolved) when validation runs; only the later
+    // maybeContinueTodosChannel → resolveStagedFallback sequence discards it. If the
+    // resolver ran ahead of the continuation, the stage would resolve to a POST here
+    // (no reminder queued yet) and the test would fail.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    // One-shot continuation: delivers a reminder the FIRST time the post-validation
+    // maybeContinueTodosChannel runs while a fallback is staged, mirroring the idle
+    // continuation re-prompting the stranded turn.
+    let continuationDelivered = false
+    const runIdleContinuationSeam: NonNullable<CreateChannelRouterOptions['runIdleContinuation']> = async ({
+      deliver,
+    }) => {
+      if (continuationDelivered) return false
+      continuationDelivered = true
+      deliver('continue your work')
+      return true
+    }
+    const { router, sessions } = makeRouter(dir, { logs, runIdleContinuation: runIdleContinuationSeam })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'A 회의실 예약해줘' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt <= 1 + MAX_WILLINGNESS_NUDGES) {
+        // ack+strand until exhaustion stages (not posts) the fallback. The continuation
+        // is NOT queued here — it arrives post-validation via the seam above.
+        await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${attempt})`, String(attempt))
+        return
+      }
+      // the continuation iteration (driven by the seam's reminder) delivers the answer
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '스페이스 A1 예약 완료' })
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent).not.toContain(EMPTY_TURN_FALLBACK_TEXT)
+    expect(sent.some((s) => s.includes('예약 완료'))).toBe(true)
+    expect(logs.some((m) => m.includes('empty_turn_fallback_staged'))).toBe(true)
+    expect(
+      logs.some((m) => m.includes('empty_turn_fallback_deferred') && m.includes('reason=continuation_queued')),
+    ).toBe(true)
+    expect(logs.some((m) => m.includes('empty_turn_fallback_discarded') && m.includes('reason=reply_landed'))).toBe(
+      true,
+    )
+    expect(logs.some((m) => m.includes('empty_turn_fallback cause='))).toBe(false)
+  })
+
+  test('no continuation available: willingness exhaustion still posts the fallback exactly once', async () => {
+    // The genuine-strand invariant. No continuation is queued after exhaustion, so
+    // the staged fallback resolves to a single visible post — the human is never
+    // left on dead air.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '확인해줘' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${attempt})`, String(attempt))
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent.filter((s) => s === EMPTY_TURN_FALLBACK_TEXT)).toHaveLength(1)
+    expect(logs.some((m) => m.includes('empty_turn_fallback_staged'))).toBe(true)
+    expect(
+      logs.some((m) => m.includes('empty_turn_fallback cause=empty_stop_after_continue_reply_nudges_exhausted')),
+    ).toBe(true)
+  })
+
+  test('continuation also strands: the deferred fallback posts exactly once once no continuation remains', async () => {
+    // Stage the fallback, defer it while a continuation is queued, then let that
+    // continuation finish WITHOUT a genuine reply and without queuing another. The
+    // deferred fallback must eventually post — exactly once.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '확인해줘' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt <= 1 + MAX_WILLINGNESS_NUDGES) {
+        await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${attempt})`, String(attempt))
+        if (attempt === 1 + MAX_WILLINGNESS_NUDGES) {
+          // Defer: a continuation is queued at exhaustion time.
+          router.__testing!.injectContinuationReminder(KEY, 'continue your work')
+        }
+        return
+      }
+      // The continuation iteration produces NO reply and no further continuation →
+      // the deferred fallback resolves to a single post.
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(
+      logs.some((m) => m.includes('empty_turn_fallback_deferred') && m.includes('reason=continuation_queued')),
+    ).toBe(true)
+    expect(sent.filter((s) => s === EMPTY_TURN_FALLBACK_TEXT)).toHaveLength(1)
+  })
+
+  test('cross-turn escalation: a willingness-exhaustion staged fallback question turn does not seed the next turn', async () => {
+    // Mirrors the retry-exhausted fallback question-turn test through the STAGED
+    // willingness path. given: turn A is a question whose continue:true ack strands
+    // on every attempt until the willingness budget is exhausted and — with NO
+    // continuation queued — the staged fallback posts (no usable reply). turn B is a
+    // question. The staged-then-posted fallback must NOT commit A's question signal,
+    // so B has no question predecessor and must NOT mode-3 escalate. Before staging
+    // deferred the signal commit, the progress ack read as a usable reply and B
+    // wrongly escalated.
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // turn A — a question that acks continue:true then re-strands until exhaustion
+    await router.route(inbound({ text: 'why did the deployment fail on the staging cluster?' }))
+    let aAttempt = 0
+    sessions[0]!.onPrompt = async () => {
+      aAttempt++
+      await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${aAttempt})`, String(aAttempt))
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent.filter((s) => s === EMPTY_TURN_FALLBACK_TEXT)).toHaveLength(1)
+
+    sessions[0]!.thinkingLevels.length = 0
+
+    // turn B — a question; predecessor A only produced a fallback → no escalation
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.setAssistantText('B')
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'here you go' })
+    }
+    await router.route(inbound({ text: 'and how do i actually fix it properly now?' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: turn B did not escalate — A's staged-fallback turn never seeded the signal.
+    expect(sessions[0]!.thinkingLevels).not.toContain('xhigh')
+  })
+
+  test('cross-turn escalation: a willingness strand that self-recovers via continuation DOES seed the next turn', async () => {
+    // The discard counterpart: when the staged fallback is discarded because the
+    // continuation genuinely answers, the logical turn ended as a usable reply, so
+    // A's question signal IS committed and turn B escalates. Proves the discard path
+    // commits the deferred signal rather than dropping it.
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // turn A — a question that strands, exhausts the nudge, then a continuation
+    // re-prompt delivers the real answer (staged fallback discarded)
+    await router.route(inbound({ text: 'why did the deployment fail on the staging cluster?' }))
+    let aAttempt = 0
+    sessions[0]!.onPrompt = async () => {
+      aAttempt++
+      if (aAttempt <= 1 + MAX_WILLINGNESS_NUDGES) {
+        await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${aAttempt})`, String(aAttempt))
+        if (aAttempt === 1 + MAX_WILLINGNESS_NUDGES) {
+          router.__testing!.injectContinuationReminder(KEY, 'continue your work')
+        }
+        return
+      }
+      sessions[0]!.setAssistantText('recovered')
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'it failed because of X' })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent).not.toContain(EMPTY_TURN_FALLBACK_TEXT)
+
+    sessions[0]!.thinkingLevels.length = 0
+
+    // turn B — a question; predecessor A ended in a genuine recovery reply → escalate
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.setAssistantText('B')
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'here you go' })
+    }
+    await router.route(inbound({ text: 'and how do i actually fix it properly now?' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: turn B escalated — A's self-recovered question signal survived the stage.
+    expect(sessions[0]!.thinkingLevels).toContain('xhigh')
+  })
+
+  test('cross-turn escalation: a fresh batch superseding a staged fallback clears the prior signal (A → staged B → queued C)', async () => {
+    // The supersession hole. given: turn A is a question that replies (commits its
+    // question signal). turn B is a question whose willingness ack strands and stages
+    // the fallback; a fresh inbound C is queued WHILE staged, so the fresh batch
+    // supersedes B before the fallback posts. turn C must NOT inherit A's stale
+    // lastQuestionSignal across the superseded (failed) B — clearing only the stage
+    // would leak A's signal and wrongly escalate C.
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // turn A — a question that replies → commits A's question signal
+    await router.route(inbound({ text: 'why did the deployment fail on the staging cluster?' }))
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.setAssistantText('A')
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'because of X' })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    sessions[0]!.thinkingLevels.length = 0
+
+    // turn B — a STATEMENT (so B itself never escalates, isolating the assertion to
+    // C's inheritance of A's stale signal). It strands+stages (willingness branch
+    // needs an empty promptQueue), a continuation reminder forces the resolver to
+    // DEFER so the stage PERSISTS, then on the deferred iteration a fresh inbound C is
+    // queued so the FOLLOWING iteration's fresh batch supersedes the still-staged
+    // fallback — the exact A → staged B → queued C path.
+    let bAttempt = 0
+    sessions[0]!.onPrompt = async () => {
+      bAttempt++
+      if (bAttempt <= 1 + MAX_WILLINGNESS_NUDGES) {
+        await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${bAttempt})`, `b${bAttempt}`)
+        if (bAttempt === 1 + MAX_WILLINGNESS_NUDGES) {
+          router.__testing!.injectContinuationReminder(KEY, 'continue your work')
+        }
+        return
+      }
+      if (bAttempt === 2 + MAX_WILLINGNESS_NUDGES) {
+        router.__testing!.enqueueUserInbound(
+          KEY,
+          inbound({ text: 'and how do i actually fix it now?', externalMessageId: 'c1' }),
+        )
+        sessions[0]!.setAssistantText('')
+        return
+      }
+      // turn C (the superseding fresh batch) — a question that replies
+      sessions[0]!.setAssistantText('C')
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'here you go' })
+    }
+    await router.route(inbound({ text: 'please go ahead and reserve the room.', externalMessageId: 'b1' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the staged fallback never posted (C superseded it) AND C did not escalate —
+    // A's stale signal was cleared when the fresh batch superseded the staged turn.
+    // Without the supersession clear, C inherits A's dominant question signal and
+    // mode-3 escalates to xhigh.
+    expect(sent).not.toContain(EMPTY_TURN_FALLBACK_TEXT)
+    expect(sessions[0]!.thinkingLevels).not.toContain('xhigh')
   })
 
   test('retries once after a continue:true progress reply and suppresses the warning when the final reply succeeds', async () => {
