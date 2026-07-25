@@ -1085,6 +1085,26 @@ type LiveSession = {
   // question escalation. Compared by `turnSeq` so a stale value can't leak across
   // turns.
   emptyTurnFallbackTurn: number | null
+  // Set when a WILLINGNESS-ACK exhaustion path (empty_stop_after_continue_reply /
+  // empty_stop_after_send_ack) would post EMPTY_TURN_FALLBACK_TEXT, but the model
+  // just made a machine-readable promise to keep working (`continue: true` /
+  // willingness phrase) and did post-ack tool work. Rather than posting the scary
+  // "I got stuck" notice synchronously at validateChannelTurn — BEFORE the drain
+  // loop runs maybeContinueTodosChannel, which can re-prompt the same logical turn
+  // and land the real answer seconds later (the observed production false alarm) —
+  // the cause is STAGED here and resolved after that continuation gets its chance:
+  // discarded if a genuine reply lands or a continuation is queued, posted exactly
+  // once if the turn genuinely stranded. Only the two willingness branches stage;
+  // every other fallback path posts immediately as before (they carry no
+  // continue-promise). Persists across reminder-only iterations (reset only on a
+  // fresh user batch, beside the willingness/retry budgets) so a stage in one
+  // iteration survives to the resolution after the next. `sendCountAtStage` is
+  // `successfulChannelSends` at stage time — the resolver treats ONLY a send PAST
+  // this baseline as a genuine recovery reply, because the willingness-ack that
+  // triggered staging already bumped the turn-start count (the empty stop follows
+  // a progress ack by definition), so a turn-start baseline would always read as
+  // "already replied" and wrongly discard the fallback.
+  stagedFallbackCause: { cause: string; sendCountAtStage: number } | null
   // Stamped with `turnSeq` when a formal GitHub review (APPROVE / REQUEST_CHANGES /
   // COMMENT) lands during this LOGICAL turn, via noteGithubReviewOutput off the
   // review-output observer. On a github PR channel the agent's real deliverable is
@@ -1464,6 +1484,17 @@ export type ChannelRouter = {
           lastTurnAuthorIds: readonly string[]
         }
       | undefined
+    // Pushes a reminder onto the live session's `pendingSystemReminders`, the same
+    // seam `runIdleContinuation`'s `deliver` callback uses when the todo/idle
+    // continuation fires. Lets a test reproduce the production self-recovery race
+    // (a continuation re-prompt queued after a willingness-ack strand) at the
+    // channels layer, without coupling to todo-file persistence formats.
+    injectContinuationReminder: (key: ChannelKey, text: string) => void
+    // Enqueues a real user batch onto the live session's promptQueue via the same
+    // `enqueue` path route() uses, letting a test reproduce a fresh inbound that
+    // supersedes a still-pending staged fallback mid-drain (the A → staged B →
+    // queued C question-signal supersession case) without the debounce timing dance.
+    enqueueUserInbound: (key: ChannelKey, event: InboundMessage) => void
     // Returns a shallow copy of `live.originRef.current` for the live
     // session matching `key`, or undefined when no live session exists.
     // Exists so tests can assert on the per-turn origin that tool.before
@@ -1505,6 +1536,14 @@ export type CreateChannelRouterOptions = {
   // decision. Defaults to a stat()-based reader returning 0 for a missing or
   // unreadable file (grace then fails closed to roll-over-at-soft-TTL).
   measureTranscriptBytes?: (path: string) => number
+  // Test seam: the idle/todo continuation driver, invoked from
+  // maybeContinueTodosChannel AFTER validateChannelTurn. Defaults to the real
+  // runIdleContinuation. Injecting it lets a test deliver the continuation at the
+  // exact production phase (post-validation) so the drain-loop ordering —
+  // resolveStagedFallback runs AFTER this delivery — is actually asserted, rather
+  // than pre-seeding pendingSystemReminders from onPrompt (which would pass even if
+  // the resolver moved ahead of the continuation).
+  runIdleContinuation?: typeof runIdleContinuation
   // Test seam: override the ensureLive watchdog ceiling so the timeout path
   // is exercisable in <100ms instead of the 30s production default.
   ensureLiveTimeoutMs?: number
@@ -2227,6 +2266,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         skipLockedSendTurn: null,
         disengagedTurn: null,
         emptyTurnFallbackTurn: null,
+        stagedFallbackCause: null,
         githubReviewOutputTurn: null,
         pendingQuoteCandidate: null,
         recentEngagedPeerBotTurns: [],
@@ -2733,7 +2773,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.destroyed) return
     if (live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) return
     try {
-      await runIdleContinuation({
+      await (options.runIdleContinuation ?? runIdleContinuation)({
         agentDir: options.agentDir,
         origin: buildLiveOrigin(live),
         deliver: (text) => {
@@ -2743,6 +2783,69 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     } catch (err) {
       logger.warn(`[channels] ${live.keyId}: todo continuation failed: ${describe(err)}`)
     }
+  }
+
+  const postEmptyTurnFallback = async (live: LiveSession, cause: string): Promise<void> => {
+    logger.warn(`[channels] ${live.keyId} empty_turn_fallback cause=${cause}`)
+    live.emptyTurnFallbackTurn = live.turnSeq
+    const result = await send(
+      {
+        adapter: live.key.adapter,
+        workspace: live.key.workspace,
+        chat: live.key.chat,
+        thread: live.key.thread,
+        text: EMPTY_TURN_FALLBACK_TEXT,
+      },
+      { source: 'system' },
+    )
+    if (!result.ok) {
+      logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
+    }
+  }
+
+  // Resolve a fallback STAGED by a willingness-ack exhaustion path, run AFTER
+  // maybeContinueTodosChannel so the idle/todo continuation has already had its
+  // chance to queue a re-prompt (the mechanism that self-recovers the promised
+  // work). Three outcomes, in precedence order:
+  //   1. A genuine reply landed this logical turn (successfulChannelSends moved
+  //      past the turn-start baseline; the staged path never posts, so any bump
+  //      is real prose) → the model self-recovered, discard the stage silently.
+  //   2. A re-prompt is queued (pendingSystemReminders from the continuation, or a
+  //      fresh user inbound in promptQueue) → recovery is still in flight or a new
+  //      turn supersedes; carry the stage forward to the next resolution (or let
+  //      the fresh turn's reset clear it) — do NOT post yet.
+  //   3. Neither → the turn genuinely stranded with nothing following it; post the
+  //      visible fallback exactly once. This preserves the never-strand-on-silence
+  //      invariant for the true-stuck case while killing the production false alarm
+  //      where the continuation landed the real answer seconds after the stage.
+  const resolveStagedFallback = async (live: LiveSession): Promise<void> => {
+    const staged = live.stagedFallbackCause
+    if (staged === null) return
+    if (live.successfulChannelSends > staged.sendCountAtStage) {
+      logger.info(`[channels] ${live.keyId} empty_turn_fallback_discarded cause=${staged.cause} reason=reply_landed`)
+      live.stagedFallbackCause = null
+      // Recovery genuinely answered the user, so the logical turn ends as a usable
+      // reply — commit the question signal the try-block deferred while staged.
+      if (live.pendingUserTurnSignal !== null) {
+        live.lastQuestionSignal = live.pendingUserTurnSignal.signal
+        live.pendingUserTurnSignal = null
+      }
+      return
+    }
+    if (live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) {
+      // A re-prompt is still queued: keep both the stage and the pending signal for
+      // the next resolution — the turn hasn't finished.
+      logger.info(
+        `[channels] ${live.keyId} empty_turn_fallback_deferred cause=${staged.cause} reason=continuation_queued`,
+      )
+      return
+    }
+    live.stagedFallbackCause = null
+    // The fallback IS the turn's terminal (non-usable) output — clear both signals
+    // so an older question can't leak the xhigh escalation across this failed turn.
+    live.pendingUserTurnSignal = null
+    live.lastQuestionSignal = null
+    await postEmptyTurnFallback(live, staged.cause)
   }
 
   const fireSessionTurnStart = async (live: LiveSession, userPrompt: string): Promise<{ results: string }> => {
@@ -2965,6 +3068,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.toolLeakRetries = 0
           live.emptyStopAfterToolWorkArmed = false
           live.willingnessNudges = 0
+          // A fresh batch supersedes a still-pending staged fallback. That staged
+          // turn produced no usable reply, so it must not leave the PRIOR turn's
+          // committed lastQuestionSignal behind — otherwise the new question would
+          // inherit an xhigh escalation across the superseded (failed) turn. Clear
+          // the stale signal only when a stage was actually pending; a normal prior
+          // turn's legitimately-committed signal is left intact.
+          if (live.stagedFallbackCause !== null) {
+            live.lastQuestionSignal = null
+            live.stagedFallbackCause = null
+          }
           live.abortReasonThisTurn = null
           live.nextPromptMaxTokens = undefined
           // Cleared with the retry budgets (NOT beside resetReviewTurn below) so a
@@ -3090,7 +3203,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           const fallbackPostedThisTurn = live.emptyTurnFallbackTurn === live.turnSeq
           const sentReplyThisTurn = live.successfulChannelSends > successfulSendsBeforePrompt
           const usableReplyThisTurn = sentReplyThisTurn && !fallbackPostedThisTurn && !providerErrorThisTurn
-          if (live.pendingUserTurnSignal !== null && !retryQueuedThisTurn) {
+          // A staged (not-yet-posted) willingness fallback keeps the logical turn
+          // OPEN, exactly like a queued retry: the progress ack that triggered
+          // staging would otherwise read as `usableReplyThisTurn` and commit the
+          // question signal, so a fallback turn would leak the `xhigh` escalation it
+          // is meant to suppress. Leave the pending signal untouched here;
+          // resolveStagedFallback finalizes it (commit on genuine recovery, clear on
+          // fallback-post) once the continuation has run.
+          if (live.pendingUserTurnSignal !== null && !retryQueuedThisTurn && live.stagedFallbackCause === null) {
             live.lastQuestionSignal = usableReplyThisTurn ? live.pendingUserTurnSignal.signal : null
             live.pendingUserTurnSignal = null
           }
@@ -3165,6 +3285,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         await fireSessionIdle(live)
         await recordTodoTurnStart(live, isRealUserTurn)
         await maybeContinueTodosChannel(live)
+        await resolveStagedFallback(live)
         live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
         if (live.currentTurnAuthorId !== null) {
           live.lastTurnAuthorId = live.currentTurnAuthorId
@@ -4531,22 +4652,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.skippedTurn = null
       logger.info(`[channels] ${live.keyId} skip_contested_by_send recovering reply`)
     }
-    const postEmptyTurnFallback = async (cause: string): Promise<void> => {
-      logger.warn(`[channels] ${live.keyId} empty_turn_fallback cause=${cause}`)
-      live.emptyTurnFallbackTurn = live.turnSeq
-      const result = await send(
-        {
-          adapter: live.key.adapter,
-          workspace: live.key.workspace,
-          chat: live.key.chat,
-          thread: live.key.thread,
-          text: EMPTY_TURN_FALLBACK_TEXT,
-        },
-        { source: 'system' },
-      )
-      if (!result.ok) {
-        logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
-      }
+    const stageEmptyTurnFallback = (cause: string): void => {
+      logger.warn(`[channels] ${live.keyId} empty_turn_fallback_staged cause=${cause}`)
+      live.stagedFallbackCause = { cause, sendCountAtStage: live.successfulChannelSends }
     }
 
     // A formal GitHub review already landed this logical turn (APPROVE /
@@ -4637,7 +4745,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           )
           live.pendingSystemReminders.push(SEND_WILLINGNESS_NUDGE)
         } else {
-          await postEmptyTurnFallback('empty_stop_after_continue_reply_nudges_exhausted')
+          stageEmptyTurnFallback('empty_stop_after_continue_reply_nudges_exhausted')
         }
         return
       }
@@ -4673,7 +4781,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           )
           live.pendingSystemReminders.push(SEND_WILLINGNESS_NUDGE)
         } else {
-          await postEmptyTurnFallback('empty_stop_after_send_ack_nudges_exhausted')
+          stageEmptyTurnFallback('empty_stop_after_send_ack_nudges_exhausted')
         }
         return
       }
@@ -4710,7 +4818,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             )
             live.pendingSystemReminders.push(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
           } else {
-            await postEmptyTurnFallback('stranded_toolUse_retries_exhausted')
+            await postEmptyTurnFallback(live, 'stranded_toolUse_retries_exhausted')
           }
         }
         return
@@ -4826,7 +4934,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.pendingSystemReminders.push(EMPTY_TURN_RETRY_NUDGE)
         return
       }
-      await postEmptyTurnFallback(attemptedSendThisTurn ? 'send_thrash' : 'retries_exhausted')
+      await postEmptyTurnFallback(live, attemptedSendThisTurn ? 'send_thrash' : 'retries_exhausted')
       return
     }
 
@@ -4861,7 +4969,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.pendingSystemReminders.push(COLD_START_REPLY_NUDGE)
           return
         }
-        await postEmptyTurnFallback('cold_start_solo_bare_empty_retries_exhausted')
+        await postEmptyTurnFallback(live, 'cold_start_solo_bare_empty_retries_exhausted')
         return
       }
       // Deliberately AFTER the cold-start guard (that path has its own nudge). A
@@ -4897,7 +5005,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.pendingSystemReminders.push(EMPTY_STOP_AFTER_TOOL_WORK_NUDGE)
           return
         }
-        await postEmptyTurnFallback('empty_stop_after_tool_work_retries_exhausted')
+        await postEmptyTurnFallback(live, 'empty_stop_after_tool_work_retries_exhausted')
         return
       }
       const leakedReasoning = !isNoReplySignal(assistantText)
@@ -5953,6 +6061,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           lastTurnAuthorId: live.lastTurnAuthorId,
           lastTurnAuthorIds: Array.from(live.lastTurnAuthorIds),
         }
+      },
+      injectContinuationReminder: (key: ChannelKey, text: string): void => {
+        const live = liveSessions.get(channelKeyId(key))
+        if (!live) return
+        live.pendingSystemReminders.push(text)
+      },
+      enqueueUserInbound: (key: ChannelKey, event: InboundMessage): void => {
+        const live = liveSessions.get(channelKeyId(key))
+        if (!live) return
+        enqueue(live, event, null)
       },
     },
   }
