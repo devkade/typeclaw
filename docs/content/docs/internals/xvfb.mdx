@@ -60,7 +60,7 @@ Container Chrome uses SwiftShader (CPU WebGL). WebGL renderer reports `"ANGLE (G
 
 ## Layer 4.5: agent-browser headed-mode wrapper
 
-Works around [vercel-labs/agent-browser#1083](https://github.com/vercel-labs/agent-browser/issues/1083) ("headed silently ignored on existing session"). When a headless daemon is already running and a command requests headed, the existing browser is reused. Three upstream PRs (#660, #370, #387) have been open for months as of agent-browser 0.27.0.
+Works around [vercel-labs/agent-browser#1083](https://github.com/vercel-labs/agent-browser/issues/1083) ("headed silently ignored on existing session"). When a headless daemon is already running and a command requests headed, the existing browser is reused. Three upstream PRs (#660, #370, #387) have been open for months as of agent-browser 0.33.0.
 
 Patch: `mv` the real binary to `/usr/local/bin/agent-browser.real`; drop a POSIX shell wrapper at the original path. When headed mode is requested and the subcommand is `open`/`goto`/`navigate`, the wrapper runs `"$real" close` then exec-passes through to `.real`. Forces a clean relaunch.
 
