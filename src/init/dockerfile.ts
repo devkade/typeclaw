@@ -1265,15 +1265,14 @@ RUN chmod +x ${TYPECLAW_CX_SESSION_START_HOOK_PATH} ${TYPECLAW_CX_STOP_HOOK_PATH
 }
 
 // Shared-library runtime deps Chrome for Testing needs to launch on amd64
-// Debian trixie (base of `oven/bun:1-slim`). `agent-browser install
-// --with-deps` (still true at v0.33.0) is supposed to install these but
-// silently no-ops:
-// its hardcoded list omits `libglib2.0-0t64`, so Chrome dies on launch
-// with `libglib-2.0.so.0: cannot open shared object file` even though the
-// binary download and `--with-deps` both exit 0. We install the full
-// Playwright-tested chromium dep set here in Layer 2 so the bug doesn't
-// recur if upstream omits another package; Layer 5 still calls
-// `--with-deps` as a no-op-on-cache-hit backstop for future deps.
+// Debian trixie (base of `oven/bun:1-slim`). This layer is the ONLY thing
+// that installs them. `agent-browser install --with-deps` looks like it
+// would, but it cannot: it shells out to `sudo apt-get` and there is no
+// sudo in the image. Its hardcoded list also omits `libglib2.0-0t64`
+// (still true at 0.33.0), so even where apt worked Chrome would die on
+// launch with `libglib-2.0.so.0: cannot open shared object file`. We
+// install the full Playwright-tested chromium dep set here so the bug
+// doesn't recur if upstream omits another package.
 //
 // Package list mirrors Playwright's `debian13-x64` chromium deps in
 // nativeDeps.ts (https://github.com/microsoft/playwright). t64-suffixed
@@ -1489,7 +1488,7 @@ ${renderAgentBrowserInstallLayer(buildKit)}
 
 ${LAYER_4_5_AGENT_BROWSER_HEADED_WRAPPER}
 
-${renderChromeForTestingLayer(buildKit)}
+${renderChromeForTestingLayer()}
 
 ${cloudflaredBlock}${claudeCodeBlock}${codexCliBlock}${renderEntrypointShimLayer()}
 ${renderGitAskPassLayer()}
@@ -1567,7 +1566,7 @@ ${renderAgentBrowserInstallLayer(true)}
 
 ${LAYER_4_5_AGENT_BROWSER_HEADED_WRAPPER}
 
-${renderChromeForTestingLayer(true)}
+${renderChromeForTestingLayer()}
 
 ${renderEntrypointShimLayer()}
 ${renderGitAskPassLayer()}
@@ -1766,14 +1765,20 @@ TYPECLAW_AGENT_BROWSER_WRAPPER_EOF`
 
 // Layer 5: download the pinned Chrome for Testing build into
 // ~/.agent-browser/browsers/. NO cache mount on that path because the
-// runtime needs the binary in the image. System shared libraries are
-// already installed in Layer 2; --with-deps is a defense-in-depth backstop
-// so a future agent-browser bump that adds new deps installs them
-// automatically (near-no-op when Layer 2 already covers them).
-const renderChromeForTestingLayer = (buildKit: boolean): string =>
+// runtime needs the binary in the image, and no apt cache mount either
+// because nothing in this layer runs apt.
+//
+// Deliberately NOT `--with-deps`. That flag shells out to `sudo apt-get`
+// and there is no sudo in the image, so it could never install anything
+// here. Through 0.27.x it failed silently and still exited 0, which is
+// why it looked like a working backstop; 0.33.0 made it fail-closed
+// ("fails if deps fail" in its own --help) and turned that dead no-op
+// into a hard build failure. Chrome's shared libraries are installed for
+// real in Layer 2.
+const renderChromeForTestingLayer = (): string =>
   `# Layer 5 (heavy, amd64 only): Chrome for Testing download.
-RUN ${aptCacheMount(buildKit)}if [ "$TARGETARCH" != "arm64" ]; then \\
-      agent-browser install --with-deps; \\
+RUN if [ "$TARGETARCH" != "arm64" ]; then \\
+      agent-browser install; \\
     fi`
 
 function defaultConfig(): DockerfileConfig {

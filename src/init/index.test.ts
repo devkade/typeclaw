@@ -1293,7 +1293,7 @@ describe('writeDockerAssets', () => {
     // continuation slop + the actual install command. Lazy quantifier prevents
     // crossing into the next RUN block.
     expect(dockerfile).toMatch(/^RUN[\s\S]+?\bbun install -g agent-browser\b/m)
-    expect(dockerfile).toMatch(/^[^#\n]*\bagent-browser install --with-deps\b/m)
+    expect(dockerfile).toMatch(/^[^#\n]*\bagent-browser install\b/m)
   })
 
   test('Dockerfile bundles tmux for long-running detachable agent sessions', async () => {

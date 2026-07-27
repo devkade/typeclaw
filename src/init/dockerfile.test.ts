@@ -934,7 +934,7 @@ describe('Chrome runtime deps (amd64)', () => {
     for (const p of CHROME_RUNTIME_APT_PACKAGES_AMD64) expect(pkgs).not.toContain(p)
   })
 
-  test('Chrome runtime deps are installed in Layer 2 (before agent-browser CLI install in Layer 4), not only via the Layer 5 --with-deps backstop', () => {
+  test('Chrome runtime deps are installed in Layer 2 (before agent-browser CLI install in Layer 4) — nothing else in the image installs them', () => {
     const out = buildDockerfile()
     const layer2Idx = out.indexOf('libglib2.0-0t64')
     const layer4Idx = out.indexOf('bun install -g agent-browser@^0.33.0')
@@ -1220,7 +1220,12 @@ describe('base ↔ per-agent Dockerfile drift guard', () => {
 
   test('base Dockerfile downloads Chrome for Testing on amd64 — without it the per-agent image would FROM a base that lacks the browser binary and `agent-browser install` would have to redo it', () => {
     const base = buildBaseDockerfile()
-    expect(base).toContain('agent-browser install --with-deps')
+    expect(base).toContain('agent-browser install')
+  })
+
+  test('no Dockerfile passes --with-deps: it shells out to sudo, which the image does not have, and agent-browser >=0.33 exits 1 instead of no-oping', () => {
+    expect(buildBaseDockerfile()).not.toContain('--with-deps')
+    expect(buildDockerfile()).not.toContain('--with-deps')
   })
 
   test('base Dockerfile points agent-browser at the apt chromium on arm64 (no Chrome for Testing download path on that arch)', () => {
@@ -1302,7 +1307,7 @@ describe('versioned per-agent Dockerfile (base-image-pinning)', () => {
     // it when the toggle is on, so this regex deliberately excludes its sha256sum line)
     expect(countRunBlocksMatching(out, /curl-impersonate/)).toBe(0)
     expect(countRunBlocksMatching(out, /bun install -g agent-browser@\^0\.33\.0/)).toBe(0)
-    expect(countRunBlocksMatching(out, /agent-browser install --with-deps/)).toBe(0)
+    expect(countRunBlocksMatching(out, /agent-browser install/)).toBe(0)
     expect(countRunBlocksMatching(out, /apt-keep-cache|Keep-Downloaded-Packages/)).toBe(0)
     // and: no apt-get install line that also installs baseline packages
     expect(out).not.toMatch(/apt-get install[^\n]*\bgit\b[^\n]*\bca-certificates\b/)
@@ -2443,7 +2448,7 @@ describe('agent-browser headed-mode wrapper (Layer 4.5)', () => {
   test('wrapper appears before the Chrome-for-Testing download — pre-close behavior cannot depend on whether the browser binary is present, and the layer ordering is the only thing that guarantees a clean mv+rewrite without racing the install step', () => {
     const out = buildDockerfile()
     const wrapperIdx = out.indexOf('mv /usr/local/bin/agent-browser /usr/local/bin/agent-browser.real')
-    const chromeIdx = out.indexOf('agent-browser install --with-deps')
+    const chromeIdx = out.indexOf('agent-browser install')
     expect(wrapperIdx).toBeGreaterThan(-1)
     expect(chromeIdx).toBeGreaterThan(-1)
     expect(wrapperIdx).toBeLessThan(chromeIdx)
@@ -2451,7 +2456,7 @@ describe('agent-browser headed-mode wrapper (Layer 4.5)', () => {
 
   test('Chrome-for-Testing download in Layer 5 invokes the shimmed agent-browser binary — `agent-browser install` is not on the allowlist so the wrapper passes through unchanged at build time', () => {
     const out = buildDockerfile()
-    expect(out).toContain('agent-browser install --with-deps')
+    expect(out).toContain('agent-browser install')
     const wrapperBody = extractWrapperBody(out)
     expect(wrapperBody).toContain('open|goto|navigate')
   })
