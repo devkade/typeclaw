@@ -1475,6 +1475,157 @@ describe('startSubagent', () => {
     expect(result.finalMessage).toContain(`<verdict>${INCOMPLETE_REVIEW_VERDICT}</verdict>`)
   })
 
+  type FailingTurn =
+    | { role?: string; content?: unknown; stopReason?: string; errorMessage?: string }
+    | { throws: string }
+
+  function providerFailingSession(turns: FailingTurn[][]) {
+    const prompts: string[] = []
+    const listeners = new Set<(event: unknown) => void>()
+    let turnIndex = 0
+    let leafMessage: unknown
+    const session = {
+      prompt: async (text: string) => {
+        prompts.push(text)
+        const messages = turns[turnIndex] ?? []
+        turnIndex++
+        for (const message of messages) {
+          if ('throws' in message) throw new Error(message.throws)
+          leafMessage = message
+          for (const l of listeners) l({ type: 'message_end', message })
+        }
+      },
+      dispose: () => {},
+      subscribe: (l: (event: unknown) => void) => {
+        listeners.add(l)
+        return () => {
+          listeners.delete(l)
+        }
+      },
+      abort: async () => {},
+      sessionManager: {
+        getLeafEntry: () => (leafMessage === undefined ? undefined : { type: 'message', message: leafMessage }),
+      },
+    } as unknown as AgentSession
+    return { session, prompts }
+  }
+
+  async function runReviewerOn(session: AgentSession) {
+    const registry = { reviewer: { systemPrompt: 'X' } satisfies Subagent }
+    const { completion } = startSubagent('reviewer', {
+      registry,
+      createSessionForSubagent: async () => session,
+      agentDir: '/agent',
+      userPrompt: 'q',
+      taskId: 'bg_reviewer_provider',
+    })
+    return completion
+  }
+
+  const OVERLOADED = { role: 'assistant', stopReason: 'error', errorMessage: 'Overloaded' }
+
+  test('reviewer: an upstream provider failure spends ZERO nudges (re-prompting a dead provider is pointless)', async () => {
+    const { session, prompts } = providerFailingSession([[OVERLOADED]])
+
+    const result = await runReviewerOn(session)
+
+    if (!result.ok) throw new Error(`expected ok=true (guard, not silent drop), got error: ${result.error}`)
+    expect(prompts).toHaveLength(1)
+    expect(result.finalMessage).toContain('UPSTREAM PROVIDER FAILURE')
+    expect(result.finalMessage).toContain(`<verdict>${INCOMPLETE_REVIEW_VERDICT}</verdict>`)
+  })
+
+  test('reviewer: a provider failure is not reported as the reviewer failing to reach a verdict', async () => {
+    const { session } = providerFailingSession([[OVERLOADED]])
+
+    const result = await runReviewerOn(session)
+
+    if (!result.ok) throw new Error('expected ok=true')
+    expect(result.finalMessage).not.toContain('INCOMPLETE REVIEW')
+    expect(result.finalMessage).toContain('infrastructure failure')
+  })
+
+  test('reviewer: a model that merely omits the block still gets the full nudge budget and the model-fault wording', async () => {
+    const { session, prompts } = providerFailingSession([
+      [{ role: 'assistant', content: 'reading the files' }],
+      [{ role: 'assistant', content: 'still nothing' }],
+      [{ role: 'assistant', content: 'still nothing' }],
+    ])
+
+    const result = await runReviewerOn(session)
+
+    if (!result.ok) throw new Error('expected ok=true')
+    expect(prompts).toHaveLength(3)
+    expect(result.finalMessage).toContain('INCOMPLETE REVIEW')
+    expect(result.finalMessage).not.toContain('UPSTREAM PROVIDER FAILURE')
+  })
+
+  test('reviewer: a nudge that dies on the provider stops the loop instead of burning the last attempt', async () => {
+    const { session, prompts } = providerFailingSession([
+      [{ role: 'assistant', content: 'reading the files' }],
+      [OVERLOADED],
+      [{ role: 'assistant', content: 'never reached' }],
+    ])
+
+    const result = await runReviewerOn(session)
+
+    if (!result.ok) throw new Error('expected ok=true')
+    expect(prompts).toHaveLength(2)
+    expect(result.finalMessage).toContain('UPSTREAM PROVIDER FAILURE')
+  })
+
+  test('reviewer: a THROWN overload on the initial turn still reaches the provider-failure fallback', async () => {
+    const { session, prompts } = providerFailingSession([[{ throws: '429 Too Many Requests' }]])
+
+    const result = await runReviewerOn(session)
+
+    if (!result.ok) throw new Error(`expected ok=true, got error: ${result.error}`)
+    expect(prompts).toHaveLength(1)
+    expect(result.finalMessage).toContain('UPSTREAM PROVIDER FAILURE')
+    expect(result.finalMessage).toContain(`<verdict>${INCOMPLETE_REVIEW_VERDICT}</verdict>`)
+  })
+
+  test('reviewer: a THROWN overload on a nudge turn stops the loop and names the provider', async () => {
+    const { session, prompts } = providerFailingSession([
+      [{ role: 'assistant', content: 'reading the files' }],
+      [{ throws: 'Overloaded' }],
+      [{ role: 'assistant', content: 'never reached' }],
+    ])
+
+    const result = await runReviewerOn(session)
+
+    if (!result.ok) throw new Error(`expected ok=true, got error: ${result.error}`)
+    expect(prompts).toHaveLength(2)
+    expect(result.finalMessage).toContain('UPSTREAM PROVIDER FAILURE')
+  })
+
+  test('reviewer: an unrecognized exception still fails the subagent instead of being masked as an outage', async () => {
+    const { session } = providerFailingSession([[{ throws: 'TypeError: cannot read property of undefined' }]])
+
+    const result = await runReviewerOn(session)
+
+    expect(result.ok).toBe(false)
+  })
+
+  test('a subagent with no required block still FAILS on a thrown overload (no fallback to render it)', async () => {
+    // given: explorer has no requiredBlockTag, so there is no synthetic-result
+    // surface -- absorbing the throw here would report a clean run for a turn
+    // that never happened
+    const { session } = providerFailingSession([[{ throws: 'Overloaded' }]])
+    const registry = { explorer: { systemPrompt: 'X' } satisfies Subagent }
+
+    const { completion } = startSubagent('explorer', {
+      registry,
+      createSessionForSubagent: async () => session,
+      agentDir: '/agent',
+      userPrompt: 'q',
+      taskId: 'bg_explorer_overload',
+    })
+    const result = await completion
+
+    expect(result.ok).toBe(false)
+  })
+
   test('reviewer: the incomplete-review fallback can never carry a decisive verdict (re-review upgrade safety)', async () => {
     // given: a reviewer that exhausts its retries without reaching a verdict
     const { result } = await runReviewer([
