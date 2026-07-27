@@ -2423,6 +2423,17 @@ describe('agent-browser headed-mode wrapper (Layer 4.5)', () => {
     expect(installIdx).toBeLessThan(wrapperIdx)
   })
 
+  test('build-time wrapper marks its image ownership and applies the default user agent', () => {
+    const wrapper = extractWrapperBody(buildBaseDockerfile())
+    expect(wrapper).toContain('# typeclaw-agent-browser-image-wrapper')
+    expect(wrapper).toContain('has_user_agent=0')
+    expect(wrapper).toContain('--user-agent|--user-agent=*) has_user_agent=1; break ;;')
+    expect(wrapper).toContain(
+      "export AGENT_BROWSER_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'",
+    )
+    expect(wrapper).not.toContain('bundled-plugins/agent-browser/shim.ts')
+  })
+
   test('versioned per-agent Dockerfile omits the wrapper RUN block — the base image already carries it (paired with the install layer) so re-applying would mv a non-existent .real file and break the build', () => {
     const out = buildDockerfile(dockerfileSchema.parse({}), { baseImageVersion: '0.1.1' })
     expect(out).not.toContain('mv /usr/local/bin/agent-browser /usr/local/bin/agent-browser.real')
@@ -2466,6 +2477,7 @@ describe.skipIf(onWindows)('agent-browser headed-mode wrapper — executable beh
 {
   echo "args=[$*]"
   echo "HEADED=\${AGENT_BROWSER_HEADED-unset}"
+  echo "USER_AGENT=\${AGENT_BROWSER_USER_AGENT-unset}"
   echo "handled=\${_TYPECLAW_AGENT_BROWSER_HEADED_HANDLED-unset}"
   echo "---"
 } >> "${logfile}"
@@ -2510,6 +2522,22 @@ exit 0
     expect(calls).toHaveLength(1)
     expect(calls[0]).toContain('args=[snapshot]')
     expect(calls[0]).toContain('handled=unset')
+  })
+
+  test('injects the desktop Linux user agent when neither CLI nor environment selects one', async () => {
+    const { calls } = await runWrapper(['snapshot'])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toContain(
+      'USER_AGENT=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    )
+  })
+
+  test('preserves explicit user-agent flag and environment precedence', async () => {
+    const fromFlag = await runWrapper(['snapshot', '--user-agent=FlagAgent/1.0'])
+    expect(fromFlag.calls[0]).toContain('USER_AGENT=unset')
+
+    const fromEnv = await runWrapper(['snapshot'], { AGENT_BROWSER_USER_AGENT: 'EnvAgent/1.0' })
+    expect(fromEnv.calls[0]).toContain('USER_AGENT=EnvAgent/1.0')
   })
 
   test('AGENT_BROWSER_HEADED=1 + open: allowlist hit, pre-closes first then exec-passes through', async () => {

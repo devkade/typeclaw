@@ -1692,6 +1692,7 @@ RUN mv /usr/local/bin/agent-browser /usr/local/bin/agent-browser.real \\
  && cat > /usr/local/bin/agent-browser <<'TYPECLAW_AGENT_BROWSER_WRAPPER_EOF' \\
  && chmod +x /usr/local/bin/agent-browser
 #!/bin/sh
+# typeclaw-agent-browser-image-wrapper
 # typeclaw wrapper for agent-browser — see src/init/dockerfile.ts.
 set -e
 real="\${TYPECLAW_AGENT_BROWSER_REAL:-/usr/local/bin/agent-browser.real}"
@@ -1700,6 +1701,17 @@ real="\${TYPECLAW_AGENT_BROWSER_REAL:-/usr/local/bin/agent-browser.real}"
 # agent-browser while AGENT_BROWSER_HEADED is still set.
 if [ "\${_TYPECLAW_AGENT_BROWSER_HEADED_HANDLED:-}" = "1" ]; then
   exec "$real" "$@"
+fi
+# Match upstream precedence: an explicit --user-agent flag or non-empty
+# AGENT_BROWSER_USER_AGENT wins; otherwise use a current desktop Linux UA.
+has_user_agent=0
+for arg in "$@"; do
+  case "$arg" in
+    --user-agent|--user-agent=*) has_user_agent=1; break ;;
+  esac
+done
+if [ -z "\${AGENT_BROWSER_USER_AGENT:-}" ] && [ "$has_user_agent" = "0" ]; then
+  export AGENT_BROWSER_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 fi
 # Pre-close is only needed when the caller is requesting headed mode.
 # Match upstream's env_var_is_truthy contract (cli/src/flags.rs:183):

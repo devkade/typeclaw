@@ -27,9 +27,8 @@ let unsubscribeForwardResult: (() => void) | null = null
 
 export default definePlugin({
   plugin: async (ctx) => {
-    for (const binPath of Object.values(KNOWN_BIN_PATHS)) {
-      logInstallResult(ctx.logger, safeInstallShim(binPath))
-    }
+    logInstallResult(ctx.logger, safeInstallShim(KNOWN_BIN_PATHS.global))
+    logInstallResult(ctx.logger, safeInstallShim(KNOWN_BIN_PATHS.local, KNOWN_BIN_PATHS.global))
 
     requestDashboardForward(ctx.logger)
 
@@ -86,9 +85,9 @@ async function recordProxyPort(contents: string, logger: { warn: (msg: string) =
   }
 }
 
-function safeInstallShim(binPath: string): SafeResult {
+function safeInstallShim(binPath: string, delegateTarget?: string): SafeResult {
   try {
-    return installShim({ binPath })
+    return installShim({ binPath, delegateTarget })
   } catch (error) {
     return { kind: 'error', binPath, error }
   }
@@ -100,6 +99,10 @@ function logInstallResult(
 ): void {
   if (result.kind === 'installed') {
     logger.info(`installed agent-browser shim at ${result.binPath} (real bin stashed at ${result.stashTarget})`)
+    return
+  }
+  if (result.kind === 'delegated') {
+    logger.info(`installed agent-browser alias at ${result.binPath} (delegates to ${result.delegateTarget})`)
     return
   }
   if (result.kind === 'already-installed') {
