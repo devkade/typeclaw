@@ -49,9 +49,15 @@ describe('operator subagent declaration', () => {
     expect(sub.visibility).toBe('public')
   })
 
-  test('declares requiresSpecificPermission=true (member with generic subagent.spawn cannot spawn it)', () => {
+  test('does not require a specific permission (member with generic subagent.spawn can spawn it)', () => {
     const sub = createOperatorSubagent()
-    expect(sub.requiresSpecificPermission).toBe(true)
+    expect(sub.requiresSpecificPermission ?? false).toBe(false)
+  })
+
+  test('declares only builtin tools the spawner already holds (spawning grants no new capability)', () => {
+    const sub = createOperatorSubagent()
+    const names = (sub.tools ?? []).map((tool) => (tool as { __builtinTool: string }).__builtinTool)
+    expect(names.toSorted()).toEqual(['bash', 'edit', 'find', 'grep', 'ls', 'read', 'write'])
   })
 
   test('declares canSpawnSubagents=true (orchestration tools are wired into its session)', () => {
