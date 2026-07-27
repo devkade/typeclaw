@@ -1266,7 +1266,8 @@ RUN chmod +x ${TYPECLAW_CX_SESSION_START_HOOK_PATH} ${TYPECLAW_CX_STOP_HOOK_PATH
 
 // Shared-library runtime deps Chrome for Testing needs to launch on amd64
 // Debian trixie (base of `oven/bun:1-slim`). `agent-browser install
-// --with-deps` (v0.27.0) is supposed to install these but silently no-ops:
+// --with-deps` (still true at v0.33.0) is supposed to install these but
+// silently no-ops:
 // its hardcoded list omits `libglib2.0-0t64`, so Chrome dies on launch
 // with `libglib-2.0.so.0: cannot open shared object file` even though the
 // binary download and `--with-deps` both exit 0. We install the full
@@ -1641,7 +1642,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \\
 const renderAgentBrowserInstallLayer = (buildKit: boolean): string =>
   `# Layer 4 (volatile): install agent-browser globally so it survives the
 # runtime bind-mount over /agent/node_modules.
-RUN ${bunCacheMount(buildKit)}bun install -g agent-browser@^0.27.0`
+RUN ${bunCacheMount(buildKit)}bun install -g agent-browser@^0.33.0`
 
 // Layer 4.5: shim the agent-browser binary with a wrapper that calls
 // \`agent-browser close\` before \`open\`/\`goto\`/\`navigate\` when headed
