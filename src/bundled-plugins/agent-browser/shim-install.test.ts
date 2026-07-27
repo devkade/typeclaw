@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { resolve as resolvePath } from 'node:path'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve as resolvePath } from 'node:path'
 
 import { isWindows } from '@/shared'
 
@@ -198,6 +200,20 @@ describe.skipIf(onWindows)('installShim', () => {
     expect(fake.events).toEqual([])
   })
 
+  test('leaves the image-owned global wrapper untouched without a runtime stash', () => {
+    const fake = new FakeFs()
+    fake.files.set('/usr/local/bin/agent-browser', {
+      kind: 'file',
+      data: '#!/bin/sh\n# typeclaw-agent-browser-image-wrapper\nexec /usr/local/bin/agent-browser.real "$@"\n',
+      mode: 0o755,
+    })
+
+    const result = installShim({ binPath: '/usr/local/bin/agent-browser', shimEntry: '/x/shim.ts', fs: fake.fs() })
+
+    expect(result).toEqual({ kind: 'already-installed', binPath: '/usr/local/bin/agent-browser' })
+    expect(fake.events).toEqual([])
+  })
+
   test('returns no-upstream when nothing is at the bin path', () => {
     const fake = new FakeFs()
 
@@ -265,5 +281,83 @@ describe.skipIf(onWindows)('installShim', () => {
     expect(second.kind).toBe('no-upstream')
     expect(fake.events).toEqual(['unlink:/agent/node_modules/.bin/agent-browser'])
     expect(fake.files.has('/agent/node_modules/.bin/agent-browser')).toBe(false)
+  })
+
+  test('delegates the local npx entrypoint through the global wrapper without a stash', () => {
+    const root = mkdtempSync(join(tmpdir(), 'typeclaw-agent-browser-'))
+    try {
+      const globalBin = join(root, 'global-agent-browser')
+      const localBin = join(root, 'node_modules', '.bin', 'agent-browser')
+      const log = join(root, 'calls.log')
+      mkdirSync(dirname(localBin), { recursive: true })
+      writeFileSync(globalBin, '#!/bin/sh\nprintf "args=[%s]\\n" "$*" > "$LOGFILE"\n', { mode: 0o755 })
+      writeFileSync(localBin, '#!/bin/sh\nexit 99\n', { mode: 0o755 })
+      chmodSync(globalBin, 0o755)
+      chmodSync(localBin, 0o755)
+
+      const result = installShim({ binPath: localBin, delegateTarget: globalBin })
+
+      expect(result).toEqual({ kind: 'delegated', binPath: localBin, delegateTarget: globalBin })
+      const child = Bun.spawnSync([localBin, 'snapshot'], { env: { ...process.env, LOGFILE: log } })
+      expect(child.exitCode).toBe(0)
+      expect(readFileSync(log, 'utf-8')).toBe('args=[snapshot]\n')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('upgrades a stale local runtime shim into a global-wrapper alias', () => {
+    const root = mkdtempSync(join(tmpdir(), 'typeclaw-agent-browser-'))
+    try {
+      const globalBin = join(root, 'global-agent-browser')
+      const localBin = join(root, 'node_modules', '.bin', 'agent-browser')
+      const log = join(root, 'calls.log')
+      mkdirSync(dirname(localBin), { recursive: true })
+      writeFileSync(globalBin, '#!/bin/sh\nprintf "args=[%s]\\n" "$*" > "$LOGFILE"\n', { mode: 0o755 })
+      writeFileSync(localBin, '#!/bin/sh\n# typeclaw-agent-browser-shim\nexec /missing/agent-browser-real "$@"\n', {
+        mode: 0o755,
+      })
+      chmodSync(globalBin, 0o755)
+      chmodSync(localBin, 0o755)
+
+      const result = installShim({ binPath: localBin, delegateTarget: globalBin })
+
+      expect(result).toEqual({ kind: 'delegated', binPath: localBin, delegateTarget: globalBin })
+      const child = Bun.spawnSync([localBin, 'snapshot'], { env: { ...process.env, LOGFILE: log } })
+      expect(child.exitCode).toBe(0)
+      expect(readFileSync(log, 'utf-8')).toBe('args=[snapshot]\n')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('upgrades a local runtime shim whose stash still exists into a global-wrapper alias', () => {
+    const root = mkdtempSync(join(tmpdir(), 'typeclaw-agent-browser-'))
+    try {
+      const globalBin = join(root, 'global-agent-browser')
+      const localBin = join(root, 'node_modules', '.bin', 'agent-browser')
+      const stashDir = join(root, 'stash')
+      const log = join(root, 'calls.log')
+      mkdirSync(dirname(localBin), { recursive: true })
+      mkdirSync(stashDir, { recursive: true })
+      writeFileSync(globalBin, '#!/bin/sh\nprintf "args=[%s]\\n" "$*" > "$LOGFILE"\n', { mode: 0o755 })
+      writeFileSync(join(stashDir, 'agent-browser-real'), '#!/bin/sh\nexit 99\n', { mode: 0o755 })
+      writeFileSync(
+        localBin,
+        `#!/bin/sh\n# typeclaw-agent-browser-shim\nexec ${join(stashDir, 'agent-browser-real')} "$@"\n`,
+        { mode: 0o755 },
+      )
+      chmodSync(globalBin, 0o755)
+      chmodSync(localBin, 0o755)
+
+      const result = installShim({ binPath: localBin, stashDir, delegateTarget: globalBin })
+
+      expect(result).toEqual({ kind: 'delegated', binPath: localBin, delegateTarget: globalBin })
+      const child = Bun.spawnSync([localBin, 'open', 'https://x'], { env: { ...process.env, LOGFILE: log } })
+      expect(child.exitCode).toBe(0)
+      expect(readFileSync(log, 'utf-8')).toBe('args=[open https://x]\n')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })

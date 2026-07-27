@@ -16,11 +16,14 @@ const DEFAULT_GLOBAL_BIN_PATH = '/usr/local/bin/agent-browser'
 const DEFAULT_LOCAL_BIN_PATH = '/agent/node_modules/.bin/agent-browser'
 const STASH_ROOT = '/usr/local/lib/typeclaw-agent-browser'
 const SHIM_MARKER = '# typeclaw-agent-browser-shim'
+const IMAGE_WRAPPER_MARKER = '# typeclaw-agent-browser-image-wrapper'
+const LOCAL_ALIAS_MARKER = '# typeclaw-agent-browser-local-alias'
 
 export type InstallShimOptions = {
   binPath?: string
   stashDir?: string
   shimEntry?: string
+  delegateTarget?: string
   fs?: ShimFs
 }
 
@@ -42,6 +45,7 @@ export type ShimFs = {
 
 export type InstallShimResult =
   | { kind: 'installed'; realBin: string; binPath: string; stashTarget: string }
+  | { kind: 'delegated'; binPath: string; delegateTarget: string }
   | { kind: 'already-installed'; binPath: string }
   | { kind: 'no-upstream'; binPath: string }
 
@@ -55,13 +59,15 @@ export function installShim(opts: InstallShimOptions = {}): InstallShimResult {
   const stat = fs.lstat(binPath)
   if (stat === null) return { kind: 'no-upstream', binPath }
 
-  if (isAlreadyShim(binPath, fs)) {
+  const wrapperKind = getWrapperKind(binPath, fs)
+  if (wrapperKind === 'image' || wrapperKind === 'local-alias') {
+    return { kind: 'already-installed', binPath }
+  }
+  if (wrapperKind === 'runtime' && opts.delegateTarget === undefined) {
     if (fs.statExists(stashTarget)) return { kind: 'already-installed', binPath }
-    // Wrapper survived a container restart but the image-owned stash did not
-    // (STASH_ROOT lives outside the bind-mount). The wrapper now points at a
-    // non-existent stashTarget, so executing it would ENOENT. Drop it and
-    // report no-upstream — there is nothing valid here to preserve, and the
-    // global-path shim (if it exists) stands on its own.
+    // The stash this wrapper points at is gone (STASH_ROOT lives outside the
+    // bind-mount), so executing it would ENOENT. Nothing here is worth
+    // preserving; drop it and report no-upstream.
     fs.unlink(binPath)
     return { kind: 'no-upstream', binPath }
   }
@@ -72,6 +78,11 @@ export function installShim(opts: InstallShimOptions = {}): InstallShimResult {
   // anything — otherwise we'd stash a broken symlink and write a wrapper
   // pointing at a target that never resolves.
   if (!fs.statExists(binPath)) return { kind: 'no-upstream', binPath }
+  if (opts.delegateTarget !== undefined) {
+    fs.unlink(binPath)
+    fs.writeFile(binPath, renderDelegatingWrapper(opts.delegateTarget), 0o755)
+    return { kind: 'delegated', binPath, delegateTarget: opts.delegateTarget }
+  }
 
   const realBin = resolveCurrentTarget(binPath, stat, fs)
   fs.mkdirp(stashDir)
@@ -102,11 +113,14 @@ function defaultStashDir(binPath: string): string {
   return join(STASH_ROOT, slug)
 }
 
-function isAlreadyShim(binPath: string, fs: ShimFs): boolean {
+function getWrapperKind(binPath: string, fs: ShimFs): 'image' | 'local-alias' | 'runtime' | null {
   try {
-    return fs.readFile(binPath).includes(SHIM_MARKER)
+    const contents = fs.readFile(binPath)
+    if (contents.includes(IMAGE_WRAPPER_MARKER)) return 'image'
+    if (contents.includes(LOCAL_ALIAS_MARKER)) return 'local-alias'
+    return contents.includes(SHIM_MARKER) ? 'runtime' : null
   } catch {
-    return false
+    return null
   }
 }
 
@@ -121,6 +135,13 @@ function renderWrapper(shimEntry: string, stashTarget: string): string {
 ${SHIM_MARKER}
 export ${REAL_BIN_ENV}="\${${REAL_BIN_ENV}:-${stashTarget}}"
 exec bun run ${shimEntry} "$@"
+`
+}
+
+function renderDelegatingWrapper(delegateTarget: string): string {
+  return `#!/bin/sh
+${LOCAL_ALIAS_MARKER}
+exec "${delegateTarget}" "$@"
 `
 }
 
