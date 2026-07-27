@@ -43,7 +43,7 @@ State the success condition as something operator can check with `bash` — file
 
 Then stay responsive. When the completion `<system-reminder>` lands, weave operator's report into your next reply (in a channel session, surface it via `channel_reply`/`channel_send` — plain text is invisible there).
 
-If the `subagent.spawn.operator` gate denies (you're not owner/trusted tier), you can't delegate — fall back to doing the loop yourself, but apply the mechanics below to do it cleanly.
+If the spawn is denied (no `subagent.spawn` grant at all), you can't delegate — fall back to doing the loop yourself, but apply the mechanics below to do it cleanly.
 
 ## Mechanics operator should use (and you, if you can't delegate)
 
