@@ -5,9 +5,18 @@ import {
   detectProviderError,
   isObserverTtfbTimeout,
   isRetryableSameRef,
+  isThrottleOrOverload,
   subscribeProviderErrors,
 } from './provider-error'
-import { RETRIES_PER_REF, retryTurnAfterCompletedToolResult, retryTurnOnPersistentSession } from './retry-same-ref'
+import {
+  PATIENT_OVERLOAD_RETRIES,
+  PATIENT_OVERLOAD_WINDOW_MS,
+  patientOverloadBackoffMs,
+  RETRIES_PER_REF,
+  retryTurnAfterCompletedToolResult,
+  retryTurnOnPersistentSession,
+  type RetryPolicy,
+} from './retry-same-ref'
 import { modelThrottleCircuit, type ThrottleCircuit } from './throttle-circuit'
 
 export type PersistentTurnAttempt = {
@@ -42,11 +51,13 @@ export async function promptPersistentTurnWithFallback(opts: {
   shouldFailover: (err: Error) => boolean
   setModelForRef: (ref: ModelRef) => Promise<void>
   profile?: string
+  retryPolicy?: RetryPolicy
   circuit?: ThrottleCircuit
   skipProviderErrorSubscription?: boolean
   detectSoftErrorFromLeaf?: boolean
   authorizeRetryAfterCompletedToolResult?: () => boolean
   retryRandom?: () => number
+  patientBackoffMs?: (attempt: number) => number
   onRetryBackoffStart?: () => void
   beforeAttempt?: (ref: ModelRef) => void
   onAttemptFailed?: (attempt: PersistentTurnAttempt) => void
@@ -107,6 +118,9 @@ export async function promptPersistentTurnWithFallback(opts: {
       // later iterations resume via agent.continue() (no user-message re-append).
       let outcome: AttemptOutcome | undefined
       let retryAfterCompletedToolResult = false
+      let overloadRetries = 0
+      let patientWindowStartedAt: number | undefined
+      let nextDelayMs: number | undefined
       for (let retry = 0; ; retry++) {
         softError = undefined
         const attemptStartedAt = now()
@@ -119,10 +133,14 @@ export async function promptPersistentTurnWithFallback(opts: {
               ? await retryTurnAfterCompletedToolResult(opts.session, {
                   attempt: retry - 1,
                   authorize: () => opts.authorizeRetryAfterCompletedToolResult?.() === true,
+                  ...(nextDelayMs !== undefined ? { delayMs: nextDelayMs } : {}),
                   ...(opts.retryRandom !== undefined ? { random: opts.retryRandom } : {}),
                   ...(opts.onRetryBackoffStart !== undefined ? { onBackoffStart: opts.onRetryBackoffStart } : {}),
                 })
-              : await retryTurnOnPersistentSession(opts.session, { attempt: retry - 1 })
+              : await retryTurnOnPersistentSession(opts.session, {
+                  attempt: retry - 1,
+                  ...(nextDelayMs !== undefined ? { delayMs: nextDelayMs } : {}),
+                })
             // The safe continue-recipe couldn't apply: keep the PREVIOUS failure
             // outcome (never cleared) and let it drive the advance/return below.
             if (!retried) break
@@ -145,7 +163,27 @@ export async function promptPersistentTurnWithFallback(opts: {
         // Retry within budget only when the failure is same-ref retryable and
         // either no visible/tool activity occurred, or the caller explicitly
         // authorizes the strict post-tool-result resume recipe.
-        const retryableWithinBudget = retry < RETRIES_PER_REF && isRetryableSameRef(outcome.error.message)
+        // Overload means "this ref is out of capacity NOW", so the standing policy
+        // is to fail OVER rather than burn same-ref retries — which is why
+        // isRetryableSameRef excludes it. But on the LAST usable ref there is
+        // nothing to fail over to, and a single-ref chain is all last, so that
+        // policy leaves a capacity outage with no recovery whatsoever. A patient
+        // call site rides it out here instead; a responsive one still fails fast.
+        // Budget the delay BEFORE accepting the retry. Testing only the elapsed
+        // window lets a retry accepted just under the deadline sleep past it, so
+        // the next provider attempt would START after the window we advertise.
+        const nowMs = now()
+        const patientDelayMs =
+          opts.retryPolicy === 'patient' && isLast && isThrottleOrOverload(outcome.error.message)
+            ? (opts.patientBackoffMs ?? ((n: number) => patientOverloadBackoffMs(n, opts.retryRandom)))(overloadRetries)
+            : undefined
+        const patientElapsedMs = patientWindowStartedAt === undefined ? 0 : nowMs - patientWindowStartedAt
+        const patientOverload =
+          patientDelayMs !== undefined &&
+          overloadRetries < PATIENT_OVERLOAD_RETRIES &&
+          patientElapsedMs + patientDelayMs <= PATIENT_OVERLOAD_WINDOW_MS
+        const retryableWithinBudget =
+          patientOverload || (retry < RETRIES_PER_REF && isRetryableSameRef(outcome.error.message))
         const mayRetryWithoutActivity = !activity.producedAssistantOutput && !activity.startedToolExecution
         retryAfterCompletedToolResult =
           retryableWithinBudget &&
@@ -153,6 +191,13 @@ export async function promptPersistentTurnWithFallback(opts: {
           opts.authorizeRetryAfterCompletedToolResult?.() === true
         const mayRetry = retryableWithinBudget && (mayRetryWithoutActivity || retryAfterCompletedToolResult)
         if (!mayRetry) break
+        if (patientOverload) {
+          patientWindowStartedAt ??= nowMs
+          nextDelayMs = patientDelayMs
+          overloadRetries++
+        } else {
+          nextDelayMs = undefined
+        }
       }
 
       if (outcome === undefined) {
