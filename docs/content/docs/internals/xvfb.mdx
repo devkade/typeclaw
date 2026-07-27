@@ -60,7 +60,7 @@ Container Chrome uses SwiftShader (CPU WebGL). WebGL renderer reports `"ANGLE (G
 
 ## Layer 4.5: agent-browser headed-mode wrapper
 
-Works around [vercel-labs/agent-browser#1083](https://github.com/vercel-labs/agent-browser/issues/1083) ("headed silently ignored on existing session"). When a headless daemon is already running and a command requests headed, the existing browser is reused. Three upstream PRs (#660, #370, #387) have been open for months as of agent-browser 0.27.0.
+Works around [vercel-labs/agent-browser#1083](https://github.com/vercel-labs/agent-browser/issues/1083) ("headed silently ignored on existing session"). When a headless daemon is already running and a command requests headed, the existing browser is reused. Three upstream PRs (#660, #370, #387) have been open for months as of agent-browser 0.33.0.
 
 Patch: `mv` the real binary to `/usr/local/bin/agent-browser.real`; drop a POSIX shell wrapper at the original path. When headed mode is requested and the subcommand is `open`/`goto`/`navigate`, the wrapper runs `"$real" close` then exec-passes through to `.real`. Forces a clean relaunch.
 
@@ -72,6 +72,6 @@ Patch: `mv` the real binary to `/usr/local/bin/agent-browser.real`; drop a POSIX
 
 **Pre-close failure is non-fatal.** `"$real" close >/dev/null 2>&1 || true`. Wrapper still exec-passes.
 
-**Layer ordering.** 4.5 must run before Layer 5's `agent-browser install --with-deps` so the `mv` doesn't race the Chrome install. Wrapper is present in `buildBaseDockerfile` and the inline per-agent path, but NOT the versioned per-agent path (which FROMs the base image carrying the wrapper).
+**Layer ordering.** 4.5 must run before Layer 5's `agent-browser install` so the `mv` doesn't race the Chrome install. Wrapper is present in `buildBaseDockerfile` and the inline per-agent path, but NOT the versioned per-agent path (which FROMs the base image carrying the wrapper).
 
 **Removing when upstream merges.** Bump Layer 4 pin to the version with the fix, delete `LAYER_4_5_AGENT_BROWSER_HEADED_WRAPPER` + matching test block (search `#1083`), `typeclaw start --build`. Version bump alone removes it from existing agents because the Dockerfile regenerates on every `start`.
