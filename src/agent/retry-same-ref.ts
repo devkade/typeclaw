@@ -1,5 +1,5 @@
 import type { AgentSession } from './index'
-import { isRetryableSameRef, subscribeProviderErrors } from './provider-error'
+import { isRetryableSameRef, isThrottleOrOverload, subscribeProviderErrors } from './provider-error'
 
 // Same-ref retry policy. Conservative on purpose: the pi-ai provider layer ALSO
 // retries transport/5xx blips underneath us (WebSocket→SSE fallback + its own
@@ -11,6 +11,45 @@ import { isRetryableSameRef, subscribeProviderErrors } from './provider-error'
 export const RETRIES_PER_REF = 1
 const BASE_DELAY_MS = 1_000
 const MAX_DELAY_MS = 5_000
+
+// How much added latency a call site can absorb before the caller would rather
+// see a failure. Deliberately NOT the model-profile name: the retry layer cares
+// about latency tolerance, not which tier the operator configured. 'responsive'
+// is every interactive path (channel chat, TUI, slash commands, cron) and keeps
+// the historical fast-fail behavior; 'patient' is a background path where a
+// human is already waiting minutes for a considered answer. Today the only
+// producer is a subagent whose REQUESTED profile is `deep` (reviewer,
+// researcher) — see resolveRetryPolicy in subagents.ts.
+export type RetryPolicy = 'responsive' | 'patient'
+
+// Capacity backoff, used ONLY for throttle/overload under the 'patient' policy.
+// Kept separate from retryBackoffMs above on purpose: that curve (1–5s) is sized
+// for a one-off socket blip, and widening it globally would add dead air to the
+// TUI, slash commands, multimodal look-at, cron, and ordinary network errors.
+// An overload is a capacity outage measured in minutes, not milliseconds — the
+// incident that motivated this burned every retry in 4 seconds against a ~60s
+// outage — so it gets its own, much longer curve.
+//
+// Nominal delays are 10s, 20s, 30s, 30s, 30s, 30s (±20% jitter), so six retries
+// span roughly 120–180s of waiting and place the last attempt late enough to
+// outlive a two-minute blip.
+export const PATIENT_OVERLOAD_RETRIES = 6
+const PATIENT_OVERLOAD_BASE_MS = 10_000
+const PATIENT_OVERLOAD_CAP_MS = 30_000
+// Ceiling on when the LAST retry may START, not a hard wall on total elapsed
+// time: an attempt already in flight still runs to the observer's own 300s
+// overall deadline. The pathological upper bound is therefore ~8m, comfortably
+// inside the 30m reviewer/researcher spawn timeout.
+export const PATIENT_OVERLOAD_WINDOW_MS = 180_000
+
+// Proportional (±20%) rather than full jitter: full jitter can return ~0ms,
+// which against a capacity outage means retrying instantly into the same wall.
+// The floor keeps every wait meaningful while still decorrelating concurrent
+// subagents recovering from one upstream blip.
+export function patientOverloadBackoffMs(attempt: number, random: () => number = Math.random): number {
+  const nominal = Math.min(PATIENT_OVERLOAD_CAP_MS, PATIENT_OVERLOAD_BASE_MS * 2 ** attempt)
+  return Math.floor(nominal * (0.8 + random() * 0.4))
+}
 
 // Full-jitter exponential backoff: random in [0, min(cap, base·2^attempt)].
 // Jitter decorrelates concurrent turns (multiple channels/subagents recovering
@@ -58,7 +97,7 @@ type ContinuableAgent = {
 // no `agent.continue`) fails CLOSED — the caller falls back / surfaces instead.
 export async function retryTurnOnPersistentSession(
   session: AgentSession,
-  opts: { attempt: number; signal?: AbortSignal; random?: () => number } = { attempt: 0 },
+  opts: { attempt: number; signal?: AbortSignal; random?: () => number; delayMs?: number } = { attempt: 0 },
 ): Promise<boolean> {
   const agent = (session as { agent?: ContinuableAgent }).agent
   if (!agent || typeof agent.continue !== 'function') return false
@@ -67,7 +106,7 @@ export async function retryTurnOnPersistentSession(
   const leafRole = (messages[messages.length - 1] as { role?: unknown }).role
   if (leafRole !== 'assistant' && leafRole !== 'user') return false
 
-  await sleep(retryBackoffMs(opts.attempt, opts.random), opts.signal)
+  await sleep(opts.delayMs ?? retryBackoffMs(opts.attempt, opts.random), opts.signal)
   if (opts.signal?.aborted) return false
 
   // Drop only a trailing assistant error leaf; a trailing user message is already
@@ -153,11 +192,20 @@ function hasSameEntries(messages: unknown, expected: unknown[]): boolean {
 // WITHOUT the race (typeclaw owns the soft-error signal). On a non-retryable
 // failure it does exactly what a bare prompt() did: the throw propagates, or the
 // soft error stays on the leaf for the caller to read.
+export type SameRefPromptResult = { success: boolean; lastError?: Error }
+
 export async function promptWithSameRefRetryOnly(
   session: AgentSession,
   text: string,
   promptOpts?: Parameters<AgentSession['prompt']>[1],
-): Promise<void> {
+  opts: {
+    retryPolicy?: RetryPolicy
+    random?: () => number
+    now?: () => number
+    patientBackoffMs?: (attempt: number) => number
+  } = {},
+): Promise<SameRefPromptResult> {
+  const now = opts.now ?? (() => performance.now())
   let softError: Error | undefined
   // Feature-detect subscribe: some lightweight call sites / test fakes pass a
   // session without an event stream. Without it we simply can't observe soft
@@ -173,29 +221,61 @@ export async function promptWithSameRefRetryOnly(
     // transcript shape → retryTurnOnPersistentSession returns false) still
     // surfaces the original failure instead of resolving as a phantom success.
     let priorHardError: Error | undefined
+    let lastError: Error | undefined
+    let overloadRetries = 0
+    let patientWindowStartedAt: number | undefined
+    let nextDelayMs: number | undefined
     for (let attempt = 0; ; attempt++) {
       softError = undefined
       let hardError: Error | undefined
       try {
         if (attempt === 0) {
           await session.prompt(text, promptOpts)
-        } else if (!(await retryTurnOnPersistentSession(session, { attempt: attempt - 1 }))) {
+        } else if (
+          !(await retryTurnOnPersistentSession(session, {
+            attempt: attempt - 1,
+            ...(nextDelayMs !== undefined ? { delayMs: nextDelayMs } : {}),
+          }))
+        ) {
           // Continue-recipe not applicable: replay never happened, so the prior
           // failure stands — re-throw a hard error, or return to leave a soft
           // error on the leaf (bare-prompt() semantics).
           if (priorHardError !== undefined) throw priorHardError
-          return
+          return { success: false, ...(lastError !== undefined ? { lastError } : {}) }
         }
       } catch (err) {
         hardError = err instanceof Error ? err : new Error(String(err))
       }
       const error = hardError ?? softError
-      if (error === undefined) return
-      if (attempt >= RETRIES_PER_REF || !isRetryableSameRef(error.message)) {
+      if (error === undefined) return { success: true }
+      lastError = error
+      // A patient call site rides out a capacity outage on the same ref: there is
+      // no cross-ref failover on this path, so declining to retry an overload
+      // (isRetryableSameRef excludes it, expecting failover to handle it) would
+      // leave it with no recovery at all.
+      // The delay is budgeted BEFORE the retry is accepted: an elapsed-only check
+      // would let a retry taken just under the deadline sleep past it.
+      const nowMs = now()
+      const patientDelayMs =
+        opts.retryPolicy === 'patient' && isThrottleOrOverload(error.message)
+          ? (opts.patientBackoffMs ?? ((n: number) => patientOverloadBackoffMs(n, opts.random)))(overloadRetries)
+          : undefined
+      const patientElapsedMs = patientWindowStartedAt === undefined ? 0 : nowMs - patientWindowStartedAt
+      const patientOverload =
+        patientDelayMs !== undefined &&
+        overloadRetries < PATIENT_OVERLOAD_RETRIES &&
+        patientElapsedMs + patientDelayMs <= PATIENT_OVERLOAD_WINDOW_MS
+      if (patientOverload) {
+        patientWindowStartedAt ??= nowMs
+        nextDelayMs = patientDelayMs
+        overloadRetries++
+      } else if (attempt < RETRIES_PER_REF && isRetryableSameRef(error.message)) {
+        nextDelayMs = undefined
+      } else {
         // Out of budget or not retryable: preserve bare-prompt() semantics — a
         // hard error throws; a soft error stays on the leaf for the caller.
         if (hardError !== undefined) throw hardError
-        return
+        return { success: false, lastError: error }
       }
       priorHardError = hardError
     }

@@ -4,6 +4,7 @@ import type { ModelRef } from '@/config/providers'
 
 import type { AgentSession } from './index'
 import { isFailoverWorthy } from './provider-error'
+import { PATIENT_OVERLOAD_RETRIES, PATIENT_OVERLOAD_WINDOW_MS } from './retry-same-ref'
 import { ThrottleCircuit } from './throttle-circuit'
 import { promptPersistentTurnWithFallback } from './turn-runner'
 
@@ -1082,5 +1083,162 @@ describe('promptPersistentTurnWithFallback same-ref retry', () => {
     // one throttle record would need THRESHOLD(2) to open; a single turn must not
     // reach it — the circuit stays closed for REF_A.
     expect(circuit.isOpen({ profile: 'default', ref: REF_A })).toBe(false)
+  })
+})
+
+describe('promptPersistentTurnWithFallback patient overload retry', () => {
+  const patientOpts = {
+    circuit: new ThrottleCircuit(),
+    shouldFailover: (err: Error) => isFailoverWorthy(err.message),
+    setModelForRef: async () => {},
+    patientBackoffMs: () => 0,
+  }
+
+  test('rides out a capacity outage on a single-ref chain and recovers', async () => {
+    const fake = retryableFakeSession(['soft-throttle', 'soft-throttle', 'soft-throttle', 'success'])
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'review this',
+      retryPolicy: 'patient',
+    })
+
+    expect(result.success).toBe(true)
+    expect(fake.attempts()).toBe(4)
+  })
+
+  test('a responsive call site still fails fast on the same outage', async () => {
+    const fake = retryableFakeSession(['soft-throttle', 'soft-throttle', 'soft-throttle', 'success'])
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'hi',
+      retryPolicy: 'responsive',
+    })
+
+    expect(result.success).toBe(false)
+    expect(fake.attempts()).toBe(1)
+  })
+
+  test('omitting retryPolicy keeps the historical fast-fail behavior', async () => {
+    const fake = retryableFakeSession(['soft-throttle', 'success'])
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'hi',
+    })
+
+    expect(result.success).toBe(false)
+    expect(fake.attempts()).toBe(1)
+  })
+
+  test('gives up once the patient retry budget is exhausted', async () => {
+    const fake = retryableFakeSession(['soft-throttle'])
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'review this',
+      retryPolicy: 'patient',
+    })
+
+    expect(result.success).toBe(false)
+    expect(fake.attempts()).toBe(PATIENT_OVERLOAD_RETRIES + 1)
+  })
+
+  test('stops retrying once the patient window has elapsed', async () => {
+    const fake = retryableFakeSession(['soft-throttle'])
+    let clock = 0
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'review this',
+      retryPolicy: 'patient',
+      now: () => {
+        clock += PATIENT_OVERLOAD_WINDOW_MS
+        return clock
+      },
+    })
+
+    expect(result.success).toBe(false)
+    expect(fake.attempts()).toBeLessThan(PATIENT_OVERLOAD_RETRIES + 1)
+  })
+
+  test('rejects a retry whose backoff would start after the advertised window', async () => {
+    // given: a clock that lands 50ms inside the window, leaving no room for the
+    // 100ms backoff -- elapsed alone still passes, elapsed + backoff does not
+    const BACKOFF_MS = 100
+    const STEP_MS = PATIENT_OVERLOAD_WINDOW_MS - 50
+    let clock = 0
+    const fake = retryableFakeSession(['soft-throttle'], () => {
+      clock += STEP_MS
+    })
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'review this',
+      retryPolicy: 'patient',
+      patientBackoffMs: () => BACKOFF_MS,
+      now: () => clock,
+    })
+
+    // then: only the first retry is taken. A window check that ignored the
+    // backoff would have accepted a second one and started it past the deadline.
+    expect(result.success).toBe(false)
+    expect(fake.attempts()).toBe(2)
+  })
+
+  test('a non-terminal ref fails OVER immediately instead of waiting patiently', async () => {
+    const fake = retryableFakeSession(['soft-throttle', 'soft-throttle', 'success'])
+    const attemptedRefs: ModelRef[] = []
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [REF_A, ANTHROPIC_REF],
+      currentModelRef: REF_A,
+      session: fake.session,
+      text: 'review this',
+      retryPolicy: 'patient',
+      beforeAttempt: (ref) => {
+        attemptedRefs.push(ref)
+      },
+    })
+
+    expect(result.success).toBe(true)
+    expect(attemptedRefs).toEqual([REF_A, ANTHROPIC_REF])
+    expect(fake.attempts()).toBe(3)
+  })
+
+  test('refuses a patient replay after the model already produced output', async () => {
+    const fake = fakeSession(['text-then-throttle', 'success'])
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'review this',
+      retryPolicy: 'patient',
+    })
+
+    expect(result.success).toBe(false)
+    expect(fake.prompted).toHaveLength(1)
   })
 })

@@ -10,8 +10,8 @@ import { applyTurnThinkingLevel } from './attention-escalation'
 import { type AgentSession, createSession, type PluginSessionWiring } from './index'
 import { resolveFallbackChain } from './model-fallback'
 import { applyModelRuntimeOverrides } from './model-overrides'
-import { isFailoverWorthy, subscribeProviderErrors } from './provider-error'
-import { promptWithSameRefRetryOnly } from './retry-same-ref'
+import { detectHardProviderError, isFailoverWorthy, subscribeProviderErrors } from './provider-error'
+import { promptWithSameRefRetryOnly, type RetryPolicy } from './retry-same-ref'
 import type { SubagentBashPolicy } from './reviewer-bash-policy'
 import type { SessionOrigin } from './session-origin'
 import {
@@ -300,8 +300,35 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
       normalizeSubagentSession(await createSessionForSubagent(subagent, sessionOptions))
     let aborted = false
     let activeModelRef = resolveFallbackChain(getConfig().models, resolveSubagentProfile(subagent, sessionOptions))[0]!
-    let drainWatch: SubagentDrainWatch | undefined
+    // Latency tolerance is decided ONCE here, from the REQUESTED profile — not the
+    // one resolveProfile() landed on. A `deep` subagent whose operator never
+    // configured `models.deep` still runs on a background path nobody is watching
+    // live, so it stays patient; a spawn explicitly overridden onto `fast` is an
+    // explicit request for responsiveness and loses it.
+    const retryPolicy: RetryPolicy =
+      resolveSubagentProfile(subagent, sessionOptions) === 'deep' ? 'patient' : 'responsive'
+    // MUST be updated after every turn — initial, drain, and nudge — so a later
+    // success clears an earlier failure and the guard below reads the true state.
+    let latestTurnFailure: Error | undefined
     const requiredBlockTag = REQUIRED_FINAL_BLOCK[name]
+    // A provider failure reaches us as EITHER a soft leaf error or a hard throw
+    // (the turn runner rethrows a hard outcome once the chain is spent, and
+    // promptWithSameRefRetryOnly rethrows an exhausted hard error). Recording only
+    // the soft shape would let a thrown outage escape as a subagent crash and skip
+    // the required-block fallback entirely.
+    //
+    // Absorbing the throw is only safe where that fallback exists to turn it into
+    // an honest synthetic result. A subagent with no required block has no such
+    // surface, so swallowing there would report a clean ok:true for a turn that
+    // never ran. Those keep failing, as does anything unrecognized — loop-guard
+    // aborts, spawn timeouts, real bugs.
+    const recordHardProviderFailure = (err: unknown): void => {
+      if (requiredBlockTag === undefined) throw err
+      const detected = detectHardProviderError(err)
+      if (detected === null) throw err
+      latestTurnFailure = new Error(detected.message)
+    }
+    let drainWatch: SubagentDrainWatch | undefined
     const capture = attachFinalMessageCapture(session, requiredBlockTag, options.onFinalMessageCaptured ?? (() => {}))
     if (options.onSessionCreated !== undefined) {
       options.onSessionCreated({
@@ -346,6 +373,7 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
           refs: resolveFallbackChain(getConfig().models, resolveSubagentProfile(subagent, sessionOptions)),
           currentModelRef: activeModelRef,
           profile: resolveSubagentProfile(subagent, sessionOptions),
+          retryPolicy,
           session,
           text: turnText,
           skipProviderErrorSubscription: true,
@@ -367,7 +395,10 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
           },
         })
         if (result.success) activeModelRef = result.refUsed
+        latestTurnFailure = result.success ? undefined : result.lastError
         throwIfLoopGuardAborted(session)
+      } catch (err) {
+        recordHardProviderFailure(err)
       } finally {
         if (hooks && turnEvent !== undefined) {
           await hooks.runSessionTurnEnd(turnEvent)
@@ -377,7 +408,17 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
         await runSubagentDrain(drainWatch, {
           drain: backgroundDrain,
           prompt: async (text) => {
-            await promptWithSameRefRetryOnly(session, `${renderTurnTimeAnchor()}\n\n${text}`)
+            try {
+              const drained = await promptWithSameRefRetryOnly(
+                session,
+                `${renderTurnTimeAnchor()}\n\n${text}`,
+                undefined,
+                { retryPolicy },
+              )
+              latestTurnFailure = drained.success ? undefined : drained.lastError
+            } catch (err) {
+              recordHardProviderFailure(err)
+            }
             throwIfLoopGuardAborted(session)
           },
           cancelled: () => aborted,
@@ -392,23 +433,39 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
       // final contract-repair pass, not another research phase; it deliberately
       // does NOT re-run the drain.
       if (requiredBlockTag !== undefined) {
+        // `latestTurnFailure` set means the last turn died on an upstream provider
+        // error rather than finishing without the block. Nudging is then pointless
+        // — the nudge is itself a model call, so it hits the same failing provider
+        // and returns in ms, burning the whole budget in seconds against an outage
+        // that outlives it. Skip straight to a fallback that names the real cause.
         for (
           let attempt = 1;
-          !aborted && !capture.hasRequiredBlock() && attempt <= MAX_REQUIRED_BLOCK_RETRIES;
+          !aborted &&
+          !capture.hasRequiredBlock() &&
+          latestTurnFailure === undefined &&
+          attempt <= MAX_REQUIRED_BLOCK_RETRIES;
           attempt++
         ) {
           console.warn(
             `[subagent] ${name} required_block_retry attempt=${attempt}/${MAX_REQUIRED_BLOCK_RETRIES} tag=${requiredBlockTag}`,
           )
-          await promptWithSameRefRetryOnly(
-            session,
-            `${renderTurnTimeAnchor()}\n\n${renderRequiredBlockRetryNudge(requiredBlockTag)}`,
-          )
+          try {
+            const nudge = await promptWithSameRefRetryOnly(
+              session,
+              `${renderTurnTimeAnchor()}\n\n${renderRequiredBlockRetryNudge(requiredBlockTag)}`,
+              undefined,
+              { retryPolicy },
+            )
+            if (!nudge.success) latestTurnFailure = nudge.lastError
+          } catch (err) {
+            recordHardProviderFailure(err)
+          }
           throwIfLoopGuardAborted(session)
         }
         if (!aborted && !capture.hasRequiredBlock()) {
-          console.warn(`[subagent] ${name} required_block_fallback tag=${requiredBlockTag}`)
-          capture.setSyntheticFinalMessage(renderMissingRequiredBlockFallback(name, requiredBlockTag))
+          const reason: MissingBlockReason = latestTurnFailure !== undefined ? 'provider-failure' : 'missing-block'
+          console.warn(`[subagent] ${name} required_block_fallback tag=${requiredBlockTag} reason=${reason}`)
+          capture.setSyntheticFinalMessage(renderMissingRequiredBlockFallback(name, requiredBlockTag, reason))
         }
       }
       if (hooks && sessionId !== undefined) {
@@ -686,14 +743,26 @@ Output exactly one <${tag}> block and nothing else.`
 // src/skills/typeclaw-channel-github/SKILL.md.
 export const INCOMPLETE_REVIEW_VERDICT = 'incomplete-review-not-a-verdict'
 
+// Why the block is missing. 'missing-block' is the model's own doing — it ended
+// its turn without emitting the block. 'provider-failure' is an upstream outage:
+// the turn never ran to completion at all. Both produce the SAME sentinel verdict
+// (the downstream contract is identical — no analysis landed), but the prose must
+// name the real cause, or an operator reading a capacity outage is told the
+// subagent misbehaved and re-runs it straight into the same wall.
+type MissingBlockReason = 'missing-block' | 'provider-failure'
+
 // The terminal graceful fallback when the nudges are exhausted. It fabricates NO
 // findings — only a structured "could not complete" notice — so the parent gets
 // a usable result instead of stale `<analysis>` or a hard error.
-function renderMissingRequiredBlockFallback(name: string, tag: FinalBlockTag): string {
+function renderMissingRequiredBlockFallback(name: string, tag: FinalBlockTag, reason: MissingBlockReason): string {
+  const providerFailed = reason === 'provider-failure'
+  const cause = providerFailed
+    ? `the upstream model provider kept failing (capacity/outage), so the turn never completed`
+    : `it ended without emitting the required <${tag}> block`
   if (tag === 'report') {
     return `<report>
 <summary>
-The ${name} subagent could not complete a research report in this run: it ended without emitting the required <report> block (a known cause is the report tool not completing). Do not treat any earlier analysis text as findings — rerun the researcher or gather the sources directly if the answer is still needed.
+The ${name} subagent could not complete a research report in this run: ${cause}${providerFailed ? '' : ' (a known cause is the report tool not completing)'}. Do not treat any earlier analysis text as findings — rerun the researcher or gather the sources directly if the answer is still needed.
 </summary>
 <report_file>
 none
@@ -707,16 +776,20 @@ The original research request remains unresolved; rerun the ${name} subagent or 
 </report>`
   }
   if (tag === 'review') {
+    const headline = providerFailed ? 'UPSTREAM PROVIDER FAILURE — NOT A VERDICT' : 'INCOMPLETE REVIEW — NOT A VERDICT'
+    const remedy = providerFailed
+      ? 'This is an infrastructure failure, not a judgement on the code. Re-request the review once the provider recovers; do not report it as a review that found nothing.'
+      : 'Re-request the review; if it still cannot complete, post an honest "review could not be completed" note and leave existing review state unchanged.'
     return `<review>
 <summary>
-INCOMPLETE REVIEW — NOT A VERDICT. The ${name} subagent could not complete a review in this run: it ended without emitting the required <review> block. No findings were produced and no verdict was reached — do not treat any earlier text as a verdict, and do NOT map this to APPROVE/REQUEST_CHANGES/COMMENT (including on a re-review). Re-request the review; if it still cannot complete, post an honest "review could not be completed" note and leave existing review state unchanged.
+${headline}. The ${name} subagent could not complete a review in this run: ${cause}. No findings were produced and no verdict was reached — do not treat any earlier text as a verdict, and do NOT map this to APPROVE/REQUEST_CHANGES/COMMENT (including on a re-review). ${remedy}
 </summary>
 <findings>
 </findings>
 <verdict>${INCOMPLETE_REVIEW_VERDICT}</verdict>
 </review>`
   }
-  return `<${tag}>\nThe ${name} subagent ended without emitting the required <${tag}> block and could not recover; rerun it or inspect the transcript.\n</${tag}>`
+  return `<${tag}>\nThe ${name} subagent could not produce the required <${tag}> block (${cause}) and could not recover; rerun it or inspect the transcript.\n</${tag}>`
 }
 
 type SubagentCapture = {
