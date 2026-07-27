@@ -506,6 +506,32 @@ describe('createSpawnSubagentTool — permissions gating', () => {
     const details = result.details as { ok: boolean }
     expect(details.ok).toBe(true)
   })
+
+  test('operator (no requiresSpecificPermission) is spawnable on the generic member grant', async () => {
+    const session = stubSession()
+    const { tool } = fixedSpawn({
+      createSession: async () => session,
+      registry: { operator: { systemPrompt: 'You are the operator.', visibility: 'public' } },
+      permissions: permService(new Set(['subagent.spawn'])),
+    })
+
+    const result = await tool.execute('call_1', { subagent_type: 'operator', prompt: 'q' }, undefined, undefined, ctx)
+    const details = result.details as { ok: boolean }
+    expect(details.ok).toBe(true)
+  })
+
+  test('the legacy subagent.spawn.operator grant still admits operator on its own', async () => {
+    const session = stubSession()
+    const { tool } = fixedSpawn({
+      createSession: async () => session,
+      registry: { operator: { systemPrompt: 'You are the operator.', visibility: 'public' } },
+      permissions: permService(new Set(['subagent.spawn.operator'])),
+    })
+
+    const result = await tool.execute('call_1', { subagent_type: 'operator', prompt: 'q' }, undefined, undefined, ctx)
+    const details = result.details as { ok: boolean }
+    expect(details.ok).toBe(true)
+  })
 })
 
 describe('createSpawnSubagentTool — concurrency', () => {

@@ -71,8 +71,15 @@ export function createOperatorSubagent(): Subagent<OperatorPayload> {
     payloadSchema: operatorPayloadSchema,
     visibility: 'public',
     rosterDescription:
-      'write-capable: bash-with-side-effects, write, edit — for browser sessions, refactors, deploys, batch ops, and Claude Code / Codex CLI driving; gated by `subagent.spawn.operator`, owner/trusted only — on denial, do the work yourself',
-    requiresSpecificPermission: true,
+      'write-capable: bash-with-side-effects, write, edit — for browser sessions, refactors, deploys, batch ops, and Claude Code / Codex CLI driving; runs at YOUR role, so it can do nothing here you could not already do inline',
+    // No `requiresSpecificPermission`: a subagent inherits `spawnedByRole`, and
+    // main sessions are never narrowed to a subset of the builtin tools, so a
+    // caller already holds every tool listed above. Gating the spawn bought no
+    // authorization — it only forced the same mutations to happen inline, in a
+    // dirtier context, and (unlike this subagent) with `channel_reply` in reach.
+    // The real boundaries are the non-ackable escalation guards, hidden-path
+    // masking, and the github-cli-auth token overlay, all of which bind parent
+    // and child identically.
     canSpawnSubagents: true,
     inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     toolResultBudget: {
