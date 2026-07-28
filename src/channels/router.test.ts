@@ -10445,7 +10445,7 @@ describe('ChannelRouter history dispatch', () => {
     expect(slackCalls).toBe(0)
   })
 
-  test('a hung history callback times out and degrades to history-not-supported', async () => {
+  test('a hung history callback times out as an adapter error, never as history-not-supported', async () => {
     // given a fetchHistory callback that never resolves (production failure
     // mode: same root cause as the hung name resolver — REST stuck inside
     // the cold-start chain). Without the timeout, prefetchChannelContext
@@ -10469,10 +10469,22 @@ describe('ChannelRouter history dispatch', () => {
     const result = await router.fetchHistory('discord-bot', { chat: 'c1', thread: null, limit: 1 })
     const elapsed = Date.now() - start
 
-    // then it returns the not-supported degraded result and logs the timeout
+    // then it reports a live adapter failure — not a missing capability — and logs the timeout
     expect(elapsed).toBeLessThan(500)
     expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected a failed history fetch')
+    expect(result.error).toContain('history-adapter-error')
+    expect(result.error).not.toContain('history-not-supported')
     expect(logs.some((l) => l.includes('history fetch threw') && l.includes('timed out after 50ms'))).toBe(true)
+  })
+
+  test('an adapter with no registered history callback still reports history-not-supported', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+
+    const result = await router.fetchHistory('telegram-bot', { chat: 'c1', thread: null, limit: 1 })
+
+    expect(result).toEqual({ ok: false, error: 'history-not-supported' })
   })
 })
 
@@ -10542,7 +10554,7 @@ describe('ChannelRouter message-get dispatch', () => {
     expect(result).toEqual({ ok: false, error: 'message-get-not-supported', code: 'not-supported' })
   })
 
-  test('a hung message-get callback times out and degrades to not-supported', async () => {
+  test('a hung message-get callback times out as an adapter error, never as not-supported', async () => {
     const dir = await tempDir()
     const router = createChannelRouter({
       agentDir: dir,
@@ -10557,7 +10569,26 @@ describe('ChannelRouter message-get dispatch', () => {
     const elapsed = Date.now() - start
 
     expect(elapsed).toBeLessThan(500)
-    expect(result).toEqual({ ok: false, error: 'message-get-not-supported', code: 'not-supported' })
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected a failed message-get')
+    expect(result.code).toBe('adapter-error')
+    expect(result.error).toContain('message-get-adapter-error')
+    expect(result.error).toContain('NOT an unsupported capability')
+  })
+
+  test('a throwing message-get callback reports the failure rather than claiming the capability is missing', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    router.registerMessageGet('discord-bot', async () => {
+      throw new Error('http 401')
+    })
+
+    const result = await router.getMessage('discord-bot', { chat: 'c1', thread: null, messageId: 'm1' })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected a failed message-get')
+    expect(result.code).toBe('adapter-error')
+    expect(result.error).not.toContain('not-supported')
   })
 })
 
@@ -10621,6 +10652,44 @@ describe('ChannelRouter channel-list dispatch', () => {
     const result = await router.listChannels('slack-bot', { workspace: 'T0', limit: 50 })
 
     expect(result).toEqual({ ok: false, error: 'list-not-supported', code: 'not-supported' })
+  })
+
+  test('a throwing list callback reports an adapter error rather than claiming list is unsupported', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    router.registerList('slack-bot', async () => {
+      throw new Error('http 401')
+    })
+
+    const result = await router.listChannels('slack-bot', { workspace: 'T0', limit: 50 })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected a failed listChannels')
+    expect(result.code).toBe('adapter-error')
+    expect(result.error).toContain('list-adapter-error')
+    expect(result.error).not.toContain('list-not-supported')
+  })
+
+  test('a hung list callback times out as an adapter error, never as not-supported', async () => {
+    const dir = await tempDir()
+    const router = createChannelRouter({
+      agentDir: dir,
+      configForAdapter: () => baseConfig,
+      fetchHistoryTimeoutMs: 50,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+    router.registerList('slack-bot', () => new Promise(() => {}))
+
+    const start = Date.now()
+    const result = await router.listChannels('slack-bot', { workspace: 'T0', limit: 50 })
+    const elapsed = Date.now() - start
+
+    expect(elapsed).toBeLessThan(500)
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected a failed listChannels')
+    expect(result.code).toBe('adapter-error')
+    expect(result.error).toContain('list-adapter-error')
+    expect(result.error).not.toContain('list-not-supported')
   })
 })
 

@@ -4080,6 +4080,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ? `${capability}-adapter-unavailable: the "${adapter}" adapter is configured but not currently running (it likely failed to start, e.g. an expired token or auth error — check the container logs and re-authenticate)`
       : `${capability}-not-supported`
 
+  // A live callback that throws or times out is a FAILURE of a capability the
+  // adapter has, not the absence of one. Collapsing it into `*-not-supported`
+  // would tell the model the feature does not exist, and it will relay that to
+  // a human as fact. The underlying error stays in the logs rather than the
+  // model-facing string, matching `missingCallbackError`.
+  const callbackFailureError = (adapter: ChannelKey['adapter'], capability: ReadCapability): string =>
+    `${capability}-adapter-error: the "${adapter}" adapter supports ${capability} but the call failed or timed out. This is a live adapter failure, NOT an unsupported capability — check the container logs for the underlying error, then retry.`
+
   const isWriteCapabilityUnavailable = (adapter: ChannelKey['adapter'], capability: WriteCapability): boolean =>
     configuredAdapters.has(adapter) && ADAPTER_WRITE_CAPABILITIES[adapter].includes(capability)
 
@@ -4099,7 +4107,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         lastError = result
       } catch (err) {
         logger.warn(`[channels] history fetch threw for ${adapter}: ${describe(err)}`)
-        lastError = { ok: false, error: 'history-not-supported' }
+        lastError = { ok: false, error: callbackFailureError(adapter, 'history') }
       }
     }
     return lastError
@@ -4123,7 +4131,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return await raceWithTimeout(cb(args), fetchHistoryTimeoutMs, `[channels] ${adapter} message get`)
     } catch (err) {
       logger.warn(`[channels] message get threw for ${adapter}: ${describe(err)}`)
-      return { ok: false, error: 'message-get-not-supported', code: 'not-supported' }
+      return { ok: false, error: callbackFailureError(adapter, 'message-get'), code: 'adapter-error' }
     }
   }
 
@@ -4145,7 +4153,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return await raceWithTimeout(cb(args), fetchHistoryTimeoutMs, `[channels] ${adapter} list channels`)
     } catch (err) {
       logger.warn(`[channels] list channels threw for ${adapter}: ${describe(err)}`)
-      return { ok: false, error: 'list-not-supported', code: 'not-supported' }
+      return { ok: false, error: callbackFailureError(adapter, 'list'), code: 'adapter-error' }
     }
   }
 
