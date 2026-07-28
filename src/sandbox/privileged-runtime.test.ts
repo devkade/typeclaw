@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { buildSandboxedCommand } from './build'
+import { SandboxCredentialWithheldError } from './errors'
 import {
+  AGENT_MESSENGER_BINS,
   cleanupPrivilegedSandboxRuntime,
   resolvePrivilegedSandboxRuntime,
   verifyPrivilegedSandboxRuntime,
@@ -81,17 +83,87 @@ describe('resolvePrivilegedSandboxRuntime', () => {
   })
 
   test('keeps auth diagnostics executable but supplies no credential profile', async () => {
-    for (const command of [
-      'claude setup-token',
-      'gws auth status',
-      'agent-slack auth status',
-      'agent-slack --account test auth status',
-    ]) {
+    for (const command of ['claude setup-token', 'gws auth status']) {
       expect(await resolvePrivilegedSandboxRuntime({ agentDir, homeDir: home, env: {}, command })).toEqual({
         env: {},
         mounts: [],
       })
     }
+  })
+
+  test.each([
+    'agent-slack auth status',
+    'agent-slack --account test auth status',
+    'agent-slack channel list',
+    'bunx agent-slackbot message list general',
+  ])('refuses agent-messenger command %s rather than letting it fail as an auth error', async (command) => {
+    await expect(resolvePrivilegedSandboxRuntime({ agentDir, homeDir: home, env: {}, command })).rejects.toBeInstanceOf(
+      SandboxCredentialWithheldError,
+    )
+  })
+
+  test('the agent-messenger refusal disclaims being evidence about upstream authentication', async () => {
+    const thrown = await resolvePrivilegedSandboxRuntime({
+      agentDir,
+      homeDir: home,
+      env: {},
+      command: 'agent-slack message search hello',
+    }).catch((error: unknown) => error)
+
+    expect(thrown).toBeInstanceOf(SandboxCredentialWithheldError)
+    const { message } = thrown as Error
+    expect(message).toContain('LOCAL sandbox policy decision')
+    expect(message).toContain('NOT evidence that the workspace, account, or upstream service lacks authentication')
+    expect(message).toContain('channel_read')
+  })
+
+  test.each([
+    'agent-slack auth status 2>&1',
+    'bun x agent-messenger slack message list general',
+    'bun run agent-slackbot channel list',
+    'npx agent-messenger slack message search hello',
+    'pnpx agent-messenger slack message search hello',
+    'cd /tmp && agent-slack channel list',
+    'amsg slack message list general',
+    'agent-slack channel list | head -5',
+    '/agent/node_modules/.bin/agent-slack channel list',
+    'AGENT_MESSENGER_CONFIG_DIR=/tmp agent-slack channel list',
+  ])('refuses %s, which would otherwise reach the model as an upstream auth error', async (command) => {
+    await expect(resolvePrivilegedSandboxRuntime({ agentDir, homeDir: home, env: {}, command })).rejects.toBeInstanceOf(
+      SandboxCredentialWithheldError,
+    )
+  })
+
+  test('names the actual bin it refused so the message cannot misdescribe the command', async () => {
+    const thrown = await resolvePrivilegedSandboxRuntime({
+      agentDir,
+      homeDir: home,
+      env: {},
+      command: 'bunx amsg slack message list general',
+    }).catch((error: unknown) => error)
+
+    expect((thrown as Error).message).toContain('`amsg`')
+  })
+
+  test.each(['agent-lint --fix src', 'agent-browser open https://example.com'])(
+    'leaves unrelated executable %s runnable rather than claiming it needs agent-messenger credentials',
+    async (command) => {
+      expect(await resolvePrivilegedSandboxRuntime({ agentDir, homeDir: home, env: {}, command })).toEqual({
+        env: {},
+        mounts: [],
+      })
+    },
+  )
+
+  test('agent-browser stays runnable because it holds no agent-messenger credential profile', async () => {
+    expect(
+      await resolvePrivilegedSandboxRuntime({
+        agentDir,
+        homeDir: home,
+        env: {},
+        command: 'agent-browser open https://example.com',
+      }),
+    ).toEqual({ env: {}, mounts: [] })
   })
 
   test('does not follow a symlinked Codex auth file because Codex profiles are never brokered', async () => {
@@ -134,13 +206,14 @@ describe('resolvePrivilegedSandboxRuntime', () => {
     })
     expect(gwsRuntime).toEqual({ env: {}, mounts: [] })
 
-    const messengerRuntime = await resolvePrivilegedSandboxRuntime({
-      agentDir,
-      homeDir: home,
-      env: { AGENT_MESSENGER_CONFIG_DIR: messenger },
-      command: 'agent-slack channel list',
-    })
-    expect(messengerRuntime).toEqual({ env: {}, mounts: [] })
+    await expect(
+      resolvePrivilegedSandboxRuntime({
+        agentDir,
+        homeDir: home,
+        env: { AGENT_MESSENGER_CONFIG_DIR: messenger },
+        command: 'agent-slack channel list',
+      }),
+    ).rejects.toBeInstanceOf(SandboxCredentialWithheldError)
   })
 
   test('does not expose git config to an unknown alias command', async () => {
@@ -234,5 +307,14 @@ describe('resolvePrivilegedSandboxRuntime', () => {
     expect(await Promise.all(generated.map((source) => Bun.file(source).exists()))).toEqual(
       Array.from({ length: generated.length }, () => false),
     )
+  })
+})
+
+describe('agent-messenger bin manifest lockstep', () => {
+  test('the refused bin set matches every bin the installed agent-messenger exposes', async () => {
+    const manifest = path.join(import.meta.dir, '..', '..', 'node_modules', 'agent-messenger', 'package.json')
+    const installed = JSON.parse(await readFile(manifest, 'utf8')) as { bin: Record<string, string> }
+
+    expect([...AGENT_MESSENGER_BINS].sort()).toEqual(Object.keys(installed.bin).sort())
   })
 })

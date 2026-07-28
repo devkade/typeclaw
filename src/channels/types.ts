@@ -430,8 +430,11 @@ export type GetMessageResult =
   // as a soft error; `code: 'not-supported'` means the adapter is not configured
   // at all; `code: 'adapter-unavailable'` means it IS configured but currently
   // has no live callback (e.g. failed to start), mirroring `fetchHistory`'s
-  // 'message-get-adapter-unavailable' string contract.
-  | { ok: false; error: string; code?: 'not-found' | 'not-supported' | 'adapter-unavailable' }
+  // 'message-get-adapter-unavailable' string contract; `code: 'adapter-error'`
+  // means a live callback threw or timed out. That last one must never collapse
+  // into 'not-supported' — a thrown 401 reported as "unsupported" teaches the
+  // model the capability does not exist, and it will say so to a human.
+  | { ok: false; error: string; code?: 'not-found' | 'not-supported' | 'adapter-unavailable' | 'adapter-error' }
 
 export type MessageGetCallback = (args: GetMessageArgs) => Promise<GetMessageResult>
 
@@ -454,7 +457,7 @@ export type ListChannelsArgs = {
 
 export type ListChannelsResult =
   | { ok: true; entries: ChannelListEntry[]; nextCursor?: string }
-  | { ok: false; error: string; code?: 'not-supported' | 'adapter-unavailable' }
+  | { ok: false; error: string; code?: 'not-supported' | 'adapter-unavailable' | 'adapter-error' }
 
 // Backs the `channel_read` tool's `mode: "list"`. Opt-in per adapter like
 // history; the router answers 'list-not-supported' when none is registered.
