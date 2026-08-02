@@ -106,6 +106,7 @@ describe('buildSandboxedCommand env policy', () => {
     expect(valueAfter(argv, '--setenv')).toBe('PATH')
     const setenvKeys = argv.filter((_, i) => argv[i - 1] === '--setenv')
     expect(setenvKeys).toEqual(['PATH', 'HOME', 'LANG', 'BUN_TMPDIR', 'BUN_INSTALL'])
+    expect(argv.join(' ')).toContain('--setenv PATH /tmp/typeclaw-dependency-bin:/usr/local/bin:/usr/bin:/bin')
   })
 
   test('gives bun a writable temp/install dir under /tmp so bunx does not abort', () => {
@@ -208,7 +209,7 @@ describe('buildSandboxedCommand spawnEnv (bwrap parent env snapshot)', () => {
 
   test('spawnEnv contains only defaults + set + inherited names', () => {
     const { spawnEnv } = buildSandboxedCommand('true', { env: { set: { GIT_PAGER: 'cat' } } })
-    expect(spawnEnv.PATH).toBe('/usr/local/bin:/usr/bin:/bin')
+    expect(spawnEnv.PATH).toBe('/tmp/typeclaw-dependency-bin:/usr/local/bin:/usr/bin:/bin')
     expect(spawnEnv.GIT_PAGER).toBe('cat')
   })
 })

@@ -44,6 +44,13 @@ export {
   type PrivilegedSandboxRuntime,
 } from './privileged-runtime'
 export { ensureSessionTmpDir, isUnderTmp, mapVirtualTmpPath, SESSION_TMP_ROOT, sessionTmpDir } from './session-tmp'
+export {
+  DEPENDENCY_BIN_SANDBOX_DIR,
+  DEPENDENCY_BIN_SANDBOX_PATH,
+  dependencyBinUnavailableHint,
+  reconcileDependencyBinWrappers,
+  type DependencyBinReconciliation,
+} from './dependency-bins'
 export { formatCommand, shellQuote } from './quote'
 export {
   SandboxDegradedProcError,
