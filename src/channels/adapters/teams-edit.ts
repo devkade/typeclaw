@@ -2,6 +2,7 @@ import type { TeamsClient } from 'agent-messenger/teams'
 
 import type { EditMessageCallback, EditMessageResult } from '@/channels/types'
 
+import { describeError } from '../describe-error'
 import { decodeTeamsConversationKey } from './teams-key'
 
 // The Teams user-account SDK only exposes an edit primitive for 1:1/group
@@ -25,7 +26,7 @@ export function createTeamsEditMessageCallback(deps: {
     try {
       await deps.client.editChatMessage(decoded.chatId, req.messageId, req.text)
     } catch (err) {
-      return { ok: false, error: describe(err), code: classifyEditError(err) }
+      return { ok: false, error: describeError(err), code: classifyEditError(err) }
     }
     return { ok: true }
   }
@@ -54,8 +55,4 @@ function errorCode(err: unknown): string | null {
     if (typeof code === 'string') return code
   }
   return null
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

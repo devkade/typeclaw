@@ -2,6 +2,7 @@ import type { TelegramBotClient } from 'agent-messenger/telegrambot'
 
 import type { EditMessageCallback, EditMessageResult } from '@/channels/types'
 
+import { describeError } from '../describe-error'
 import { toTelegramMarkdownV2 } from './telegram-bot-format'
 
 export function createTelegramEditMessageCallback(deps: {
@@ -31,8 +32,8 @@ export function createTelegramEditMessageCallback(deps: {
       // "message is not modified" fires when the new text equals the current
       // body — the desired end state already holds, so treat it as success
       // (idempotent), mirroring the reaction adapters' already-in-state handling.
-      if (describe(err).toLowerCase().includes('message is not modified')) return { ok: true }
-      return { ok: false, error: describe(err), code: classifyEditError(err) }
+      if (describeError(err).toLowerCase().includes('message is not modified')) return { ok: true }
+      return { ok: false, error: describeError(err), code: classifyEditError(err) }
     }
     return { ok: true }
   }
@@ -41,11 +42,7 @@ export function createTelegramEditMessageCallback(deps: {
 // "message to edit not found" / "message can't be edited" (too old) map to
 // not-found; a chat-permission error to permission-denied.
 function classifyEditError(err: unknown): NonNullable<(EditMessageResult & { ok: false })['code']> {
-  const message = describe(err).toLowerCase()
+  const message = describeError(err).toLowerCase()
   if (message.includes('not enough rights') || message.includes('forbidden')) return 'permission-denied'
   return 'not-found'
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
