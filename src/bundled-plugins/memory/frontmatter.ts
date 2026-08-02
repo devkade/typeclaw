@@ -1,10 +1,13 @@
 export type ShardFrontmatter = {
   heading: string
+  kind?: ShardKind
   cites: number
   days: number
   lastReinforced: string
   tags?: string[]
 }
+
+export type ShardKind = 'belief' | 'procedure' | 'environmental-incident'
 
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/
 
@@ -111,7 +114,8 @@ function parseFrontmatterBlock(text: string): ShardFrontmatter {
     throw new Error(`frontmatter field 'lastReinforced': expected YYYY-MM-DD, got '${values.lastReinforced}'`)
   }
 
-  const result: ShardFrontmatter = { heading, cites, days, lastReinforced }
+  const kind = values.kind ?? 'belief'
+  const result: ShardFrontmatter = { heading, kind: kind as ShardKind, cites, days, lastReinforced }
   if ('tags' in values) {
     result.tags = values.tags as string[]
   }
@@ -120,9 +124,15 @@ function parseFrontmatterBlock(text: string): ShardFrontmatter {
 }
 
 const FRONTMATTER_PARSERS: {
-  [K in keyof Omit<ShardFrontmatter, 'tags'>]: (value: string) => unknown
+  [K in keyof Required<Omit<ShardFrontmatter, 'tags'>>]: (value: string) => unknown
 } = {
   heading: (v) => v,
+  kind: (v) => {
+    if (v !== 'belief' && v !== 'procedure' && v !== 'environmental-incident') {
+      throw new Error(`expected belief, procedure, or environmental-incident, got '${v}'`)
+    }
+    return v
+  },
   cites: parseNonNegativeInt,
   days: parseNonNegativeInt,
   lastReinforced: (v) => v,
@@ -140,6 +150,7 @@ function parseNonNegativeInt(value: string): number {
 export function renderShard(frontmatter: ShardFrontmatter, body: string): string {
   const lines = ['---']
   lines.push(`heading: ${frontmatter.heading}`)
+  if (frontmatter.kind !== undefined && frontmatter.kind !== 'belief') lines.push(`kind: ${frontmatter.kind}`)
   lines.push(`cites: ${frontmatter.cites}`)
   lines.push(`days: ${frontmatter.days}`)
   lines.push(`lastReinforced: ${frontmatter.lastReinforced}`)

@@ -3,11 +3,28 @@ import { describe, expect, test } from 'bun:test'
 import { parseShard, renderShard, updateFrontmatter, type ShardFrontmatter } from './frontmatter'
 
 describe('parseShard', () => {
+  test('legacy shards default to belief and explicit kinds round-trip', () => {
+    const legacy = '---\nheading: Foo\ncites: 1\ndays: 1\nlastReinforced: 2026-05-20\n---\nbody\n'
+    expect(parseShard(legacy).frontmatter.kind).toBe('belief')
+
+    const procedure = '---\nheading: Foo\nkind: procedure\ncites: 1\ndays: 1\nlastReinforced: 2026-05-20\n---\nbody\n'
+    const parsed = parseShard(procedure)
+    expect(parsed.frontmatter.kind).toBe('procedure')
+    expect(renderShard(parsed.frontmatter, parsed.body)).toBe(procedure)
+  })
+
+  test('rejects an unknown shard kind', () => {
+    expect(() =>
+      parseShard('---\nheading: Foo\nkind: workaround\ncites: 1\ndays: 1\nlastReinforced: 2026-05-20\n---\nbody\n'),
+    ).toThrow("frontmatter field 'kind'")
+  })
+
   test('round-trip canonical input', () => {
     const input = `---\nheading: Design system tokens\ncites: 5\ndays: 3\nlastReinforced: 2026-05-20\ntags: [design, css]\n---\nBody text here.\n`
     const parsed = parseShard(input)
     expect(parsed.frontmatter).toEqual({
       heading: 'Design system tokens',
+      kind: 'belief',
       cites: 5,
       days: 3,
       lastReinforced: '2026-05-20',
