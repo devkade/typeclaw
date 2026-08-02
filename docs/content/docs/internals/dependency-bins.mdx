@@ -1,0 +1,48 @@
+---
+title: Dependency bins
+description: How direct dependencies become sandboxed bare commands
+icon: Terminal
+---
+
+TypeClaw derives sandbox-visible package commands from the operator-owned `<agentDir>/package.json`, which the write guard protects outside the `workspace/` free-write zone. Only names under `dependencies` are considered, including `workspace:*` entries. It never walks transitive dependencies and never trusts `node_modules/.bin`, which would expose unrelated transitive launchers and may contain host-platform shims that do not run in the Linux container.
+
+For every direct dependency installed under `<agentDir>/node_modules`, TypeClaw reads that package's own `package.json#bin`. Both the string and name-to-entrypoint map forms are supported. The package root must resolve inside the agent's real `node_modules`, and every real bin entrypoint must remain inside that package root; missing files and escaping symlinks fail closed.
+
+## Resolution order
+
+Each discovered bin resolves in this order:
+
+1. An executable in the trusted image baseline: `/usr/local/bin`, `/usr/bin`, then `/bin`.
+2. The direct dependency's manifest-resolved package entrypoint.
+
+Baseline-first resolution keeps image-owned wrappers authoritative. In particular, `agent-browser` continues to use the image-installed headed-mode executable instead of a package wrapper.
+
+The explicit dependency-bin denylist excludes `typeclaw`. TypeClaw never generates a wrapper for its own CLI, even when the direct `typeclaw` dependency advertises that bin.
+
+## Per-session wrappers
+
+Package resolutions receive executable `/bin/sh` wrappers under the session tmp backing directory. The existing writable `/tmp` bind exposes them inside bwrap at `/tmp/typeclaw-dependency-bin/<bin>`, then a narrow last-operation-wins read-only rebind protects that directory for the command's lifetime. Sandbox `PATH` is:
+
+```text
+/tmp/typeclaw-dependency-bin:/usr/local/bin:/usr/bin:/bin
+```
+
+Each wrapper executes `bun` against the POSIX-normalized absolute entrypoint. The agent directory is read-only-bound into bwrap at that same absolute path, so ad-hoc runtime directories work without assuming `/agent`. Wrapper writes are atomic, reject symlink targets, retain executable bits on POSIX, and tolerate a lost concurrent rename when the winner wrote identical content.
+
+Wrappers are reconciled before every sandboxed bash call. An operator-installed direct dependency therefore becomes available without recreating the session. Nothing in this mechanism installs packages or edits `package.json`; the operator must add dependencies and run the normal host-stage install flow. Boot diagnostics and `typeclaw doctor` report malformed manifests, missing direct dependencies, and unresolved declared entrypoints.
+
+## Relationship to `ctx.exec`
+
+TypeClaw resolves local bins on two surfaces, with deliberately different policies. They are not duplicates, and neither can substitute for the other.
+
+`ctx.exec` (`buildExecEnv`, `src/server/command-runner.ts`) prepends the whole `<cwd>/node_modules/.bin` to `PATH` for plugin handlers and cron. That surface is authored by the operator, so it takes the permissive `npm run` / `bun run` semantics: every installed bin is reachable, including transitive ones, and a local bin deliberately shadows a global of the same name.
+
+Model-driven bash cannot reuse that fix. It runs under bwrap, which clears the environment and installs its own `PATH` (`DEFAULT_SANDBOX_ENV`), so a `process.env`-derived `PATH` never reaches it. It is also an untrusted surface, so it takes the restrictive policy instead:
+
+|                   | `ctx.exec`                                       | model bash                                |
+| ----------------- | ------------------------------------------------ | ----------------------------------------- |
+| Exposure          | all of `node_modules/.bin`, including transitive | direct dependencies only                  |
+| Shadowing         | local wins over global                           | baseline wins; globals cannot be shadowed |
+| `typeclaw` binary | reachable                                        | denylisted                                |
+
+The asymmetry is the point: the permissive policy is appropriate for operator-authored plugin code and inappropriate for a model deciding its own commands.
