@@ -94,7 +94,9 @@ export async function hybridSearch(
     })
     return events.length === 0 ? [] : [{ ...day, events }]
   })
-  const eligibleShards = shards.filter((shard) => provenanceIndex.topicEligible(shard.slug, scope))
+  const eligibleShards = shards.filter(
+    (shard) => shard.frontmatter.kind !== 'environmental-incident' && provenanceIndex.topicEligible(shard.slug, scope),
+  )
   const eligibleReferences = scoped ? [] : references
 
   const { supersededFragmentIds } = buildParentLinks(shards)

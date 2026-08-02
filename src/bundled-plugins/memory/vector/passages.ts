@@ -72,7 +72,11 @@ export function findMissingPassages(store: VectorStore, passages: Passage[]): Pa
 function buildPassages(shards: TopicShard[], streamDays: UndreamedStreamDay[]): Passage[] {
   const { supersededFragmentIds } = buildParentLinks(shards)
   return [
-    ...shards.map((shard): Passage => topicPassage(shard.slug, shard.frontmatter.heading, shard.body)),
+    ...shards.flatMap((shard): Passage[] =>
+      shard.frontmatter.kind === 'environmental-incident'
+        ? []
+        : [topicPassage(shard.slug, shard.frontmatter.heading, shard.body)],
+    ),
     ...streamDays.flatMap((day) =>
       day.events.flatMap((event): Passage[] => {
         if (event.type === 'watermark') return []

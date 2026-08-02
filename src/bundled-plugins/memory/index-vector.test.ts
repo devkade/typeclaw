@@ -124,6 +124,29 @@ describe('vector session.turn.start hook', () => {
     expect(infos.some((line) => line.includes('suppressed=1') && line.includes('fallback=topic-index'))).toBe(true)
   })
 
+  test('environmental-incident shards are excluded from automatic retrieval', async () => {
+    const emptySearch = mock(async () => [])
+    await writeTopic(agentDir, 'ordinary-belief', 'Ordinary belief', 'ordinary body')
+    await writeTopic(
+      agentDir,
+      'environment-failure',
+      'Environment failure',
+      'historical workaround body',
+      'environmental-incident',
+    )
+    const exports = await bootVectorPluginWith(emptySearch, 16384)
+    const retrievalContext = { results: '' }
+
+    await exports.hooks!['session.turn.start']!(
+      { sessionId: 'ses_environment_fence', agentDir, userPrompt: 'anything', retrievalContext },
+      { agentDir, pluginName: 'memory', logger: createPluginLogger('memory') },
+    )
+
+    expect(retrievalContext.results).toContain('ordinary-belief')
+    expect(retrievalContext.results).not.toContain('environment-failure')
+    expect(retrievalContext.results).not.toContain('historical workaround body')
+  })
+
   test('zero-shard turn still logs suppression without falling back to an empty index', async () => {
     const emptySearch = mock(async () => [])
     const infos: string[] = []
@@ -748,11 +771,20 @@ function errorCapturingLogger(errors: string[]) {
   }
 }
 
-async function writeTopic(dir: string, slug: string, heading: string, body: string): Promise<void> {
+async function writeTopic(
+  dir: string,
+  slug: string,
+  heading: string,
+  body: string,
+  kind?: 'belief' | 'procedure' | 'environmental-incident',
+): Promise<void> {
   await mkdir(topicsDir(dir), { recursive: true })
   await writeFile(
     topicShardPath(dir, slug),
-    renderShard({ heading, cites: 1, days: 1, lastReinforced: '2026-06-11' }, body),
+    renderShard(
+      { heading, ...(kind === undefined ? {} : { kind }), cites: 1, days: 1, lastReinforced: '2026-06-11' },
+      body,
+    ),
   )
 }
 
