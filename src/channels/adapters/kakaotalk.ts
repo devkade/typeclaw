@@ -33,7 +33,7 @@ import type {
   InboundAttachment,
 } from '@/channels/types'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import {
   emoticonEventToMessageEvent,
   splitEmoticonInbound,

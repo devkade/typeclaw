@@ -34,7 +34,7 @@ import type {
   SendResult,
 } from '@/channels/types'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { createWebexChannelNameResolver } from './webex-bot-channel-resolver'
 import { classifyInbound, type InboundDropReason, type WebexInboundMessage } from './webex-bot-classify'
 import { enrichWebexMessageReference } from './webex-bot-reference'

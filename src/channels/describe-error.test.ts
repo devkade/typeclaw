@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { describeError } from '@/channels/adapters/describe-error'
+import { describeError } from '@/channels/describe-error'
 
 describe('describeError', () => {
   test('returns the message of a plain Error', () => {

@@ -33,7 +33,7 @@ import type {
 import { chunkMarkdown } from '@/markdown'
 import type { SlackAccountRecord } from '@/secrets/schema'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-attachment-download'
 import { createSlackAuthorResolver } from './slack-author-resolver'
 import { slackTsToMillis } from './slack-bot-time'

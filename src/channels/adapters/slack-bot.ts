@@ -40,7 +40,7 @@ import type {
 } from '@/channels/types'
 import { chunkMarkdown } from '@/markdown'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { addSlackMentionHints } from './mention-hints'
 import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-attachment-download'
 import { createSlackAuthorResolver, type SlackAuthorResolver } from './slack-bot-author-resolver'

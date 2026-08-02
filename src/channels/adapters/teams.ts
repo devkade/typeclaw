@@ -15,7 +15,7 @@ import type {
 } from '@/channels/types'
 import type { TeamsAccountRecord } from '@/secrets/schema'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import {
   classifyChannelInbound,
   classifyChatInbound,
