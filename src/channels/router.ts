@@ -1120,6 +1120,29 @@ type LiveSession = {
   // EARLIER iteration than the fallback; resetting per-iteration (beside
   // resetReviewTurn) would recreate the bug.
   githubReviewOutputTurn: number | null
+  // True once this LOGICAL turn executed any tool. Read only by
+  // `maybePostDeferredProviderError`: the provider-error notice exists so a
+  // dead turn doesn't leave the human with silence, and a turn that ran tools
+  // was not silent — it may already have published a review, a review-thread
+  // reply, or any other out-of-band write that never bumps
+  // `successfulChannelSends`. Approximating "produced durable output" with
+  // "executed a tool" deliberately over-suppresses: an operator log records
+  // every suppressed notice, whereas a public "connection dropped" comment
+  // stranded above the agent's own successful review cannot be taken back. A
+  // boolean rather than a `turnSeq` stamp so it survives the reminder-only
+  // retry iterations that end the turn. Reset ONLY on a real user batch,
+  // beside `githubReviewOutputTurn`.
+  toolExecutionThisLogicalTurn: boolean
+  // True while a successful `channel_reply({ more_work_this_turn: true })`
+  // promise remains unfulfilled in this LOGICAL turn. Unlike the per-iteration
+  // `continueReplyTurn` stamp used by retry authorization and empty-stop
+  // recovery, this survives reminder-only iterations so a provider failure
+  // cannot mistake earlier tool activity for completed user-visible work after
+  // the promise stamp is cleared before the next prompt. A successful terminal
+  // `channel_reply` clears it authoritatively; a substantive tool-source send
+  // also fulfills it, while a continuation-willingness/status send preserves
+  // it. A real user batch resets it beside `toolExecutionThisLogicalTurn`.
+  promisedWorkOutstandingThisLogicalTurn: boolean
   // Captured by drain() at batch dequeue; read+cleared by send() on the
   // first tool-source send of the turn. The anchor decision (delay
   // threshold + intervening-observed check) is evaluated at SEND time
@@ -1218,6 +1241,12 @@ export type SendSource = 'tool' | 'system'
 
 export type SendOptions = {
   source?: SendSource
+  // Classifies what the human saw, independently of which router path sent it.
+  // Tool calls omit this: substantive text is the default, while the shared
+  // multilingual willingness detector recognizes status updates. System paths
+  // set it explicitly because recovery prose fulfills promised work whereas
+  // provider/fallback/control notices are meta output and must not.
+  outputKind?: 'substantive' | 'status' | 'meta'
 }
 
 export const DUPLICATE_SEND_ERROR =
@@ -2270,6 +2299,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         emptyTurnFallbackTurn: null,
         stagedFallbackCause: null,
         githubReviewOutputTurn: null,
+        toolExecutionThisLogicalTurn: false,
+        promisedWorkOutstandingThisLogicalTurn: false,
         pendingQuoteCandidate: null,
         recentEngagedPeerBotTurns: [],
         consecutiveEngagedPeerBotTurns: 0,
@@ -2652,8 +2683,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const details = context.result.details as { ok?: unknown; more_work_this_turn?: unknown } | undefined
       const succeeded = context.toolCall.name === 'channel_reply' && !context.isError && details?.ok === true
       const keepTurnAlive = details?.more_work_this_turn === true
-      if (succeeded && keepTurnAlive) {
-        live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
+      if (succeeded) {
+        // This hook is authoritative for channel_reply semantics: the send path
+        // cannot distinguish channel_reply from channel_send, but here the
+        // explicit more_work_this_turn flag tells us whether the delivered reply
+        // renewed the promise or terminally fulfilled it.
+        live.promisedWorkOutstandingThisLogicalTurn = keepTurnAlive
+        if (keepTurnAlive) {
+          live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
+        }
       }
       if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true) {
         logger.info(`[channels] ${live.keyId} terminal_after_channel_reply`)
@@ -2799,7 +2837,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         thread: live.key.thread,
         text: EMPTY_TURN_FALLBACK_TEXT,
       },
-      { source: 'system' },
+      { source: 'system', outputKind: 'meta' },
     )
     if (!result.ok) {
       logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
@@ -2973,6 +3011,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.pendingProviderError = null
       return
     }
+    // The turn ran tools and promised nothing further, so it was not silent —
+    // the very condition that makes recovery unsafe (`canAdvance` refuses to
+    // fail over once `startedToolExecution` is set) also means a side effect
+    // may already be public. Surfacing the notice here strands a "connection
+    // dropped" warning above the agent's own successful work. A logical turn
+    // holding an outstanding continue-reply promise is the opposite case: it
+    // explicitly told the user more was coming, so dying silently WOULD leave
+    // them waiting and the notice must still fire. Operators still get the
+    // failure from the `LLM call failed` line plus this suppression record.
+    if (live.toolExecutionThisLogicalTurn && !live.promisedWorkOutstandingThisLogicalTurn) {
+      live.pendingProviderError = null
+      logger.warn(
+        `[channels] ${live.keyId}: provider_error_notice_suppressed reason=tool_activity_this_turn notice="${pending.safeMessage}"`,
+      )
+      return
+    }
     // An empty-turn retry was queued (validateChannelTurn pushed
     // EMPTY_TURN_RETRY_NUDGE): the same logical turn re-prompts in the next
     // drain iteration and may yet recover. Carry the pending error forward,
@@ -2997,7 +3051,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         thread: live.key.thread,
         text: `⚠️ ${pending.safeMessage}`,
       },
-      { source: 'system' },
+      { source: 'system', outputKind: 'meta' },
     ).catch((sendErr) => {
       logger.warn(`[channels] ${live.keyId}: provider-error notice send threw: ${describeError(sendErr)}`)
       return null
@@ -3087,6 +3141,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           // review landed earlier in this logical turn keeps suppressing the
           // empty-turn fallback across the reminder-only retry iterations.
           live.githubReviewOutputTurn = null
+          live.toolExecutionThisLogicalTurn = false
+          live.promisedWorkOutstandingThisLogicalTurn = false
         } else if (live.lastTurnAuthorId !== null) {
           live.currentTurnEngageReactions = []
           // Reminder-only turn (batch.length === 0, reminders.length > 0):
@@ -3178,6 +3234,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               logger.warn(
                 `[channels] ${live.keyId}: ${attempt.outcome} failure on ${attempt.ref}: ${attempt.errorMessage ?? 'unknown'}; falling back`,
               )
+            },
+            onToolExecutionStarted: () => {
+              live.toolExecutionThisLogicalTurn = true
             },
           })
           if (result.success) live.activeModelRef = result.refUsed
@@ -3280,7 +3339,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.willingnessNudges > willingnessNudgesBeforePrompt
           await maybePostDeferredProviderError(
             live,
-            sentReplyThisTurn && !hasPendingContinueReply(live),
+            sentReplyThisTurn && !live.promisedWorkOutstandingThisLogicalTurn,
             retryQueuedThisTurn,
           )
           await fireSessionTurnEnd(live)
@@ -3447,7 +3506,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           thread: event.thread,
           text: result.reply,
         },
-        { source: 'system' },
+        { source: 'system', outputKind: 'meta' },
       )
     }
     return result
@@ -3494,7 +3553,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             thread: event.thread,
             text: outcome.reply,
           },
-          { source: 'system' },
+          { source: 'system', outputKind: 'meta' },
         )
         return
       }
@@ -4432,6 +4491,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.pendingQuoteCandidate = null
     }
     const text = normalizeSendText(msg.text)
+    const outputKind =
+      opts?.outputKind ?? (text !== undefined && detectContinuationWillingness(text) ? 'status' : 'substantive')
 
     // Central enforcement. Tool-initiated sends are subject to two policies:
     // a per-turn count cap (kills runaway loops regardless of content) and
@@ -4564,6 +4625,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     if (live) {
       live.successfulChannelSends++
+      // Promise fulfillment follows OUTPUT KIND, never source:
+      //   (a) ordinary substantive tool output clears;
+      //   (b) multilingual continuation-willingness/status output preserves;
+      //   (c) recovery prose explicitly marked substantive clears even though
+      //       it uses the system bypass;
+      //   (d) provider-error, empty-turn-fallback, and control notices are
+      //       explicitly meta and preserve, so a warning can never self-clear.
+      // The channel_reply afterToolCall hook above remains authoritative for its
+      // machine-readable more_work_this_turn flag.
+      if (outputKind === 'substantive') live.promisedWorkOutstandingThisLogicalTurn = false
       live.lastSendLeafId = live.session.sessionManager.getLeafEntry()?.id ?? null
       live.policyDeniedToolSendsThisTurn.delete(sendKey)
       // Don't stop the heartbeat here: the agent may still be mid-turn and
@@ -5163,7 +5234,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         thread: live.key.thread,
         text: assistantText,
       },
-      { source: 'system' },
+      { source: 'system', outputKind: 'substantive' },
     )
     if (!result.ok) {
       logger.warn(`[channels] ${live.keyId}: recovery send failed: ${result.error}`)
