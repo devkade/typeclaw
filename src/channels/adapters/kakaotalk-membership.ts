@@ -1,3 +1,4 @@
+import { describeError } from '../describe-error'
 import type {
   MembershipCount,
   MembershipResolver,
@@ -56,12 +57,8 @@ export function createKakaoMembershipResolver(options: KakaoMembershipResolverOp
         humanMemberIds,
       } satisfies MembershipCount
     } catch (err) {
-      options.logger.warn(`[kakaotalk] membership chat=${key.chat} failed: ${describe(err)}`)
+      options.logger.warn(`[kakaotalk] membership chat=${key.chat} failed: ${describeError(err)}`)
       return { kind: 'transient' } satisfies MembershipResolverFailure
     }
   }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

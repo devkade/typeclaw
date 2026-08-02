@@ -2,6 +2,8 @@ import { classifyKakaoChat, type KakaoChat, type KakaoChatKind, type KakaoTalkCl
 
 import type { ChannelKey, ChannelNameResolver, ResolvedChannelNames } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 const DEFAULT_TTL_MS = 5 * 60 * 1000
 
 export type KakaoWorkspace = '@kakao-dm' | '@kakao-group' | '@kakao-open'
@@ -78,7 +80,7 @@ export function createKakaoChannelResolver(options: KakaoChannelResolverOptions)
       const expiresAt = now() + ttlMs
       for (const chat of chats) ingest(chat, expiresAt)
     } catch (err) {
-      options.logger?.warn(`[kakaotalk] channel resolver refresh failed: ${describe(err)}`)
+      options.logger?.warn(`[kakaotalk] channel resolver refresh failed: ${describeError(err)}`)
     }
   }
 
@@ -128,8 +130,4 @@ export function createKakaoChannelResolver(options: KakaoChannelResolverOptions)
   }
 
   return { resolve, lookupChat, refresh, ingestProvisional }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
