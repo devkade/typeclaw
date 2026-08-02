@@ -25,6 +25,16 @@ import {
 } from '@/bundled-plugins/guard/policy'
 import { config, getSandboxWritablePathSpecs } from '@/config/config'
 import { readEnvFile } from '@/init/env-file'
+import {
+  classifyToolOutcome,
+  deriveMechanicallyVerifiedIncidentFingerprints,
+  IncidentLedger,
+  operationalRemediations,
+  renderIncidentHint,
+  renderUntrackedIncidentHint,
+  repairAndRetryOnce,
+} from '@/operations'
+import type { RemediationRegistry } from '@/operations'
 import type { PermissionService } from '@/permissions/permissions'
 import type {
   BuiltinToolRef,
@@ -284,6 +294,9 @@ export type WrapSystemToolOptions = {
   // `src/agent/reviewer-bash-policy.ts`.
   bashPolicy?: SubagentBashPolicy
   bashSandboxBoundary?: BashSandboxBoundary
+  realProcDependencyCheck?: typeof commandNeedsRealProc
+  remediations?: RemediationRegistry
+  incidentLedger?: IncidentLedger
 }
 
 // Zod 4 emits a top-level `"$schema": "https://json-schema.org/draft/2020-12/schema"`
@@ -574,59 +587,81 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       let rawResult: ToolResult | undefined
       let executionError: unknown
       let cleanupError: unknown
+      let sandboxedRealProcSucceeded = false
       const sandboxBoundary = opts.bashSandboxBoundary ?? DEFAULT_BASH_SANDBOX_BOUNDARY
-      try {
-        if (tool.name === 'bash') {
-          if (opts.permissions === undefined) {
-            throw new SandboxPolicyError('model-driven bash has no permission service; refusing unsandboxed execution')
+      const incidentLedger = opts.incidentLedger ?? new IncidentLedger(opts.agentDir)
+      const originalArgs = { ...mutableArgs }
+      const executeAttempt = async (): Promise<void> => {
+        preparedSandboxRuntime = undefined
+        pinnedFiles = undefined
+        tmpRedirect = undefined
+        rawResult = undefined
+        executionError = undefined
+        cleanupError = undefined
+        sandboxedRealProcSucceeded = false
+        const attemptArgs = { ...originalArgs }
+        try {
+          if (tool.name === 'bash') {
+            if (opts.permissions === undefined) {
+              throw new SandboxPolicyError(
+                'model-driven bash has no permission service; refusing unsandboxed execution',
+              )
+            }
+            preparedSandboxRuntime = await applyBashSandbox(
+              attemptArgs,
+              opts.permissions,
+              liveOrigin,
+              opts.agentDir,
+              opts.sessionId,
+              bashEnvOverlay,
+              sandboxBoundary,
+            )
           }
-          preparedSandboxRuntime = await applyBashSandbox(
-            mutableArgs,
-            opts.permissions,
-            liveOrigin,
-            opts.agentDir,
-            opts.sessionId,
-            bashEnvOverlay,
-            sandboxBoundary,
-          )
-        }
 
-        tmpRedirect =
-          TMP_REDIRECT_TOOLS.has(tool.name) && opts.permissions !== undefined
-            ? await applyTmpPathRedirect(mutableArgs, opts.permissions, liveOrigin, opts.agentDir, opts.sessionId)
-            : undefined
-        pinnedFiles = await enforceAndPinToolFiles({
-          tool: tool.name,
-          args: mutableArgs,
-          agentDir: opts.agentDir,
-          ...(opts.permissions !== undefined
-            ? { hidden: resolveHiddenPaths(opts.permissions, liveOrigin, opts.agentDir) }
-            : {}),
-          signal,
-        })
-        await preparedSandboxRuntime?.verify()
-        const spawnEnvContext: BashSpawnEnvContext | undefined =
-          bashEnvOverlay !== undefined || preparedSandboxRuntime?.spawnEnv !== undefined
-            ? {
-                ...(bashEnvOverlay !== undefined ? { overlay: bashEnvOverlay } : {}),
-                ...(preparedSandboxRuntime?.spawnEnv !== undefined
-                  ? { sandboxSpawnEnv: preparedSandboxRuntime.spawnEnv }
-                  : {}),
-              }
-            : undefined
-        rawResult = await bashEnvStore.run(spawnEnvContext, () =>
-          tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate, ctx),
-        )
-      } catch (error) {
-        executionError = error
-      } finally {
-        const cleanup = [pinnedFiles?.cleanup(), preparedSandboxRuntime?.cleanup()].filter(
-          (task): task is Promise<void> => task !== undefined,
-        )
-        const outcomes = await Promise.allSettled(cleanup)
-        const failed = outcomes.find((outcome) => outcome.status === 'rejected')
-        if (failed?.status === 'rejected') cleanupError = failed.reason
+          tmpRedirect =
+            TMP_REDIRECT_TOOLS.has(tool.name) && opts.permissions !== undefined
+              ? await applyTmpPathRedirect(attemptArgs, opts.permissions, liveOrigin, opts.agentDir, opts.sessionId)
+              : undefined
+          pinnedFiles = await enforceAndPinToolFiles({
+            tool: tool.name,
+            args: attemptArgs,
+            agentDir: opts.agentDir,
+            ...(opts.permissions !== undefined
+              ? { hidden: resolveHiddenPaths(opts.permissions, liveOrigin, opts.agentDir) }
+              : {}),
+            signal,
+          })
+          await preparedSandboxRuntime?.verify()
+          const spawnEnvContext: BashSpawnEnvContext | undefined =
+            bashEnvOverlay !== undefined || preparedSandboxRuntime?.spawnEnv !== undefined
+              ? {
+                  ...(bashEnvOverlay !== undefined ? { overlay: bashEnvOverlay } : {}),
+                  ...(preparedSandboxRuntime?.spawnEnv !== undefined
+                    ? { sandboxSpawnEnv: preparedSandboxRuntime.spawnEnv }
+                    : {}),
+                }
+              : undefined
+          rawResult = await bashEnvStore.run(spawnEnvContext, () =>
+            tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
+          )
+          const originalCommand = originalArgs.command
+          sandboxedRealProcSucceeded =
+            preparedSandboxRuntime !== undefined &&
+            typeof originalCommand === 'string' &&
+            (opts.realProcDependencyCheck ?? commandNeedsRealProc)(originalCommand)
+        } catch (error) {
+          executionError = error
+        } finally {
+          const cleanup = [pinnedFiles?.cleanup(), preparedSandboxRuntime?.cleanup()].filter(
+            (task): task is Promise<void> => task !== undefined,
+          )
+          const outcomes = await Promise.allSettled(cleanup)
+          const failed = outcomes.find((outcome) => outcome.status === 'rejected')
+          if (failed?.status === 'rejected') cleanupError = failed.reason
+        }
       }
+
+      await executeAttempt()
       // Decorate genuine, user-correctable builtin file-tool failures with a
       // recovery hint so weaker models retry correctly. Only executionError (not
       // cleanupError) and only non-aborted Error instances; remediation is a
@@ -635,6 +670,46 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       // preserves the error's subclass and stack for the rethrow.
       if (executionError instanceof Error && signal?.aborted !== true) {
         executionError.message = remediateToolErrorMessage(tool.name, executionError.message)
+        const incidentFact = classifyToolOutcome({ tool: tool.name, error: executionError })
+        if (incidentFact !== null) {
+          const initialError = executionError
+          let recordedFingerprint: string | undefined
+          let incidentHint = renderUntrackedIncidentHint(incidentFact)
+          try {
+            const incident = await incidentLedger.record(incidentFact, opts.sessionId)
+            recordedFingerprint = incident.fingerprint
+            incidentHint = renderIncidentHint(incident)
+          } catch {
+            // Incident persistence must never hide the originating tool failure.
+          }
+          const remediation = await repairAndRetryOnce(
+            opts.remediations ?? operationalRemediations,
+            incidentFact,
+            initialError,
+            async () => {
+              await executeAttempt()
+              const retryError = executionError ?? cleanupError
+              if (retryError !== undefined) throw retryError
+            },
+          )
+          if (remediation.outcome === 'retried') {
+            const retrySuccessFingerprints = deriveMechanicallyVerifiedIncidentFingerprints({
+              tool: tool.name,
+              args: originalArgs,
+              sandboxedRealProcSucceeded,
+            })
+            if (recordedFingerprint !== undefined && retrySuccessFingerprints.has(recordedFingerprint)) {
+              await incidentLedger.resolve(recordedFingerprint).catch(() => false)
+            }
+          } else {
+            const failedError = remediation.outcome === 'retry-failed' ? remediation.error : initialError
+            const finalIncidentError = failedError instanceof Error ? failedError : new Error(String(failedError))
+            finalIncidentError.message = remediateToolErrorMessage(tool.name, finalIncidentError.message)
+            finalIncidentError.message = `${finalIncidentError.message}\n\n${incidentHint}`
+            executionError = finalIncidentError
+            cleanupError = undefined
+          }
+        }
       }
       const finalError = executionError ?? cleanupError
       if (finalError !== undefined) {
@@ -657,6 +732,12 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         callId: toolCallId,
         result: hookResult,
       })
+      const successFingerprints = deriveMechanicallyVerifiedIncidentFingerprints({
+        tool: tool.name,
+        args: originalArgs,
+        sandboxedRealProcSucceeded,
+      })
+      await incidentLedger.resolveObservedSuccess(successFingerprints).catch(() => 0)
       return {
         content: hookResult.content as ContentPart[],
         details: hookResult.details as TDetails,

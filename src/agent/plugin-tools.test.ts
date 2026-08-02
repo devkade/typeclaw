@@ -26,7 +26,9 @@ import { z } from 'zod'
 import { createDreamingSubagent } from '@/bundled-plugins/memory/dreaming'
 import { createWriteReportTool } from '@/bundled-plugins/researcher/write-report'
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
+import { buildOperationalIncidentChecks } from '@/doctor/operational-incidents'
 import { hooklessGitArgs } from '@/git/hookless'
+import { DeclaredSkillBinUnresolvedError, IncidentLedger, readIncidentLedger, RemediationRegistry } from '@/operations'
 import { createPermissionService } from '@/permissions/permissions'
 import { createHookBus, defineTool, type PluginRegistry, type ToolResult } from '@/plugin'
 import {
@@ -35,6 +37,7 @@ import {
   _resetBwrapAvailabilityCacheForTests,
   _resetRealProcProbeCacheForTests,
   resolveProtectedZones,
+  SandboxDegradedProcError,
   SESSION_TMP_ROOT,
   resolvePrivilegedSandboxRuntime,
 } from '@/sandbox'
@@ -3659,6 +3662,486 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     expect(afterResults).toHaveLength(1)
     expect(afterResults[0]?.details).toEqual({ error: 'execution failed' })
     await rm(agentDir, { recursive: true, force: true })
+  })
+
+  test('classified failures keep the transcript marker when incident persistence is unavailable', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-persistence-'))
+    const afterResults: ToolResult[] = []
+    const hooks = createHookBus()
+    hooks.registerAll('observer', agentDir, noopLogger, {
+      'tool.after': (event) => {
+        afterResults.push(event.result)
+      },
+    })
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      await rm(path.join(agentDir, '.typeclaw'), { recursive: true, force: true })
+      await writeFile(path.join(agentDir, '.typeclaw'), 'not-a-directory')
+      throw new Error('/bin/bash: opensoma: command not found\n\n\nCommand exited with code 127')
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-persistence',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await expect(wrapped.execute('c', { command: 'opensoma' }, undefined, undefined, {} as never)).rejects.toThrow(
+        /TYPECLAW_OPERATIONAL_INCIDENT.*"recurrenceTracking":"unavailable"/,
+      )
+      expect(afterResults).toHaveLength(1)
+      expect(afterResults[0]?.details).toEqual({
+        error: expect.stringMatching(/TYPECLAW_OPERATIONAL_INCIDENT.*"recurrenceTracking":"unavailable"/),
+      })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('registered operational remediation repairs and retries a classified builtin failure once', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-remediation-'))
+    const registry = new RemediationRegistry()
+    class TrackingIncidentLedger extends IncidentLedger {
+      automaticResolveCalls = 0
+
+      override async resolve(fingerprint: string): Promise<boolean> {
+        this.automaticResolveCalls += 1
+        return super.resolve(fingerprint)
+      }
+    }
+    const incidentLedger = new TrackingIncidentLedger(agentDir)
+    const repairedBins: string[] = []
+    registry.register('bash-command-not-found', async (fact) => {
+      if (fact.kind === 'bash-command-not-found') repairedBins.push(fact.bin)
+      return { repaired: true }
+    })
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) {
+        throw new Error('/bin/bash: opensoma: command not found\n\n\nCommand exited with code 127')
+      }
+      return { content: [{ type: 'text' as const, text: 'ran after repair' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-remediation',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      incidentLedger,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      const result = await wrapped.execute('c', { command: 'opensoma --version' }, undefined, undefined, {} as never)
+      expect(textOfFirstContent(result)).toBe('ran after repair')
+      expect(attempts).toBe(2)
+      expect(repairedBins).toEqual(['opensoma'])
+      expect(incidentLedger.automaticResolveCalls).toBe(1)
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'bash:command-not-found:opensoma', count: 1, status: 'resolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    { name: 'masked aggregate success', command: 'opensoma || true' },
+    { name: 'success for a different executable', command: 'another-cli' },
+  ])('a remediation retry with $name does not resolve the recorded bin incident', async ({ command }) => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-unverified-remediation-'))
+    const registry = new RemediationRegistry()
+    registry.register('bash-command-not-found', async () => ({ repaired: true }))
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) {
+        throw new Error('/bin/bash: opensoma: command not found\n\n\nCommand exited with code 127')
+      }
+      return { content: [{ type: 'text' as const, text: 'aggregate retry succeeded' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-unverified-remediation',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await wrapped.execute('retry', { command }, undefined, undefined, {} as never)
+
+      expect(attempts).toBe(2)
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'bash:command-not-found:opensoma', status: 'unresolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a masked successful sandbox remediation retry does not resolve the sandbox incident', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-unverified-sandbox-remediation-'))
+    const registry = new RemediationRegistry()
+    registry.register('sandbox-proc-unavailable', async () => ({ repaired: true }))
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) throw new SandboxDegradedProcError()
+      return { content: [{ type: 'text' as const, text: 'masked sandbox retry succeeded' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-unverified-sandbox-remediation',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      realProcDependencyCheck: () => true,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await wrapped.execute('retry', { command: 'package-cli || true' }, undefined, undefined, {} as never)
+
+      expect(attempts).toBe(2)
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'sandbox:proc-unavailable', status: 'unresolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a later successful invocation resolves an unhandled incident after manual repair', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-manual-repair-'))
+    const registry = new RemediationRegistry()
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) {
+        throw new Error('/bin/bash: opensoma: command not found\n\n\nCommand exited with code 127')
+      }
+      return { content: [{ type: 'text' as const, text: 'ran after manual repair' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-manual-repair',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await expect(
+        wrapped.execute('failure', { command: 'opensoma' }, undefined, undefined, {} as never),
+      ).rejects.toThrow('TYPECLAW_OPERATIONAL_INCIDENT')
+      expect((await buildOperationalIncidentChecks()[0]!.run({ cwd: agentDir, hasAgentFolder: true })).status).toBe(
+        'warning',
+      )
+
+      const result = await wrapped.execute(
+        'success',
+        { command: 'opensoma --version' },
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(textOfFirstContent(result)).toBe('ran after manual repair')
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'bash:command-not-found:opensoma', status: 'resolved' },
+      ])
+      expect(await buildOperationalIncidentChecks()[0]!.run({ cwd: agentDir, hasAgentFolder: true })).toEqual({
+        status: 'ok',
+        message: 'no unresolved operational incidents',
+      })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    { name: 'an OR-list that swallows failure', command: 'opensoma --version || true' },
+    { name: 'a short-circuited AND-list', command: 'a && opensoma' },
+    { name: 'a pipeline whose last segment succeeds', command: 'opensoma | tee out' },
+    { name: 'a conditional that negates failure', command: 'if ! opensoma; then echo skip; fi' },
+  ])('aggregate success from $name does not resolve the executable incident', async ({ command }) => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-ambiguous-success-'))
+    const incidentLedger = new IncidentLedger(agentDir)
+    await incidentLedger.record({ kind: 'bash-command-not-found', bin: 'opensoma' }, 'failure')
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'incident-ambiguous-success',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      incidentLedger,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await wrapped.execute('success', { command }, undefined, undefined, {} as never)
+
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'bash:command-not-found:opensoma', status: 'unresolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a later successful real-proc sandbox execution resolves a sandbox incident', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-sandbox-repair-'))
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) throw new SandboxDegradedProcError()
+      return { content: [{ type: 'text' as const, text: 'sandbox package runner succeeded' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-sandbox-repair',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: new RemediationRegistry(),
+      realProcDependencyCheck: () => true,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await expect(
+        wrapped.execute('failure', { command: 'package-cli' }, undefined, undefined, {} as never),
+      ).rejects.toThrow('TYPECLAW_OPERATIONAL_INCIDENT')
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'sandbox:proc-unavailable', status: 'unresolved' },
+      ])
+
+      await wrapped.execute('success', { command: 'package-cli' }, undefined, undefined, {} as never)
+
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'sandbox:proc-unavailable', status: 'resolved' },
+      ])
+      expect(await buildOperationalIncidentChecks()[0]!.run({ cwd: agentDir, hasAgentFolder: true })).toEqual({
+        status: 'ok',
+        message: 'no unresolved operational incidents',
+      })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('aggregate success from a chained sandbox command does not resolve a sandbox incident', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-ambiguous-sandbox-success-'))
+    const incidentLedger = new IncidentLedger(agentDir)
+    await incidentLedger.record({ kind: 'sandbox-proc-unavailable' }, 'failure')
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'incident-ambiguous-sandbox-success',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      incidentLedger,
+      realProcDependencyCheck: () => true,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await wrapped.execute('success', { command: 'package-cli || true' }, undefined, undefined, {} as never)
+
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'sandbox:proc-unavailable', status: 'unresolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a later successful bin invocation resolves a declared skill-bin incident', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-skill-bin-repair-'))
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) throw new DeclaredSkillBinUnresolvedError('opensoma')
+      return { content: [{ type: 'text' as const, text: 'declared bin succeeded' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-skill-bin-repair',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: new RemediationRegistry(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await expect(
+        wrapped.execute('failure', { command: 'opensoma' }, undefined, undefined, {} as never),
+      ).rejects.toThrow('TYPECLAW_OPERATIONAL_INCIDENT')
+      await wrapped.execute('success', { command: 'opensoma' }, undefined, undefined, {} as never)
+
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'skill-bin:declared-but-unresolved:opensoma', status: 'resolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('one successful bin invocation resolves command-not-found and skill-bin incidents together', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-dual-bin-repair-'))
+    const incidentLedger = new IncidentLedger(agentDir)
+    await incidentLedger.record({ kind: 'bash-command-not-found', bin: 'opensoma' }, 'command-failure')
+    await incidentLedger.record({ kind: 'declared-skill-bin-unresolved', bin: 'opensoma' }, 'skill-bin-failure')
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'incident-dual-bin-repair',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      incidentLedger,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await wrapped.execute('success', { command: 'opensoma' }, undefined, undefined, {} as never)
+
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'bash:command-not-found:opensoma', status: 'resolved' },
+        { fingerprint: 'skill-bin:declared-but-unresolved:opensoma', status: 'resolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a successful unrelated command does not resolve another executable incident', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-unrelated-success-'))
+    const registry = new RemediationRegistry()
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) {
+        throw new Error('/bin/bash: opensoma: command not found\n\n\nCommand exited with code 127')
+      }
+      return { content: [{ type: 'text' as const, text: 'unrelated command succeeded' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'incident-unrelated-success',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      await expect(
+        wrapped.execute('failure', { command: 'opensoma' }, undefined, undefined, {} as never),
+      ).rejects.toThrow('TYPECLAW_OPERATIONAL_INCIDENT')
+      await wrapped.execute('success', { command: 'another-cli' }, undefined, undefined, {} as never)
+
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'bash:command-not-found:opensoma', status: 'unresolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a successful invocation with no open incidents performs no ledger read or lock', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-incident-empty-fast-path-'))
+    let inspections = 0
+    let reads = 0
+    let locks = 0
+    const incidentLedger = new IncidentLedger(agentDir, {
+      inspect: async () => {
+        inspections += 1
+        return { kind: 'missing' }
+      },
+      read: async () => {
+        reads += 1
+        throw new Error('empty-ledger gate read unexpectedly')
+      },
+      serialize: async () => {
+        locks += 1
+        throw new Error('empty-ledger gate locked unexpectedly')
+      },
+    })
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'incident-empty-fast-path',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      incidentLedger,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      const result = await wrapped.execute('success', { command: 'echo healthy' }, undefined, undefined, {} as never)
+
+      expect(textOfFirstContent(result)).toBe('ran')
+      expect({ inspections, reads, locks }).toEqual({ inspections: 1, reads: 0, locks: 0 })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
   })
 
   test('without a permission service bash fails closed and never reaches the underlying tool', async () => {
