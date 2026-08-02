@@ -8,6 +8,8 @@ import type {
   RemoveReactionCallback,
 } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 // The reactable target on Slack: a message is addressed by its channel id plus
 // the message `ts`. The classifier stamps this because `ts` is the inbound's
 // own message timestamp — the same value that becomes `externalMessageId`
@@ -78,7 +80,7 @@ export function createSlackReactionCallback(deps: { client: Pick<SlackBotClient,
       if (code === 'already_reacted') {
         return { ok: true, reactionRef: encodeSlackRemovalRef({ ...target, emoji }) }
       }
-      return { ok: false, error: withScopeHint(code, describe(err)), code: classifySlackError(code) }
+      return { ok: false, error: withScopeHint(code, describeError(err)), code: classifySlackError(code) }
     }
     return { ok: true, reactionRef: encodeSlackRemovalRef({ ...target, emoji }) }
   }
@@ -101,7 +103,7 @@ export function createSlackRemoveReactionCallback(deps: {
       // `already_reacted` handling on the add path.
       const code = slackErrorCode(err)
       if (code === 'no_reaction') return { ok: true }
-      return { ok: false, error: describe(err), code: classifySlackError(code) }
+      return { ok: false, error: describeError(err), code: classifySlackError(code) }
     }
     return { ok: true }
   }
@@ -160,8 +162,4 @@ function parseRecord(value: string): Record<string, unknown> | null {
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : null
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

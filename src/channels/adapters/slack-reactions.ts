@@ -8,6 +8,8 @@ import type {
   RemoveReactionCallback,
 } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 export type SlackReactionTarget = { channel: string; ts: string }
 export type SlackReactionRemovalTarget = { channel: string; ts: string; emoji: string }
 
@@ -51,7 +53,7 @@ export function createSlackReactionCallback(deps: { client: Pick<SlackClient, 'a
     } catch (err) {
       const code = slackErrorCode(err)
       if (code === 'already_reacted') return { ok: true, reactionRef: encodeSlackRemovalRef({ ...target, emoji }) }
-      return { ok: false, error: describe(err), code: classifySlackError(code) }
+      return { ok: false, error: describeError(err), code: classifySlackError(code) }
     }
     return { ok: true, reactionRef: encodeSlackRemovalRef({ ...target, emoji }) }
   }
@@ -69,7 +71,7 @@ export function createSlackRemoveReactionCallback(deps: {
     } catch (err) {
       const code = slackErrorCode(err)
       if (code === 'no_reaction') return { ok: true }
-      return { ok: false, error: describe(err), code: classifySlackError(code) }
+      return { ok: false, error: describeError(err), code: classifySlackError(code) }
     }
     return { ok: true }
   }
@@ -119,8 +121,4 @@ function parseRecord(value: string): Record<string, unknown> | null {
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : null
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
