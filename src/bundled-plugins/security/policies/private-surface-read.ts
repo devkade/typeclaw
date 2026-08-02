@@ -81,24 +81,33 @@ export function checkPrivateSurfaceReadGuard(
 ): SecurityBlock | undefined {
   const { tool, args, agentDir, hidden, fileOperands } = options
   if (UNSCANNED_TOOLS.has(tool)) return undefined
-  const { deniedDirs, deniedFiles } = deniedSurface(agentDir, hidden)
-  if (deniedDirs.length === 0 && deniedFiles.length === 0) return undefined
-  const identityScanner = createHardlinkIdentityScanner(agentDir, deniedDirs, deniedFiles, hooks)
+  try {
+    const { deniedDirs, deniedFiles } = deniedSurface(agentDir, hidden)
+    if (deniedDirs.length === 0 && deniedFiles.length === 0) return undefined
+    const identityScanner = createHardlinkIdentityScanner(agentDir, deniedDirs, deniedFiles, hooks)
+    const realpath = hooks.realpathNative ?? realpathSync.native
 
-  const nonFile = fileOperands?.nonFile === undefined ? undefined : new Set(fileOperands.nonFile)
-  for (const candidate of collectPathCandidates(args, tool, nonFile)) {
-    const hit = matchHidden(candidate, agentDir, deniedDirs, deniedFiles, identityScanner)
-    if (hit !== undefined) {
-      return {
-        block: true,
-        reason: [
-          `Guard \`${GUARD_PRIVATE_SURFACE_READ}\` blocked ${tool}: argument \`${candidate}\` resolves to ${hit}, which is not available to LLM tools.`,
-          'The bash sandbox masks the same path. Privileged roles cannot bypass canonical agent credential files; use host-side redacted diagnostics such as `typeclaw doctor`, `typeclaw provider list`, or `typeclaw channel list` instead.',
-        ].join(' '),
+    const nonFile = fileOperands?.nonFile === undefined ? undefined : new Set(fileOperands.nonFile)
+    for (const candidate of collectPathCandidates(args, tool, nonFile)) {
+      const hit = matchHidden(candidate, agentDir, deniedDirs, deniedFiles, identityScanner, realpath)
+      if (hit !== undefined) {
+        return {
+          block: true,
+          reason: [
+            `Guard \`${GUARD_PRIVATE_SURFACE_READ}\` blocked ${tool}: argument \`${candidate}\` resolves to ${hit}, which is not available to LLM tools.`,
+            'The bash sandbox masks the same path. Privileged roles cannot bypass canonical agent credential files; use host-side redacted diagnostics such as `typeclaw doctor`, `typeclaw provider list`, or `typeclaw channel list` instead.',
+          ].join(' '),
+        }
       }
     }
+    return undefined
+  } catch (error) {
+    hooks.onInternalError?.(error)
+    return {
+      block: true,
+      reason: `Guard \`${GUARD_PRIVATE_SURFACE_READ}\` blocked ${tool}: an internal guard error prevented safe path validation.`,
+    }
   }
-  return undefined
 }
 
 type PrivateSurfaceIdentityOptions = {
@@ -111,6 +120,8 @@ export type PrivateSurfaceIdentityScanHooks = {
   maxEntries?: number
   openDirectory?(directory: string): Pick<Dir, 'readSync' | 'closeSync'>
   lstat?(candidate: string): Stats
+  realpathNative?(candidate: string): string
+  onInternalError?(error: unknown): void
   afterEntryLstat?(candidate: string, stats: Stats): void
 }
 
@@ -157,6 +168,7 @@ function createHardlinkIdentityScanner(
         ? openDescriptorAnchoredDirectory
         : createPathDirectoryOpener(hooks.openDirectory, lstat),
     lstat,
+    realpath: hooks.realpathNative ?? realpathSync.native,
     afterEntryLstat: hooks.afterEntryLstat,
   })
 }
@@ -341,18 +353,19 @@ function matchHidden(
   deniedDirs: string[],
   deniedFiles: string[],
   identityScanner: HardlinkIdentityScanner,
+  realpath: (candidate: string) => string,
 ): string | undefined {
   const lexicalHit = matchLexicallyDenied(candidate, agentDir, deniedDirs, deniedFiles)
   if (lexicalHit !== undefined) return lexicalHit
   const lexical = path.resolve(agentDir, candidate)
-  const resolved = realpathRealIntendedPath(lexical)
+  const resolved = realpathRealIntendedPath(lexical, realpath)
   const virtualRoot = virtualFilesystemRoot(lexical) ?? virtualFilesystemRoot(resolved)
   if (virtualRoot !== undefined) return `${virtualRoot}, a virtual or process-backed filesystem`
   for (const file of deniedFiles) {
-    if (resolved === realpathRealIntendedPath(file) || hasSameFileIdentity(resolved, file)) return file
+    if (resolved === realpathRealIntendedPath(file, realpath) || hasSameFileIdentity(resolved, file)) return file
   }
   for (const dir of deniedDirs) {
-    const realDir = realpathRealIntendedPath(dir)
+    const realDir = realpathRealIntendedPath(dir, realpath)
     // realpathRealIntendedPath joins with the platform separator, so the
     // under-dir test must use path.sep too — a hardcoded "/" never matches the
     // "\"-joined paths a win32 test runner produces.
@@ -510,6 +523,7 @@ type HardlinkIdentityScannerOptions = {
   maxEntries: number
   openDirectory(directory: string): HardlinkDirectory
   lstat(candidate: string): Stats
+  realpath(candidate: string): string
   afterEntryLstat?(candidate: string, stats: Stats): void
 }
 
@@ -565,9 +579,11 @@ class HardlinkIdentityScanner {
   private scanVisibleTree(): void {
     if (this.visibleScanned) return
     this.visibleScanned = true
-    const root = realpathRealIntendedPath(this.options.agentDir)
-    const deniedRoots = this.options.deniedDirs.map(realpathRealIntendedPath)
-    const deniedFiles = new Set(this.options.deniedFiles.map(realpathRealIntendedPath))
+    const root = realpathRealIntendedPath(this.options.agentDir, this.options.realpath)
+    const deniedRoots = this.options.deniedDirs.map((dir) => realpathRealIntendedPath(dir, this.options.realpath))
+    const deniedFiles = new Set(
+      this.options.deniedFiles.map((file) => realpathRealIntendedPath(file, this.options.realpath)),
+    )
     const rootStats = this.readRootStats(root, 'visible')
     if (rootStats === undefined) return
     const rootDirectory = this.openVerifiedDirectory(root, rootStats, 'visible')
@@ -619,7 +635,7 @@ class HardlinkIdentityScanner {
       let rootStats: Stats
       let root: string
       try {
-        root = realpathRealIntendedPath(deniedDir)
+        root = realpathRealIntendedPath(deniedDir, this.options.realpath)
         rootStats = this.options.lstat(root)
       } catch (error) {
         if (isNotFoundError(error)) continue
@@ -950,16 +966,15 @@ function hasSameFileIdentity(candidate: string, deniedFile: string): boolean {
 // symlinked component including a planted symlink), and rejoin the remainder.
 // This catches `public/leak/x` where `public/leak` is a symlink into a hidden
 // dir even though `public/leak/x` itself does not exist. Sync (realpathSync)
-// keeps the guard synchronous so the security tool.before check array stays
-// non-async; the cost is one syscall per existing component, negligible at the
-// tool-call boundary. Sync mirror of resolveRealIntendedPath in the guard
-// plugin's non-workspace-write policy.
-function realpathRealIntendedPath(absolutePath: string): string {
+// keeps the guard synchronous; the cost is one syscall per existing component,
+// negligible at the tool-call boundary. Sync mirror of resolveRealIntendedPath
+// in the guard plugin's non-workspace-write policy.
+function realpathRealIntendedPath(absolutePath: string, realpath: (candidate: string) => string): string {
   const pending: string[] = []
   let current = absolutePath
   while (true) {
     try {
-      return path.join(realpathSync.native(current), ...pending.reverse())
+      return path.join(realpath(current), ...pending.reverse())
     } catch (err) {
       if (!isNotFoundError(err)) throw err
     }
