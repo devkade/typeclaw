@@ -3,10 +3,6 @@ import { join } from 'node:path'
 import { definePlugin } from '@/plugin'
 import { publishForwardRequest, subscribeForwardResult } from '@/portbroker'
 
-import { installShim, KNOWN_BIN_PATHS, type InstallShimResult } from './shim-install'
-
-type SafeResult = InstallShimResult | { kind: 'error'; binPath: string; error: unknown }
-
 // Documented in skills/agent-browser/SKILL.md so the agent can discover which
 // host port the reserved dashboard forward actually bound. Moving or renaming
 // this path requires updating the skill in lockstep. The env override is an
@@ -27,9 +23,6 @@ let unsubscribeForwardResult: (() => void) | null = null
 
 export default definePlugin({
   plugin: async (ctx) => {
-    logInstallResult(ctx.logger, safeInstallShim(KNOWN_BIN_PATHS.global))
-    logInstallResult(ctx.logger, safeInstallShim(KNOWN_BIN_PATHS.local, KNOWN_BIN_PATHS.global))
-
     requestDashboardForward(ctx.logger)
 
     return {
@@ -83,35 +76,4 @@ async function recordProxyPort(contents: string, logger: { warn: (msg: string) =
     // session report which port to open). Failure is non-fatal.
     logger.warn(`failed to write ${path}: ${String(error)}`)
   }
-}
-
-function safeInstallShim(binPath: string, delegateTarget?: string): SafeResult {
-  try {
-    return installShim({ binPath, delegateTarget })
-  } catch (error) {
-    return { kind: 'error', binPath, error }
-  }
-}
-
-function logInstallResult(
-  logger: { info: (msg: string) => void; warn: (msg: string) => void },
-  result: SafeResult,
-): void {
-  if (result.kind === 'installed') {
-    logger.info(`installed agent-browser shim at ${result.binPath} (real bin stashed at ${result.stashTarget})`)
-    return
-  }
-  if (result.kind === 'delegated') {
-    logger.info(`installed agent-browser alias at ${result.binPath} (delegates to ${result.delegateTarget})`)
-    return
-  }
-  if (result.kind === 'already-installed') {
-    logger.info(`agent-browser shim already installed at ${result.binPath}`)
-    return
-  }
-  if (result.kind === 'no-upstream') {
-    logger.info(`no agent-browser binary at ${result.binPath}; nothing to shim here`)
-    return
-  }
-  logger.warn(`failed to install agent-browser shim at ${result.binPath}: ${String(result.error)}`)
 }
