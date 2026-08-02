@@ -758,10 +758,14 @@ async function applyBashSandbox(
     files,
   })
   const writableRoot = canWriteAgentRootInSandbox(permissions, origin)
-  const protectedZones =
+  const baseProtectedZones =
     writableRoot || writable.dirs.includes(join(agentDir, '.git'))
       ? subtractMasked(await resolveProtectedZones(agentDir), { dirs, files })
       : { dirs: [], files: [] }
+  const protectedZones = {
+    dirs: baseProtectedZones.dirs,
+    files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
+  }
   const writableDirSet = new Set(writable.dirs)
   const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'
   const symlinks = resolveSandboxSymlinks(agentDir, config.sandbox.symlinks, sandboxHome).filter((op) =>

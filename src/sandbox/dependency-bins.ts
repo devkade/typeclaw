@@ -14,15 +14,38 @@ export type DependencyBinReconciliation = {
   resolutions: ResolvedDependencyBin[]
   unavailable: Extract<ResolvedDependencyBin, { kind: 'unavailable' }>[]
   issues: DependencyBinIssue[]
+  protectedFiles: string[]
 }
+
+const reconciliationLocks = new Map<string, Promise<void>>()
 
 export async function reconcileDependencyBinWrappers(options: {
   agentDir: string
   sessionTmp: string
   baselineDirs?: readonly string[]
 }): Promise<DependencyBinReconciliation> {
-  const validation = await validateDependencyBins(options.agentDir, options.baselineDirs)
   const dir = join(options.sessionTmp, DEPENDENCY_BIN_DIR_NAME)
+  const previous = reconciliationLocks.get(dir) ?? Promise.resolve()
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const queued = previous.then(() => gate)
+  reconciliationLocks.set(dir, queued)
+  await previous
+  try {
+    return await reconcileDependencyBinWrappersUnlocked(options, dir)
+  } finally {
+    release()
+    if (reconciliationLocks.get(dir) === queued) reconciliationLocks.delete(dir)
+  }
+}
+
+async function reconcileDependencyBinWrappersUnlocked(
+  options: { agentDir: string; sessionTmp: string; baselineDirs?: readonly string[] },
+  dir: string,
+): Promise<DependencyBinReconciliation> {
+  const validation = await validateDependencyBins(options.agentDir, options.baselineDirs)
   await ensureWrapperDir(dir)
   const wrappers = new Map<string, string>()
   for (const resolution of validation.resolutions) {
@@ -52,6 +75,7 @@ export async function reconcileDependencyBinWrappers(options: {
     resolutions: validation.resolutions,
     unavailable: validation.unavailable,
     issues: validation.issues,
+    protectedFiles: validation.protectedFiles,
   }
 }
 

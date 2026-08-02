@@ -3456,8 +3456,19 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
 
   test('prepends the per-session dependency bin directory to PATH at the bash sandbox boundary', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-dependency-path-'))
+    const workspaceRoot = path.join(agentDir, 'packages', 'workspace-cli')
+    const workspaceLink = path.join(agentDir, 'node_modules', 'workspace-cli')
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(path.dirname(workspaceLink), { recursive: true })
+    await writeFile(
+      path.join(agentDir, 'package.json'),
+      JSON.stringify({ name: 'test-agent', dependencies: { 'workspace-cli': 'workspace:*' } }),
+    )
+    await writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'workspace-cli' }))
+    await symlink(workspaceRoot, workspaceLink, process.platform === 'win32' ? 'junction' : 'dir')
     let pathValue: string | undefined
     let mounts: SandboxPolicy['mounts']
+    let protectedFiles: string[] | undefined
     const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
       agentDir,
       sessionId: 'dependency-path',
@@ -3471,6 +3482,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
           const built = buildSandboxedCommand(command, options)
           pathValue = built.spawnEnv.PATH
           mounts = options?.mounts
+          protectedFiles = options?.protected?.files
           return { ...built, commandString: command }
         },
       },
@@ -3483,6 +3495,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       ['bind', '/tmp'],
       ['ro-bind', '/tmp/typeclaw-dependency-bin'],
     ])
+    expect(protectedFiles).toEqual(expect.arrayContaining([await realpath(path.join(agentDir, 'package.json'))]))
     await rm(agentDir, { recursive: true, force: true })
   })
 

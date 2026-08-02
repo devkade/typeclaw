@@ -15,7 +15,6 @@ import { configSchema, type Models, resolveProfile, type ResolvedProfile, type T
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { ModelRef } from '@/config/providers'
 import { createHookBus, type PluginRegistry } from '@/plugin'
-import { emptyRegistry } from '@/plugin/registry'
 import { createStream } from '@/stream'
 
 import {

@@ -272,7 +272,6 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // the chain when it recreates a session after the previous ref failed.
   const activeRef: ModelRef = options.refOverride ?? resolved.ref
   const { authStorage, modelRegistry } = getAuthFor(providerForModelRef(activeRef))
-  const agentDir = options.plugins?.agentDir ?? process.cwd()
   const sessionManager = options.sessionManager ?? SessionManager.inMemory()
 
   const materializedSkills =
