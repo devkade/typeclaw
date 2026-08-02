@@ -55,6 +55,23 @@ describe('resolveDependencyBin', () => {
     expect(resolved.kind).toBe('denied')
   })
 
+  test.skipIf(process.platform === 'win32')('allows a declared workspace package inside the agent root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'typeclaw-bin-resolver-'))
+    const workspaceRoot = join(root, 'packages', 'workspace-cli')
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(join(root, 'node_modules'), { recursive: true })
+    await writeFile(join(workspaceRoot, 'cli.js'), '')
+    await symlink(workspaceRoot, join(root, 'node_modules', 'workspace-cli'))
+
+    const resolved = await resolveDependencyBin(
+      root,
+      { package: 'workspace-cli', bin: 'workspace-cli', entry: 'cli.js', workspace: true },
+      [],
+    )
+
+    expect(resolved.kind).toBe('package')
+  })
+
   test.skipIf(process.platform === 'win32')('rejects a package root symlink that escapes node_modules', async () => {
     const root = await mkdtemp(join(tmpdir(), 'typeclaw-bin-resolver-'))
     const external = await mkdtemp(join(tmpdir(), 'typeclaw-external-package-'))

@@ -9,6 +9,7 @@ export type DependencyBinDeclaration = {
   package: string
   bin: string
   entry: string
+  workspace?: boolean
 }
 
 export type ResolvedDependencyBin =
@@ -31,10 +32,11 @@ export async function resolveDependencyBin(
     if (await isExecutable(executable)) return { kind: 'baseline', declaration, executable }
   }
 
+  const agentRoot = await realpath(agentDir).catch(() => undefined)
   const nodeModulesRoot = await realpath(join(agentDir, 'node_modules')).catch(() => undefined)
   const packageRoot = join(agentDir, 'node_modules', ...declaration.package.split('/'))
   const resolvedRoot = await realpath(packageRoot).catch(() => undefined)
-  if (nodeModulesRoot === undefined || resolvedRoot === undefined) {
+  if (agentRoot === undefined || nodeModulesRoot === undefined || resolvedRoot === undefined) {
     return {
       kind: 'unavailable',
       declaration,
@@ -42,11 +44,9 @@ export async function resolveDependencyBin(
     }
   }
   const resolvedEntry = await realpath(resolve(resolvedRoot, declaration.entry)).catch(() => undefined)
-  if (
-    resolvedEntry === undefined ||
-    !isInside(nodeModulesRoot, resolvedRoot) ||
-    !isInside(resolvedRoot, resolvedEntry)
-  ) {
+  const packageRootAllowed =
+    isInside(nodeModulesRoot, resolvedRoot) || (declaration.workspace === true && isInside(agentRoot, resolvedRoot))
+  if (resolvedEntry === undefined || !packageRootAllowed || !isInside(resolvedRoot, resolvedEntry)) {
     return {
       kind: 'unavailable',
       declaration,
