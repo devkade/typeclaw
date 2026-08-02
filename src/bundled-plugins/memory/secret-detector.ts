@@ -29,6 +29,7 @@ export const SECRET_RULES: readonly SecretRule[] = [
   { name: 'google-api-key', pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
   { name: 'stripe-secret', pattern: /\bsk_live_[0-9A-Za-z]{24,}\b/ },
   { name: 'stripe-restricted', pattern: /\brk_live_[0-9A-Za-z]{24,}\b/ },
+  { name: 'jwt', pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/ },
   { name: 'rsa-private-key', pattern: /-----BEGIN (?:RSA |OPENSSH |EC |DSA |PGP )?PRIVATE KEY-----/ },
 ]
 
@@ -46,4 +47,10 @@ export function detectSecrets(content: string): SecretMatch[] {
     }
   }
   return matches
+}
+
+export function isSecretShapedToken(token: string): boolean {
+  if (detectSecrets(token).length > 0) return true
+  if (/^[A-Fa-f0-9]{48,}$/.test(token)) return true
+  return /^[A-Za-z0-9_+-]{48,}$/.test(token)
 }
