@@ -15,6 +15,23 @@ describe('describeError', () => {
     expect(describeError(errorEvent)).toBe('Unexpected server response: 401')
   })
 
+  test('reports the nested reason from a WebSocket ErrorEvent-like object', () => {
+    // given: the gateway outage shape stringifies as [object ErrorEvent]
+    const errorEvent = {
+      [Symbol.toStringTag]: 'ErrorEvent',
+      type: 'error',
+      error: new Error('WebSocket closed: 1006 abnormal closure'),
+    }
+    expect(String(errorEvent)).toBe('[object ErrorEvent]')
+
+    // when
+    const reason = describeError(errorEvent)
+
+    // then
+    expect(reason).toBe('WebSocket closed: 1006 abnormal closure')
+    expect(reason).not.toContain('[object ErrorEvent]')
+  })
+
   test('digs into a nested .error when .message is absent', () => {
     const event = { type: 'error', error: new Error('ECONNREFUSED') }
     expect(describeError(event)).toBe('ECONNREFUSED')
