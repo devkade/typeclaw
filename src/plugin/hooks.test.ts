@@ -82,6 +82,29 @@ describe('HookBus tool.before', () => {
     const result = await bus.runToolBefore({ tool: 't', sessionId: 's', callId: 'c', args: {} })
     expect(result).toBeUndefined()
   })
+
+  test('logs a throwing handler and continues to a later plugin', async () => {
+    const errors: string[] = []
+    const bus = createHookBus()
+    bus.registerAll(
+      'broken-plugin',
+      '/agent',
+      { info: () => {}, warn: () => {}, error: (message) => errors.push(message) },
+      {
+        'tool.before': () => {
+          throw new Error('broken guard')
+        },
+      },
+    )
+    bus.registerAll('blocking-plugin', '/agent', noopLogger, {
+      'tool.before': () => ({ block: true, reason: 'denied by healthy plugin' }),
+    })
+
+    const result = await bus.runToolBefore({ tool: 't', sessionId: 's', callId: 'c', args: {} })
+
+    expect(result).toEqual({ block: true, reason: 'denied by healthy plugin' })
+    expect(errors).toEqual(['hook tool.before threw: broken guard'])
+  })
 })
 
 describe('HookBus session.idle / session.start / session.end', () => {

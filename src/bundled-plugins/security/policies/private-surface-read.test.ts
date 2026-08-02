@@ -63,6 +63,28 @@ describe('private-surface-read guard — builtin file tools', () => {
 })
 
 describe('private-surface-read guard — fail-closed across ALL tools (not a whitelist)', () => {
+  test('blocks with a generic reason when realpathSync.native reports EACCES', () => {
+    // Must resolve like the guard does: a POSIX literal would not match on Windows.
+    const inaccessible = path.resolve(AGENT, 'public/protected.md')
+    const error = Object.assign(new Error('permission denied while resolving protected path'), { code: 'EACCES' })
+
+    const result = checkPrivateSurfaceReadGuard(
+      { tool: 'read', args: { path: inaccessible }, agentDir: AGENT, hidden: guestHidden },
+      {
+        realpathNative(candidate) {
+          if (candidate === inaccessible) throw error
+          return realpathSync.native(candidate)
+        },
+      },
+    )
+
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toMatch(/internal guard error/i)
+    expect(result?.reason).not.toContain(inaccessible)
+    expect(result?.reason).not.toContain(error.message)
+    expect(result?.reason).not.toContain(error.code)
+  })
+
   test('blocks find_entry reading a hidden transcript via top-level path', () => {
     expect(check('find_entry', { path: '/agent/sessions/s.jsonl', entryId: 'x' })?.block).toBe(true)
   })
