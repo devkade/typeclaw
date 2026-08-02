@@ -71,10 +71,10 @@ const FORBIDDEN_WRITABLE_ROOTS = [
 // `echo … > cron.json` from bash and defeat the guard entirely. Keeping them off
 // this list forces every mutation of a guarded file through the one guarded path
 // (the write/edit tool), so a managed file has exactly one mutation boundary.
-// `package.json` stays writable: it is NOT a semantically-guarded managed file
-// (only cron.json/typeclaw.json are), and ordinary trusted/manual edits remain
-// supported.
-const WRITABLE_ROOT_FILES = ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'USER.md', 'package.json'] as const
+// `package.json` is operator-owned because direct dependencies define the
+// executable surface exposed in the model sandbox. It must not receive an RW
+// rebind that would let model-driven bash expand its own PATH capabilities.
+const WRITABLE_ROOT_FILES = ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'USER.md'] as const
 
 // SECURITY: the symlink rejection is load-bearing. An RW bind follows symlinks,
 // so a `workspace -> /etc` symlink at a zone root would grant write access to an

@@ -450,7 +450,7 @@ describe('resolveWritableZones package lifecycle boundary', () => {
     },
   )
 
-  test.each(['bun.lock', 'cron.json', 'typeclaw.json'])(
+  test.each(['bun.lock', 'cron.json', 'package.json', 'typeclaw.json'])(
     'does not expose lifecycle/managed root file %s as a normal writable file',
     async (relative) => {
       await writeFile(join(agentDir, relative), 'x')
@@ -459,12 +459,10 @@ describe('resolveWritableZones package lifecycle boundary', () => {
     },
   )
 
-  test('retains ordinary non-install scratch and manifest writes', async () => {
+  test('retains ordinary non-install scratch writes', async () => {
     for (const dir of ['workspace', 'public', 'mounts']) await mkdir(join(agentDir, dir))
-    await writeFile(join(agentDir, 'package.json'), '{}')
     const zones = await resolveWritableZones(agentDir)
     expect(zones.dirs).toEqual(expect.arrayContaining(['workspace', 'public', 'mounts'].map((d) => join(agentDir, d))))
-    expect(zones.files).toContain(join(agentDir, 'package.json'))
   })
 })
 
