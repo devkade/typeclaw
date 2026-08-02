@@ -4,9 +4,9 @@ description: How direct dependencies become sandboxed bare commands
 icon: Terminal
 ---
 
-TypeClaw derives sandbox-visible package commands from the operator-owned `<agentDir>/package.json`, which the write guard protects outside the `workspace/` free-write zone. Only names under `dependencies` are considered, including `workspace:*` entries. It never walks transitive dependencies and never trusts `node_modules/.bin`, which would expose unrelated transitive launchers and may contain host-platform shims that do not run in the Linux container.
+TypeClaw derives sandbox-visible package commands from the operator-owned `<agentDir>/package.json`. File-tool guards and the bash sandbox keep that manifest read-only to the model, so changing the command surface remains an operator action. Only names under `dependencies` are considered, including `workspace:*` entries. It never walks transitive dependencies and never trusts `node_modules/.bin`, which would expose unrelated transitive launchers and may contain host-platform shims that do not run in the Linux container.
 
-For every direct dependency installed under `<agentDir>/node_modules`, TypeClaw reads that package's own `package.json#bin`. Both the string and name-to-entrypoint map forms are supported. The package root must resolve inside the agent's real `node_modules`, and every real bin entrypoint must remain inside that package root; missing files and escaping symlinks fail closed.
+For every direct dependency installed under `<agentDir>/node_modules`, TypeClaw reads that package's own `package.json#bin`. Both the string and name-to-entrypoint map forms are supported. Normal package roots must resolve inside the agent's real `node_modules`; a declared `workspace:*` link may instead resolve elsewhere inside the real agent root. Every real bin entrypoint must remain inside its package root, so missing files and escaping symlinks fail closed.
 
 ## Resolution order
 
