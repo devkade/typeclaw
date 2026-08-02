@@ -272,6 +272,8 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // the chain when it recreates a session after the previous ref failed.
   const activeRef: ModelRef = options.refOverride ?? resolved.ref
   const { authStorage, modelRegistry } = getAuthFor(providerForModelRef(activeRef))
+  const agentDir = options.plugins?.agentDir ?? process.cwd()
+  const sessionManager = options.sessionManager ?? SessionManager.inMemory()
 
   const materializedSkills =
     options.plugins && options.plugins.registry.skills.length > 0
@@ -357,8 +359,6 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // session's stable identity (sessionManager.getSessionId()). Subscribers use
   // that ID to distinguish the originating session from siblings on the
   // container-restarting broadcast.
-  const sessionManager = options.sessionManager ?? SessionManager.inMemory()
-
   // Stamp a one-shot custom entry naming the session's origin kind so
   // `typeclaw usage` can bucket tokens by tui/cron/channel/subagent. Pi's
   // `appendCustomEntry` is the blessed extension point: the entry persists
