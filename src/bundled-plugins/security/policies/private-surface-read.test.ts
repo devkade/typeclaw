@@ -64,7 +64,8 @@ describe('private-surface-read guard — builtin file tools', () => {
 
 describe('private-surface-read guard — fail-closed across ALL tools (not a whitelist)', () => {
   test('blocks with a generic reason when realpathSync.native reports EACCES', () => {
-    const inaccessible = '/agent/public/protected.md'
+    // Must resolve like the guard does: a POSIX literal would not match on Windows.
+    const inaccessible = path.resolve(AGENT, 'public/protected.md')
     const error = Object.assign(new Error('permission denied while resolving protected path'), { code: 'EACCES' })
 
     const result = checkPrivateSurfaceReadGuard(
