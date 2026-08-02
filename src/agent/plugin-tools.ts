@@ -43,12 +43,15 @@ import {
   cleanupPrivilegedSandboxRuntime,
   commandNeedsRealProc,
   DEFAULT_SANDBOX_ENV,
+  DEPENDENCY_BIN_SANDBOX_DIR,
+  dependencyBinUnavailableHint,
   ensureBwrapAvailable,
   ensureHiddenMaskTargets,
   ensureSessionTmpDir,
   getProcBindSafetyVerdict,
   isGitControlPath,
   mapVirtualTmpPath,
+  reconcileDependencyBinWrappers,
   resolveHiddenPaths,
   resolvePrivilegedSandboxRuntime,
   resolveProcBindSafetyWithRetry,
@@ -59,6 +62,7 @@ import {
   SandboxPolicyError,
   SandboxDegradedProcError,
   SandboxProcProbeUnverifiedError,
+  type DependencyBinReconciliation,
   subtractMasked,
   verifyHiddenMaskTargets,
   verifyPrivilegedSandboxRuntime,
@@ -519,6 +523,8 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
     parameters: withGuardAcknowledgements(tool.name, tool.parameters),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const mutableArgs = params as Record<string, unknown>
+      const originalBashCommand =
+        tool.name === 'bash' && typeof mutableArgs.command === 'string' ? mutableArgs.command : undefined
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
       const liveOrigin = opts.getOrigin?.()
       // Defense-in-depth: strip any pre-existing internal env-overlay key
@@ -644,7 +650,15 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       if (pinnedFiles === undefined) throw new Error('tool file boundary was not initialized')
       if (rawResult === undefined) throw new Error('tool execution returned no result')
       const pinnedResult = pinnedFiles.restoreResult(rawResult)
-      const result = tmpRedirect !== undefined ? restoreTmpPathInResult(pinnedResult, tmpRedirect) : pinnedResult
+      let result = tmpRedirect !== undefined ? restoreTmpPathInResult(pinnedResult, tmpRedirect) : pinnedResult
+      if (
+        originalBashCommand !== undefined &&
+        preparedSandboxRuntime?.dependencyBins !== undefined &&
+        bashResultIsCommandNotFound(result)
+      ) {
+        const hint = dependencyBinUnavailableHint(originalBashCommand, preparedSandboxRuntime.dependencyBins)
+        if (hint !== undefined) result = appendTextResult(result, hint)
+      }
       const resolved = loopGate.resolve({ content: result.content as ContentPart[], details: result.details })
       if ('deferredBlock' in resolved) {
         fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block')
@@ -705,6 +719,7 @@ type PreparedBashSandbox = {
   verify: () => Promise<void>
   cleanup: () => Promise<void>
   spawnEnv?: Record<string, string>
+  dependencyBins?: DependencyBinReconciliation
 }
 
 export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) {
@@ -737,6 +752,7 @@ async function applyBashSandbox(
   const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
   await boundary.ensureAvailable()
   const sessionTmp = await ensureSessionTmpDir(sessionId)
+  const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
   const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
     dirs,
     files,
@@ -768,6 +784,10 @@ async function applyBashSandbox(
       mounts: [
         { type: 'ro-bind', source: agentDir, dest: agentDir },
         { type: 'bind', source: sessionTmp, dest: '/tmp' },
+        // `/tmp` is writable, but PATH entries must remain runtime-owned for
+        // the lifetime of this command. Last-op-wins makes this narrow re-bind
+        // read-only without adding any broader filesystem exposure.
+        { type: 'ro-bind', source: dependencyBins.wrapperDir, dest: DEPENDENCY_BIN_SANDBOX_DIR },
         ...(privilegedRuntime?.mounts ?? []),
       ],
       ...(writableRoot
@@ -793,11 +813,23 @@ async function applyBashSandbox(
       verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(privilegedRuntime),
       cleanup,
       spawnEnv: mergedSpawnEnv,
+      dependencyBins,
     }
   } catch (error) {
     await cleanup()
     throw error
   }
+}
+
+function bashResultIsCommandNotFound(result: ToolResult): boolean {
+  if (isRecord(result.details) && result.details.exitCode === 127) return true
+  return (result.content as ContentPart[]).some(
+    (part) => part.type === 'text' && /command not found(?:\s|$)/i.test(part.text),
+  )
+}
+
+function appendTextResult(result: ToolResult, text: string): ToolResult {
+  return { ...result, content: [...(result.content as ContentPart[]), { type: 'text', text }] }
 }
 
 export function buildSandboxEnvPolicy(

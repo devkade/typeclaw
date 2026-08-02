@@ -38,6 +38,7 @@ import {
   SESSION_TMP_ROOT,
   resolvePrivilegedSandboxRuntime,
 } from '@/sandbox'
+import type { SandboxPolicy } from '@/sandbox'
 
 import { URL_FETCH_MAX_BYTES } from './multimodal/looker'
 import {
@@ -3451,6 +3452,79 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     } finally {
       await rm(agentDir, { recursive: true, force: true })
     }
+  })
+
+  test('prepends the per-session dependency bin directory to PATH at the bash sandbox boundary', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-dependency-path-'))
+    let pathValue: string | undefined
+    let mounts: SandboxPolicy['mounts']
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'dependency-path',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        buildCommand(command, options) {
+          const built = buildSandboxedCommand(command, options)
+          pathValue = built.spawnEnv.PATH
+          mounts = options?.mounts
+          return { ...built, commandString: command }
+        },
+      },
+    })
+
+    await wrapped.execute('c', { command: 'true' }, undefined, undefined, {} as never)
+
+    expect(pathValue).toBe('/tmp/typeclaw-dependency-bin:/usr/local/bin:/usr/bin:/bin')
+    expect(mounts?.slice(1, 3).map((mount) => [mount.type, mount.dest])).toEqual([
+      ['bind', '/tmp'],
+      ['ro-bind', '/tmp/typeclaw-dependency-bin'],
+    ])
+    await rm(agentDir, { recursive: true, force: true })
+  })
+
+  test('adds a structured operator-install hint when a direct dependency bin exits 127', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-dependency-hint-'))
+    await writeFile(
+      path.join(agentDir, 'package.json'),
+      JSON.stringify({ name: 'test-agent', dependencies: { opensoma: '^1.0.0' } }),
+    )
+    const packageRoot = path.join(agentDir, 'node_modules', 'opensoma')
+    await mkdir(packageRoot, { recursive: true })
+    await writeFile(
+      path.join(packageRoot, 'package.json'),
+      JSON.stringify({ name: 'opensoma', bin: { opensoma: 'missing.js' } }),
+    )
+    const bash = fakeBash({})
+    bash.execute = async () => ({
+      content: [{ type: 'text' as const, text: 'bash: opensoma: command not found' }],
+      details: undefined,
+    })
+    const wrapped = wrapBuiltinToolDefinition(bash, {
+      agentDir,
+      sessionId: 'dependency-hint',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        buildCommand(command, options) {
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    const result = await wrapped.execute('c', { command: 'opensoma session list' }, undefined, undefined, {} as never)
+
+    expect(result.content).toContainEqual({
+      type: 'text',
+      text: '[typeclaw:capability-unavailable capability=dependency-bin dependency=opensoma bin=opensoma action=operator-install]',
+    })
+    await rm(agentDir, { recursive: true, force: true })
   })
 
   test('confined authenticated Git cannot load global or system config', async () => {
