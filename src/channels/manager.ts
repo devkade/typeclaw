@@ -146,7 +146,14 @@ export type ChannelManagerOptions = {
   connectionRecovery?: {
     checkIntervalMs?: number
     disconnectedGraceMs?: number
+    // Base delay for the failed-adapter retry backoff (`retryBaseMs * 2^(n-1)`,
+    // capped at 15 minutes, jittered). Deliberately independent of
+    // `checkIntervalMs`: a retry deadline is only observed on a tick, so a tick
+    // as coarse as the base would round a jittered 30-36s deadline up to the
+    // 60s tick and silently double every early delay.
+    retryBaseMs?: number
     now?: () => number
+    random?: () => number
     setInterval?: (fn: () => void, ms: number) => unknown
     clearInterval?: (handle: unknown) => void
   }
@@ -188,6 +195,27 @@ type AdapterEntry = {
   recoveryRestartQueued: boolean
 }
 
+type FailedAdapter = {
+  kind: 'start-failed' | 'missing-credentials'
+  attempts: number
+  failedSinceMs: number
+  nextAttemptAtMs: number
+  retryQueued: boolean
+  nextLogAtMs: number
+}
+
+type StartAdapterResult =
+  | { status: 'started' }
+  | { status: 'disabled' }
+  | { status: 'blocked' }
+  | { status: 'aborted' }
+  | {
+      status: 'failed'
+      kind: FailedAdapter['kind']
+      detail: string
+      inputSignature: string
+    }
+
 export function createChannelManager(options: ChannelManagerOptions): ChannelManager {
   const logger = options.logger ?? consoleLogger
   const env = options.env ?? process.env
@@ -223,15 +251,20 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const createWebexBot = options.createWebexBotAdapter ?? createWebexBotAdapter
 
   const live = new Map<AdapterId, AdapterEntry>()
+  const failed = new Map<AdapterId, FailedAdapter>()
+  const failedInputSignatures = new WeakMap<FailedAdapter, string>()
   const perAdapterSerial = new Map<AdapterId, Promise<unknown>>()
   const recovery = options.connectionRecovery ?? {}
-  const recoveryCheckIntervalMs = recovery.checkIntervalMs ?? 30_000
+  const recoveryCheckIntervalMs = recovery.checkIntervalMs ?? 5_000
   const recoveryDisconnectedGraceMs = recovery.disconnectedGraceMs ?? 90_000
   const recoveryNow = recovery.now ?? (() => Date.now())
+  const recoveryRandom = recovery.random ?? Math.random
   const recoverySetInterval = recovery.setInterval ?? ((fn: () => void, ms: number) => setInterval(fn, ms))
   const recoveryClearInterval =
     recovery.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>))
   let recoveryTimer: unknown = null
+  let running = false
+  let lifecycleEpoch = 0
 
   const runSerially = <T>(name: AdapterId, op: () => Promise<T>): Promise<T> => {
     const prev = perAdapterSerial.get(name) ?? Promise.resolve()
@@ -408,50 +441,218 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     return null
   }
 
-  const startAdapter = async (name: AdapterId, cfg: ChannelAdapterConfig): Promise<boolean> => {
+  const buildFailedInputSignature = (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    credentials = buildCredentialSignature(name),
+  ): string => JSON.stringify([cfg, credentials.signature, credentials.missing])
+
+  const cleanupPartialStart = async (adapter: AnyAdapter): Promise<void> => {
+    try {
+      await adapter.stop()
+    } catch {}
+  }
+
+  const startAdapter = async (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    canCommit: () => boolean,
+  ): Promise<StartAdapterResult> => {
+    if (!canCommit()) return { status: 'aborted' }
     if (cfg.enabled === false) {
       logger.info(`[channels] adapter "${name}" is disabled; skipping`)
-      return false
+      return { status: 'disabled' }
     }
-    const { signature, missing } = buildCredentialSignature(name)
+    const credentials = buildCredentialSignature(name)
+    const { signature, missing } = credentials
     if (missing.length > 0) {
-      logger.error(`[channels] adapter "${name}" missing credentials: ${missing.join(', ')}; skipping`)
-      return false
+      return {
+        status: 'failed',
+        kind: 'missing-credentials',
+        detail: `missing credentials: ${missing.join(', ')}`,
+        inputSignature: buildFailedInputSignature(name, cfg, credentials),
+      }
     }
     const adapter = buildAdapter(name, cfg)
     if (adapter === null) {
       logger.error(`[channels] adapter "${name}" could not be constructed; skipping`)
-      return false
+      return { status: 'blocked' }
     }
     try {
       await adapter.start()
+      if (!canCommit()) {
+        await cleanupPartialStart(adapter)
+        return { status: 'aborted' }
+      }
       live.set(name, {
         adapter,
         credentialSignature: signature,
         disconnectedSinceMs: adapter.isConnected() ? null : recoveryNow(),
         recoveryRestartQueued: false,
       })
-      logger.info(`[channels] adapter "${name}" started`)
+      return { status: 'started' }
+    } catch (err) {
+      await cleanupPartialStart(adapter)
+      if (!canCommit()) return { status: 'aborted' }
+      return {
+        status: 'failed',
+        kind: 'start-failed',
+        detail: `failed to start: ${describeError(err)}`,
+        inputSignature: buildFailedInputSignature(name, cfg, credentials),
+      }
+    }
+  }
+
+  const retryCapMs = 15 * 60 * 1_000
+  const retryHeartbeatMs = 6 * 60 * 60 * 1_000
+  const retryBaseMs = Math.max(1, recovery.retryBaseMs ?? 30_000)
+
+  const nominalRetryDelayMs = (attempts: number): number =>
+    Math.min(retryCapMs, retryBaseMs * 2 ** Math.min(30, attempts - 1))
+
+  const retryDelayMs = (attempts: number): number => {
+    const nominal = nominalRetryDelayMs(attempts)
+    const spread = nominal * 0.4
+    // A deadline is only ever observed on a supervision tick, which rounds it
+    // UP by as much as one interval. Narrow the jitter spread by that interval
+    // so the OBSERVED retry still lands inside the advertised ±20% window
+    // instead of up to a tick beyond it. When the tick is coarser than the
+    // window there is no room to compensate, so fall back to plain jitter and
+    // let quantization dominate rather than collapsing every delay to the floor.
+    const usableSpread = recoveryCheckIntervalMs < spread ? spread - recoveryCheckIntervalMs : spread
+    return Math.min(retryCapMs, Math.floor(nominal * 0.8 + recoveryRandom() * usableSpread))
+  }
+
+  const recordFailure = (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    failure: Extract<StartAdapterResult, { status: 'failed' }>,
+    previous?: FailedAdapter,
+  ): FailedAdapter => {
+    const now = recoveryNow()
+    const continuing = previous !== undefined && failed.get(name) === previous
+    const attempts = continuing ? previous.attempts + 1 : 1
+    const delayMs = retryDelayMs(attempts)
+    const nominalDelayMs = nominalRetryDelayMs(attempts)
+    const previousNominalDelayMs = attempts > 1 ? nominalRetryDelayMs(attempts - 1) : 0
+    const entry: FailedAdapter = continuing
+      ? previous
+      : {
+          kind: failure.kind,
+          attempts,
+          failedSinceMs: now,
+          nextAttemptAtMs: now + delayMs,
+          retryQueued: false,
+          nextLogAtMs: Number.POSITIVE_INFINITY,
+        }
+
+    entry.kind = failure.kind
+    entry.attempts = attempts
+    entry.nextAttemptAtMs = now + delayMs
+    entry.retryQueued = false
+
+    const reachedCap = nominalDelayMs === retryCapMs
+    const justReachedCap = reachedCap && previousNominalDelayMs < retryCapMs
+    if (justReachedCap) entry.nextLogAtMs = now + retryHeartbeatMs
+
+    if (attempts === 1) {
+      if (reachedCap) entry.nextLogAtMs = now + retryHeartbeatMs
+      logger.error(`[channels] adapter "${name}" ${failure.detail} (attempt ${attempts}); retrying in ${delayMs}ms`)
+    } else if (nominalDelayMs > previousNominalDelayMs) {
+      logger.warn(
+        `[channels] adapter "${name}" still unavailable after ${Math.round(now - entry.failedSinceMs)}ms (attempt ${attempts}; ${failure.detail}); retrying in ${delayMs}ms`,
+      )
+    } else if (reachedCap && now >= entry.nextLogAtMs) {
+      logger.warn(
+        `[channels] adapter "${name}" still unavailable after ${Math.round(now - entry.failedSinceMs)}ms (attempt ${attempts}; ${failure.detail}); retrying in ${delayMs}ms`,
+      )
+      entry.nextLogAtMs = now + retryHeartbeatMs
+    }
+
+    failed.set(name, entry)
+    failedInputSignatures.set(entry, failure.inputSignature)
+    return entry
+  }
+
+  const applyStartResult = (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    result: StartAdapterResult,
+    previousFailure?: FailedAdapter,
+  ): boolean => {
+    if (result.status === 'started') {
+      const recoveryState = failed.get(name) ?? previousFailure
+      failed.delete(name)
+      if (recoveryState === undefined) {
+        logger.info(`[channels] adapter "${name}" started`)
+      } else {
+        logger.info(
+          `[channels] adapter "${name}" recovered after ${Math.round(recoveryNow() - recoveryState.failedSinceMs)}ms (${recoveryState.attempts} failed attempts)`,
+        )
+      }
+      return true
+    }
+    if (result.status === 'failed') {
+      recordFailure(name, cfg, result, previousFailure)
+    } else if (previousFailure !== undefined && failed.get(name) === previousFailure) {
+      failed.delete(name)
+    }
+    return false
+  }
+
+  const recordMissingCredentialFailure = (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    credentials: { signature: string; missing: string[] },
+  ): void => {
+    recordFailure(
+      name,
+      cfg,
+      {
+        status: 'failed',
+        kind: 'missing-credentials',
+        detail: `missing credentials: ${credentials.missing.join(', ')}`,
+        inputSignature: buildFailedInputSignature(name, cfg, credentials),
+      },
+      failed.get(name),
+    )
+  }
+
+  const recordUnexpectedStartFailure = (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    err: unknown,
+    previous?: FailedAdapter,
+  ): void => {
+    recordFailure(
+      name,
+      cfg,
+      {
+        status: 'failed',
+        kind: 'start-failed',
+        detail: `failed to start: ${describeError(err)}`,
+        inputSignature: buildFailedInputSignature(name, cfg),
+      },
+      previous,
+    )
+  }
+
+  const stopAdapter = async (name: AdapterId): Promise<boolean> => {
+    const entry = live.get(name)
+    if (!entry) return true
+    try {
+      await entry.adapter.stop()
+      if (live.get(name) === entry) live.delete(name)
+      logger.info(`[channels] adapter "${name}" stopped`)
       return true
     } catch (err) {
-      logger.error(`[channels] adapter "${name}" failed to start: ${describeError(err)}`)
+      logger.error(`[channels] adapter "${name}" failed to stop: ${describeError(err)}`)
       return false
     }
   }
 
-  const stopAdapter = async (name: AdapterId): Promise<void> => {
-    const entry = live.get(name)
-    if (!entry) return
-    try {
-      await entry.adapter.stop()
-      live.delete(name)
-      logger.info(`[channels] adapter "${name}" stopped`)
-    } catch (err) {
-      logger.error(`[channels] adapter "${name}" failed to stop: ${describeError(err)}`)
-    }
-  }
-
-  const checkConnectionRecovery = (): void => {
+  const superviseAdapters = (): void => {
+    if (!running) return
     const now = recoveryNow()
     for (const [name, entry] of live) {
       if (entry.adapter.isConnected()) {
@@ -470,27 +671,88 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       logger.warn(
         `[channels] adapter "${name}" disconnected for ${Math.round(disconnectedForMs)}ms; restarting adapter`,
       )
+      const queuedEpoch = lifecycleEpoch
       void runSerially(name, async () => {
         try {
           const current = live.get(name)
-          if (current !== entry) return
+          if (!running || queuedEpoch !== lifecycleEpoch || current !== entry) return
           const currentCfg = options.channelsConfigRef()[name]
           if (currentCfg === undefined || currentCfg.enabled === false) {
             logger.info(`[channels] recovery restart for "${name}" skipped; adapter no longer enabled`)
             return
           }
-          await stopAdapter(name)
-          await startAdapter(name, currentCfg)
+          const stopped = await stopAdapter(name)
+          if (!stopped || !running || queuedEpoch !== lifecycleEpoch) return
+          const latestCfg = options.channelsConfigRef()[name]
+          if (latestCfg === undefined || latestCfg.enabled === false) return
+          try {
+            const result = await startAdapter(name, latestCfg, () => {
+              const cfg = options.channelsConfigRef()[name]
+              return running && queuedEpoch === lifecycleEpoch && cfg !== undefined && cfg.enabled !== false
+            })
+            applyStartResult(name, latestCfg, result)
+          } catch (err) {
+            const cfg = options.channelsConfigRef()[name]
+            if (running && queuedEpoch === lifecycleEpoch && cfg !== undefined && cfg.enabled !== false) {
+              recordUnexpectedStartFailure(name, cfg, err)
+            }
+          }
         } finally {
           if (live.get(name) === entry) entry.recoveryRestartQueued = false
         }
+      }).catch((err) => {
+        logger.error(`[channels] adapter "${name}" recovery supervision failed: ${describeError(err)}`)
+      })
+    }
+
+    for (const [name, entry] of failed) {
+      if (entry.nextAttemptAtMs > now || entry.retryQueued) continue
+      entry.retryQueued = true
+      const queuedEpoch = lifecycleEpoch
+      void runSerially(name, async () => {
+        try {
+          if (!running || queuedEpoch !== lifecycleEpoch || failed.get(name) !== entry) return
+          const currentCfg = options.channelsConfigRef()[name]
+          if (currentCfg === undefined || currentCfg.enabled === false) {
+            if (failed.get(name) === entry) failed.delete(name)
+            return
+          }
+          try {
+            const result = await startAdapter(name, currentCfg, () => {
+              const cfg = options.channelsConfigRef()[name]
+              return (
+                running &&
+                queuedEpoch === lifecycleEpoch &&
+                failed.get(name) === entry &&
+                cfg !== undefined &&
+                cfg.enabled !== false
+              )
+            })
+            applyStartResult(name, currentCfg, result, entry)
+          } catch (err) {
+            const cfg = options.channelsConfigRef()[name]
+            if (
+              running &&
+              queuedEpoch === lifecycleEpoch &&
+              failed.get(name) === entry &&
+              cfg !== undefined &&
+              cfg.enabled !== false
+            ) {
+              recordUnexpectedStartFailure(name, cfg, err, entry)
+            }
+          }
+        } finally {
+          if (failed.get(name) === entry) entry.retryQueued = false
+        }
+      }).catch((err) => {
+        logger.error(`[channels] adapter "${name}" retry supervision failed: ${describeError(err)}`)
       })
     }
   }
 
   const startRecoveryTimer = (): void => {
     if (recoveryTimer !== null) return
-    recoveryTimer = recoverySetInterval(checkConnectionRecovery, recoveryCheckIntervalMs)
+    recoveryTimer = recoverySetInterval(superviseAdapters, recoveryCheckIntervalMs)
   }
 
   const stopRecoveryTimer = (): void => {
@@ -504,6 +766,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
 
     async start(): Promise<void> {
       const cfg = options.channelsConfigRef()
+      running = true
+      const startedEpoch = lifecycleEpoch
       // Safe to fan out: `live` and every router registry are keyed by adapter
       // name, so concurrent starts never collide. Serial start would otherwise pay
       // the sum of each adapter's connect latency instead of just the slowest.
@@ -515,7 +779,12 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         // uses this flag to answer "configured but unavailable" instead of the
         // misleading "not supported".
         router.setAdapterConfigured(name, adapterCfg.enabled !== false)
-        return [runSerially(name, () => startAdapter(name, adapterCfg))]
+        return [
+          runSerially(name, async () => {
+            const result = await startAdapter(name, adapterCfg, () => running && startedEpoch === lifecycleEpoch)
+            return applyStartResult(name, adapterCfg, result)
+          }),
+        ]
       })
       // Await every launched start to settle BEFORE surfacing a failure.
       // `startAdapter` converts expected per-adapter failures to `false`, so a
@@ -525,29 +794,48 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       // that the caller's subsequent `stop()` never sees. Settle all, then rethrow.
       const results = await Promise.allSettled(starts)
       const failure = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+      // An unexpected throw leaves the manager half-built, so arming supervision
+      // would retry against a state the caller is about to tear down.
       if (failure !== undefined) throw failure.reason
       startRecoveryTimer()
     },
 
     async stop(): Promise<void> {
+      // Everything that gates a queued start must flip BEFORE the first await,
+      // or a retry already sitting in `perAdapterSerial` re-registers an adapter
+      // after teardown and leaks it past the caller's stop().
+      running = false
+      lifecycleEpoch += 1
       stopRecoveryTimer()
-      for (const name of Array.from(live.keys())) await runSerially(name, () => stopAdapter(name))
+      failed.clear()
+      // Drain every id, not just the live ones: an in-flight retry for a
+      // currently-dead adapter has to be awaited too, and its `canCommit` will
+      // have aborted it by the time this barrier runs.
+      await Promise.all(ADAPTER_IDS.map((name) => runSerially(name, () => stopAdapter(name))))
       await router.stop()
     },
 
     async restartAdapter(name: AdapterId): Promise<void> {
       await runSerially(name, async () => {
-        if (!live.has(name)) {
-          logger.info(`[channels] restartAdapter('${name}'): adapter not live, skipping`)
-          return
-        }
         const currentCfg = options.channelsConfigRef()[name]
         if (currentCfg === undefined) {
           logger.info(`[channels] restartAdapter('${name}'): adapter config missing, skipping`)
           return
         }
-        await stopAdapter(name)
-        await startAdapter(name, currentCfg)
+        if (currentCfg.enabled === false) {
+          logger.info(`[channels] restartAdapter('${name}'): adapter is disabled, skipping`)
+          return
+        }
+        // Deliberately not gated on `live.has(name)`: the whole point is to let
+        // an operator revive an adapter that failed to start and is therefore
+        // absent from `live`.
+        const previousFailure = failed.get(name)
+        failed.delete(name)
+        const stopped = await stopAdapter(name)
+        if (!stopped) return
+        const queuedEpoch = lifecycleEpoch
+        const result = await startAdapter(name, currentCfg, () => running && queuedEpoch === lifecycleEpoch)
+        applyStartResult(name, currentCfg, result, previousFailure)
       })
     },
 
@@ -559,43 +847,82 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
 
       for (const name of ADAPTER_IDS) {
         const desired = cfg[name]
-        const current = live.get(name)
         if (desired === undefined || desired.enabled === false) {
           router.setAdapterConfigured(name, false)
-          if (current) {
+          failed.delete(name)
+          if (live.has(name)) {
             await runSerially(name, () => stopAdapter(name))
             stopped.push(name)
           }
-        } else if (!current) {
-          router.setAdapterConfigured(name, true)
-          const ok = await runSerially(name, () => startAdapter(name, desired))
-          if (ok) started.push(name)
-        } else {
-          const { signature, missing } = buildCredentialSignature(name)
+          continue
+        }
+        router.setAdapterConfigured(name, true)
+        // The whole decision runs inside the barrier. Choosing a branch from
+        // `live.has(name)` out here races a queued retry: it can go live (or
+        // die) before the barrier admits us, and the branch we picked would
+        // then either start a second instance or skip credential
+        // reconciliation on an adapter that is now live with a stale token.
+        const outcome = await runSerially(name, async (): Promise<'started' | 'stopped' | 'rotated' | null> => {
+          const latest = options.channelsConfigRef()[name]
+          if (latest === undefined || latest.enabled === false) return null
+          const credentials = buildCredentialSignature(name)
+          const { signature, missing } = credentials
+          const current = live.get(name)
+
           if (missing.length > 0) {
             // Required credentials disappeared (env vars removed from .env, or
             // KakaoTalk credentials removed from secrets.json). Continuing to use the
             // in-memory credentials would silently honor a credential the
             // operator explicitly removed, so stop the adapter instead of
             // waiting for a manual restart.
+            if (current === undefined) {
+              recordMissingCredentialFailure(name, latest, credentials)
+              return null
+            }
             logger.warn(
               `[channels] adapter "${name}" missing credentials after reload (${missing.join(', ')}); stopping`,
             )
-            await runSerially(name, () => stopAdapter(name))
-            stopped.push(name)
-          } else if (signature !== current.credentialSignature) {
-            const reason =
-              name === 'kakaotalk' ||
-              name === 'line' ||
-              name === 'instagram' ||
-              name === 'webex' ||
-              name === 'teams' ||
-              name === 'slack' ||
-              name === 'discord'
-                ? 'credential rotation'
-                : 'token rotation'
-            restartRequired.push(`${name} (${reason})`)
+            if (!(await stopAdapter(name))) return null
+            // Without this the adapter leaves `live` and never enters `failed`,
+            // so supervision loses it entirely and restoring the credential
+            // could not revive it without another manual reload.
+            recordMissingCredentialFailure(name, latest, credentials)
+            return 'stopped'
           }
+
+          if (current !== undefined) {
+            return signature === current.credentialSignature ? null : 'rotated'
+          }
+
+          // A reload is the operator's signal that inputs changed, so a
+          // pending backoff timer is stale — retry now rather than making
+          // them wait out up to fifteen minutes.
+          const previousFailure = failed.get(name)
+          if (previousFailure !== undefined) {
+            const changed =
+              failedInputSignatures.get(previousFailure) !== buildFailedInputSignature(name, latest, credentials)
+            if (changed) failed.delete(name)
+            else if (previousFailure.retryQueued) return null
+          }
+          const queuedEpoch = lifecycleEpoch
+          const result = await startAdapter(name, latest, () => running && queuedEpoch === lifecycleEpoch)
+          return applyStartResult(name, latest, result, previousFailure) ? 'started' : null
+        })
+
+        if (outcome === 'started') started.push(name)
+        else if (outcome === 'stopped') stopped.push(name)
+        else if (outcome === 'rotated') {
+          const reason =
+            name === 'kakaotalk' ||
+            name === 'line' ||
+            name === 'instagram' ||
+            name === 'webex' ||
+            name === 'teams' ||
+            name === 'slack' ||
+            name === 'discord'
+              ? 'credential rotation'
+              : 'token rotation'
+          restartRequired.push(`${name} (${reason})`)
         }
       }
 
