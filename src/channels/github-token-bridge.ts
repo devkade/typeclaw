@@ -1,3 +1,4 @@
+import { describeError } from './describe-error'
 // Decoupled from ChannelRouter on purpose: minting a token for an arbitrary
 // bash `gh` command is adjacent to channels but is not routing, and a global
 // singleton would leak resolver state across tests. One instance is created in
@@ -34,7 +35,7 @@ export function createGithubTokenBridge(): GithubTokenBridge {
         const token = await resolver(repoSlug)
         return { kind: 'token', token }
       } catch (err) {
-        return { kind: 'unavailable', reason: err instanceof Error ? err.message : String(err) }
+        return { kind: 'unavailable', reason: describeError(err) }
       }
     },
     hasAppTokenResolver: () => current !== null,

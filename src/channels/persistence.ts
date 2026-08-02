@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import type { ChannelParticipant } from '@/agent/session-origin'
 
 import { toRef } from './adapters/webex-id-ref'
+import { describeError } from './describe-error'
 import type { AdapterId } from './schema'
 import type { ChannelKey } from './types'
 
@@ -71,7 +72,7 @@ export async function loadChannelSessions(
   try {
     parsed = JSON.parse(raw)
   } catch (err) {
-    logger.error(`[channels] ${path} corrupted: ${describe(err)}; starting fresh`)
+    logger.error(`[channels] ${path} corrupted: ${describeError(err)}; starting fresh`)
     return []
   }
   if (!isObject(parsed)) {
@@ -107,7 +108,7 @@ export async function saveChannelSessions(
     const { rename } = await import('node:fs/promises')
     await rename(tmp, path)
   } catch (err) {
-    logger.error(`[channels] failed to persist sessions: ${describe(err)}`)
+    logger.error(`[channels] failed to persist sessions: ${describeError(err)}`)
   }
 }
 
@@ -200,8 +201,4 @@ function isValidRecord(v: unknown): v is ChannelSessionRecord {
     (r.lastInboundAt === undefined || typeof r.lastInboundAt === 'number') &&
     Array.isArray(r.participants)
   )
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

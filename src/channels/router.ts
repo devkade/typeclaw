@@ -40,6 +40,7 @@ import type { Stream } from '@/stream'
 import { extractMentionedUserIds } from './adapters/mention-hints'
 import { formatChannelCommandHelp } from './commands'
 import { detectContinuationWillingness } from './continuation-willingness'
+import { describeError } from './describe-error'
 import {
   countEffectiveHumans,
   decideEngagement,
@@ -1861,7 +1862,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           merged.workspaceName = result.workspaceName
         }
       } catch (err) {
-        logger.warn(`[channels] name resolver threw for ${channelKeyId(key)}: ${describe(err)}`)
+        logger.warn(`[channels] name resolver threw for ${channelKeyId(key)}: ${describeError(err)}`)
       }
     }
     return merged
@@ -1934,7 +1935,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (cached.kind === 'hit') return cached.membership
     if (cached.kind === 'stale') {
       void cache.warmUp(scoped).catch((err) => {
-        logger.warn(`[channels] membership refresh failed for ${live.keyId}: ${describe(err)}`)
+        logger.warn(`[channels] membership refresh failed for ${live.keyId}: ${describeError(err)}`)
       })
       return cached.membership
     }
@@ -2306,7 +2307,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           turnId: live.sessionId,
           stopReason: usage.stopReason,
           ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
-        }).catch((err) => logger.error(`[channels] ${live.keyId}: todo outcome capture failed: ${describe(err)}`))
+        }).catch((err) => logger.error(`[channels] ${live.keyId}: todo outcome capture failed: ${describeError(err)}`))
       })
       live.unsubTypingActivity = subscribeTypingActivity(created.session, live)
       installChannelReplyTerminalHook(live)
@@ -2377,7 +2378,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // ensureLive will treat as a usable warm session — strictly better than
       // a permanent silent drop. The caller (route() in this file, ultimately
       // the adapter's outer catch) sees the timeout error and logs it.
-      logger.error(`[channels] ${keyId}: ensureLive failed: ${describe(err)}`)
+      logger.error(`[channels] ${keyId}: ensureLive failed: ${describeError(err)}`)
       throw err
     } finally {
       // Owner-checked delete: only clear the in-flight marker if it still points
@@ -2524,7 +2525,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await Promise.all(
       snapshot.map((cb) =>
         cb(target).catch((err) => {
-          logger.warn(`[channels] typing callback threw for ${live.keyId}: ${describe(err)}`)
+          logger.warn(`[channels] typing callback threw for ${live.keyId}: ${describeError(err)}`)
         }),
       ),
     )
@@ -2753,7 +2754,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       await raceWithTimeout(work, sessionIdleTimeoutMs, `[channels] ${live.keyId} session.idle`)
     } catch (err) {
-      logger.warn(`[channels] session.idle hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.idle hook threw for ${live.keyId}: ${describeError(err)}`)
     }
   }
 
@@ -2761,7 +2762,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       await recordTurnStart({ agentDir: options.agentDir, origin: buildLiveOrigin(live), isRealUserTurn })
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: todo turn-start failed: ${describe(err)}`)
+      logger.warn(`[channels] ${live.keyId}: todo turn-start failed: ${describeError(err)}`)
     }
   }
 
@@ -2783,7 +2784,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         },
       })
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: todo continuation failed: ${describe(err)}`)
+      logger.warn(`[channels] ${live.keyId}: todo continuation failed: ${describeError(err)}`)
     }
   }
 
@@ -2862,7 +2863,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         retrievalContext,
       })
     } catch (err) {
-      logger.warn(`[channels] session.turn.start hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.turn.start hook threw for ${live.keyId}: ${describeError(err)}`)
     }
     return retrievalContext
   }
@@ -2876,7 +2877,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         origin: buildLiveOrigin(live),
       })
     } catch (err) {
-      logger.warn(`[channels] session.turn.end hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.turn.end hook threw for ${live.keyId}: ${describeError(err)}`)
     }
   }
 
@@ -2919,7 +2920,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       await live.hooks.runSessionEnd({ sessionId: live.sessionId })
     } catch (err) {
-      logger.warn(`[channels] session.end hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.end hook threw for ${live.keyId}: ${describeError(err)}`)
     }
   }
 
@@ -2935,7 +2936,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       await live.session.abort()
       logger.info(`[channels] ${live.keyId}: command /stop aborted current turn`)
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describe(err)}`)
+      logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describeError(err)}`)
     }
   }
 
@@ -2998,7 +2999,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       },
       { source: 'system' },
     ).catch((sendErr) => {
-      logger.warn(`[channels] ${live.keyId}: provider-error notice send threw: ${describe(sendErr)}`)
+      logger.warn(`[channels] ${live.keyId}: provider-error notice send threw: ${describeError(sendErr)}`)
       return null
     })
     if (result !== null && !result.ok) {
@@ -3218,7 +3219,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
           logger.info(`[channels] ${live.keyId} prompted elapsed_ms=${now() - promptStart}`)
         } catch (err) {
-          logger.error(`[channels] ${live.keyId}: prompt threw: ${describe(err)}`)
+          logger.error(`[channels] ${live.keyId}: prompt threw: ${describeError(err)}`)
           // Fallback is exhausted by now (promptPersistentTurnWithFallback only
           // throws after rotating every eligible ref), so a recognizable provider
           // failure is terminal for this turn. Stage a redacted notice for the
@@ -3354,7 +3355,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       successor = await ensureLive(key)
     } catch (err) {
-      logger.warn(`[channels] ${channelKeyId(key)}: successor recreate after reload failed: ${describe(err)}`)
+      logger.warn(`[channels] ${channelKeyId(key)}: successor recreate after reload failed: ${describeError(err)}`)
       return
     }
     if (successor.destroyed) return
@@ -3426,7 +3427,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         },
       })
     } catch (err) {
-      logger.warn(`[channels] inbound stream publish failed: ${err instanceof Error ? err.message : String(err)}`)
+      logger.warn(`[channels] inbound stream publish failed: ${describeError(err)}`)
     }
   }
 
@@ -3592,7 +3593,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (cache !== undefined) {
         cache.invalidate(scoped)
         void cache.warmUp(scoped).catch((err) => {
-          logger.warn(`[channels] membership warmup after new author failed for ${live.keyId}: ${describe(err)}`)
+          logger.warn(`[channels] membership warmup after new author failed for ${live.keyId}: ${describeError(err)}`)
         })
       }
     }
@@ -3832,7 +3833,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // throw is converted to a transient failure result so every caller gets a
       // uniform { ok: false } instead of an exception.
       const result = await cb(req).catch(
-        (err): ReactionResult => ({ ok: false, error: describe(err), code: 'transient' }),
+        (err): ReactionResult => ({ ok: false, error: describeError(err), code: 'transient' }),
       )
       if (result.ok) return result
       lastError = result
@@ -3870,7 +3871,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
         })
         .catch((err) => {
-          logger.info(`[channels] react-after-reply threw adapter=${req.adapter} chat=${req.chat}: ${describe(err)}`)
+          logger.info(
+            `[channels] react-after-reply threw adapter=${req.adapter} chat=${req.chat}: ${describeError(err)}`,
+          )
         })
     }
   }
@@ -3886,7 +3889,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     let lastError: ReactionResult | undefined
     for (const cb of Array.from(callbacks)) {
       const result = await cb(req).catch(
-        (err): ReactionResult => ({ ok: false, error: describe(err), code: 'transient' }),
+        (err): ReactionResult => ({ ok: false, error: describeError(err), code: 'transient' }),
       )
       if (result.ok) return result
       lastError = result
@@ -3923,7 +3926,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
       })
       .catch((err) => {
-        logger.info(`[channels] engage-react threw adapter=${event.adapter} chat=${event.chat}: ${describe(err)}`)
+        logger.info(`[channels] engage-react threw adapter=${event.adapter} chat=${event.chat}: ${describeError(err)}`)
       })
     return addReactionRef
   }
@@ -3969,7 +3972,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       })
       .catch((err) => {
         logger.info(
-          `[channels] engage-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describe(err)}`,
+          `[channels] engage-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
         )
       })
   }
@@ -4106,7 +4109,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (result.ok) return result
         lastError = result
       } catch (err) {
-        logger.warn(`[channels] history fetch threw for ${adapter}: ${describe(err)}`)
+        logger.warn(`[channels] history fetch threw for ${adapter}: ${describeError(err)}`)
         lastError = { ok: false, error: callbackFailureError(adapter, 'history') }
       }
     }
@@ -4130,7 +4133,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       return await raceWithTimeout(cb(args), fetchHistoryTimeoutMs, `[channels] ${adapter} message get`)
     } catch (err) {
-      logger.warn(`[channels] message get threw for ${adapter}: ${describe(err)}`)
+      logger.warn(`[channels] message get threw for ${adapter}: ${describeError(err)}`)
       return { ok: false, error: callbackFailureError(adapter, 'message-get'), code: 'adapter-error' }
     }
   }
@@ -4152,7 +4155,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       return await raceWithTimeout(cb(args), fetchHistoryTimeoutMs, `[channels] ${adapter} list channels`)
     } catch (err) {
-      logger.warn(`[channels] list channels threw for ${adapter}: ${describe(err)}`)
+      logger.warn(`[channels] list channels threw for ${adapter}: ${describeError(err)}`)
       return { ok: false, error: callbackFailureError(adapter, 'list'), code: 'adapter-error' }
     }
   }
@@ -4203,8 +4206,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (result.ok) return result
         lastError = result
       } catch (err) {
-        logger.warn(`[channels] edit message threw for ${req.adapter}: ${describe(err)}`)
-        lastError = { ok: false, error: `edit message failed: ${describe(err)}` }
+        logger.warn(`[channels] edit message threw for ${req.adapter}: ${describeError(err)}`)
+        lastError = { ok: false, error: `edit message failed: ${describeError(err)}` }
       }
     }
     return lastError
@@ -4270,7 +4273,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
     }
     return await resolver(req).catch(
-      (err): ReviewThreadResolveResult => ({ ok: false, error: describe(err), code: 'transient' }),
+      (err): ReviewThreadResolveResult => ({ ok: false, error: describeError(err), code: 'transient' }),
     )
   }
 
@@ -4290,7 +4293,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { ok: false, error: `adapter "${req.adapter}" does not support review-state lookup`, code: 'unsupported' }
     }
     return await resolver(req).catch(
-      (err): ReviewStateResult => ({ ok: false, error: describe(err), code: 'transient' }),
+      (err): ReviewStateResult => ({ ok: false, error: describeError(err), code: 'transient' }),
     )
   }
 
@@ -4308,7 +4311,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { ok: false, error: `adapter "${req.adapter}" does not support review submission`, code: 'unsupported' }
     }
     return await submitter(req).catch(
-      (err): SubmitReviewResult => ({ ok: false, error: describe(err), code: 'transient' }),
+      (err): SubmitReviewResult => ({ ok: false, error: describeError(err), code: 'transient' }),
     )
   }
 
@@ -5260,13 +5263,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       await live.session.abort()
     } catch (err) {
-      logger.warn(`[channels] abort failed for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] abort failed for ${live.keyId}: ${describeError(err)}`)
     }
     await fireSessionEnd(live)
     try {
       await live.dispose()
     } catch (err) {
-      logger.warn(`[channels] dispose failed for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] dispose failed for ${live.keyId}: ${describeError(err)}`)
     }
   }
 
@@ -5372,11 +5375,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const live of Array.from(liveSessions.values())) {
       const origin = buildLiveOrigin(live)
       await markRestartAbortPendingForOrigin(options.agentDir, origin).catch((err) =>
-        logger.error(`[channels] graceful-restart mark abort failed: ${describe(err)}`),
+        logger.error(`[channels] graceful-restart mark abort failed: ${describeError(err)}`),
       )
       await live.session
         .abort()
-        .catch((err) => logger.error(`[channels] graceful-restart abort failed: ${describe(err)}`))
+        .catch((err) => logger.error(`[channels] graceful-restart abort failed: ${describeError(err)}`))
     }
   }
 
@@ -5523,7 +5526,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             sessionFile: handoff.originatingSessionFile,
           })
         } catch (err) {
-          logger.warn(`[channels] ${keyId}: restart-resume ensureLive failed: ${describe(err)}`)
+          logger.warn(`[channels] ${keyId}: restart-resume ensureLive failed: ${describeError(err)}`)
           rejectGate(err)
           return
         }
@@ -5563,13 +5566,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
 
         await armRestartKickForOrigin(options.agentDir, buildLiveOrigin(live)).catch((err) =>
-          logger.error(`[channels] ${keyId}: restart-resume arm restart-kick failed: ${describe(err)}`),
+          logger.error(`[channels] ${keyId}: restart-resume arm restart-kick failed: ${describeError(err)}`),
         )
         // A restart-aborted turn arms the durable user-abort block; this resume
         // IS the restart, so clear it or the resumed session never auto-resumes
         // its incomplete todos. Gated to this restart-handoff path.
         await clearAbortSuppressionForOrigin(options.agentDir, buildLiveOrigin(live)).catch((err) =>
-          logger.error(`[channels] ${keyId}: restart-resume clear abort suppression failed: ${describe(err)}`),
+          logger.error(`[channels] ${keyId}: restart-resume clear abort suppression failed: ${describeError(err)}`),
         )
 
         live.pendingSystemReminders.push(buildRestartResumeWakeReminder(handoff.interruptedSubagents))
@@ -5846,7 +5849,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       })
       .catch((err) => {
         logger.info(
-          `[channels] disengage-react threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describe(err)}`,
+          `[channels] disengage-react threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
         )
       })
   }
@@ -5887,7 +5890,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       })
       .catch((err) => {
         logger.info(
-          `[channels] silent-ack-react threw reason=${reason} adapter=${live.key.adapter} chat=${live.key.chat}: ${describe(err)}`,
+          `[channels] silent-ack-react threw reason=${reason} adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
         )
       })
     // Register the add promise (not its resolved ref) SYNCHRONOUSLY, so a later
@@ -5928,7 +5931,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           })
           .catch((err) => {
             logger.info(
-              `[channels] silent-ack-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describe(err)}`,
+              `[channels] silent-ack-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
             )
           }),
       ),
@@ -6700,7 +6703,7 @@ function tryOpenSessionManager(
     return SessionManager.open(path)
   } catch (err) {
     logger.warn(
-      `[channels] could not rehydrate session ${existingSessionId} from ${existingSessionFile}: ${describe(err)}; creating new`,
+      `[channels] could not rehydrate session ${existingSessionId} from ${existingSessionFile}: ${describeError(err)}; creating new`,
     )
     return SessionManager.create(agentDir, sessionDir)
   }
@@ -7768,10 +7771,6 @@ function readStringValue(s: string, from: number, quote: string): string | null 
 }
 
 const ESCAPE_REPLACEMENTS: Record<string, string> = { n: '\n', r: '\r', t: '\t' }
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
-}
 
 // Used by tests / external diagnostics.
 export type { ChannelSessionRecord }

@@ -26,6 +26,7 @@ import { createTeamsAdapter, type TeamsAdapter } from './adapters/teams'
 import { createTelegramBotAdapter, type TelegramBotAdapter } from './adapters/telegram-bot'
 import { createWebexAdapter, type WebexAdapter } from './adapters/webex'
 import { createWebexBotAdapter, type WebexBotAdapter } from './adapters/webex-bot'
+import { describeError } from './describe-error'
 import type { GithubTokenBridge } from './github-token-bridge'
 import {
   createChannelRouter,
@@ -433,7 +434,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       logger.info(`[channels] adapter "${name}" started`)
       return true
     } catch (err) {
-      logger.error(`[channels] adapter "${name}" failed to start: ${describe(err)}`)
+      logger.error(`[channels] adapter "${name}" failed to start: ${describeError(err)}`)
       return false
     }
   }
@@ -446,7 +447,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       live.delete(name)
       logger.info(`[channels] adapter "${name}" stopped`)
     } catch (err) {
-      logger.error(`[channels] adapter "${name}" failed to stop: ${describe(err)}`)
+      logger.error(`[channels] adapter "${name}" failed to stop: ${describeError(err)}`)
     }
   }
 
@@ -644,7 +645,7 @@ function buildDiscordSignature(agentDir: string): { signature: string; missing: 
     const digest = createHash('sha256').update(JSON.stringify(block)).digest('hex')
     return { signature: `secrets.json#channels.discord@sha256:${digest}`, missing: [] }
   } catch (err) {
-    return { signature: '', missing: [`secrets.json#channels.discord (${describe(err)})`] }
+    return { signature: '', missing: [`secrets.json#channels.discord (${describeError(err)})`] }
   }
 }
 
@@ -670,7 +671,7 @@ function buildSlackSignature(agentDir: string): { signature: string; missing: st
     const digest = createHash('sha256').update(JSON.stringify(block)).digest('hex')
     return { signature: `secrets.json#channels.slack@sha256:${digest}`, missing: [] }
   } catch (err) {
-    return { signature: '', missing: [`secrets.json#channels.slack (${describe(err)})`] }
+    return { signature: '', missing: [`secrets.json#channels.slack (${describeError(err)})`] }
   }
 }
 
@@ -696,7 +697,7 @@ function buildWebexSignature(agentDir: string): { signature: string; missing: st
     const digest = createHash('sha256').update(JSON.stringify(block)).digest('hex')
     return { signature: `secrets.json#channels.webex@sha256:${digest}`, missing: [] }
   } catch (err) {
-    return { signature: '', missing: [`secrets.json#channels.webex (${describe(err)})`] }
+    return { signature: '', missing: [`secrets.json#channels.webex (${describeError(err)})`] }
   }
 }
 
@@ -722,7 +723,7 @@ function buildTeamsSignature(agentDir: string): { signature: string; missing: st
     const digest = createHash('sha256').update(JSON.stringify(block)).digest('hex')
     return { signature: `secrets.json#channels.teams@sha256:${digest}`, missing: [] }
   } catch (err) {
-    return { signature: '', missing: [`secrets.json#channels.teams (${describe(err)})`] }
+    return { signature: '', missing: [`secrets.json#channels.teams (${describeError(err)})`] }
   }
 }
 
@@ -748,7 +749,7 @@ function buildKakaotalkSignature(agentDir: string): { signature: string; missing
     const digest = createHash('sha256').update(JSON.stringify(block)).digest('hex')
     return { signature: `secrets.json#channels.kakaotalk@sha256:${digest}`, missing: [] }
   } catch (err) {
-    return { signature: '', missing: [`secrets.json#channels.kakaotalk (${describe(err)})`] }
+    return { signature: '', missing: [`secrets.json#channels.kakaotalk (${describeError(err)})`] }
   }
 }
 
@@ -774,7 +775,7 @@ function buildLineSignature(agentDir: string): { signature: string; missing: str
     const digest = createHash('sha256').update(JSON.stringify(block)).digest('hex')
     return { signature: `secrets.json#channels.line@sha256:${digest}`, missing: [] }
   } catch (err) {
-    return { signature: '', missing: [`secrets.json#channels.line (${describe(err)})`] }
+    return { signature: '', missing: [`secrets.json#channels.line (${describeError(err)})`] }
   }
 }
 
@@ -800,7 +801,7 @@ function buildInstagramSignature(agentDir: string): { signature: string; missing
     const digest = createHash('sha256').update(JSON.stringify(block)).digest('hex')
     return { signature: `secrets.json#channels.instagram@sha256:${digest}`, missing: [] }
   } catch (err) {
-    return { signature: '', missing: [`secrets.json#channels.instagram (${describe(err)})`] }
+    return { signature: '', missing: [`secrets.json#channels.instagram (${describeError(err)})`] }
   }
 }
 
@@ -891,8 +892,4 @@ function isTeamsCredentialBlock(value: unknown): value is { accounts: Record<str
   return (
     typeof accounts === 'object' && accounts !== null && !Array.isArray(accounts) && Object.keys(accounts).length > 0
   )
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

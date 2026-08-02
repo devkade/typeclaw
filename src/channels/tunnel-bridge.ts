@@ -1,6 +1,7 @@
 import type { Stream } from '@/stream'
 import { isTunnelUrlChangedPayload } from '@/tunnels'
 
+import { describeError } from './describe-error'
 import type { AdapterId } from './schema'
 
 export type TunnelBridgeLogger = {
@@ -41,7 +42,7 @@ export function createTunnelBridge(options: TunnelBridgeOptions): TunnelBridge {
     if (typeof name !== 'string') return
     logger.info(`[tunnels] ${name} URL → restarting adapter`)
     void options.channelManager.restartAdapter(name as AdapterId).catch((err: unknown) => {
-      logger.error(`[tunnels] failed to restart ${name} adapter: ${err instanceof Error ? err.message : String(err)}`)
+      logger.error(`[tunnels] failed to restart ${name} adapter: ${describeError(err)}`)
     })
   })
 
