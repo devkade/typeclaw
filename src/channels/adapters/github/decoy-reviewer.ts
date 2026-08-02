@@ -1,3 +1,4 @@
+import { describeError } from '../../describe-error'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 
 // `absent` separates "GitHub says the reviewer is already not requested"
@@ -38,6 +39,6 @@ export async function removeRequestedReviewer(params: {
       reason: `GitHub API ${response.status}${message !== '' ? `: ${message}` : ''}`,
     }
   } catch (err) {
-    return { kind: 'failed', reason: err instanceof Error ? err.message : String(err) }
+    return { kind: 'failed', reason: describeError(err) }
   }
 }

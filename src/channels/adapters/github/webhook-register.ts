@@ -1,3 +1,4 @@
+import { describeError } from '../../describe-error'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 
 export type RegisterGithubWebhooksOptions = {
@@ -68,7 +69,7 @@ export async function registerGithubWebhooks(
       try {
         token = await options.token(repo)
       } catch (err) {
-        return { repo, action: 'failed', error: describe(err) }
+        return { repo, action: 'failed', error: describeError(err) }
       }
       return registerOne(fetchImpl, token, repo, options)
     }),
@@ -96,7 +97,7 @@ export async function deregisterGithubWebhooks(
       try {
         token = await options.token(hook.repo)
       } catch (err) {
-        return { ...hook, action: 'failed', error: describe(err) }
+        return { ...hook, action: 'failed', error: describeError(err) }
       }
       return deleteOne(fetchImpl, token, hook)
     }),
@@ -137,7 +138,7 @@ async function registerOne(
     const stalePruned = pruned.filter(Boolean).length
     return { repo, action: 'updated', hookId: keep!, stalePruned }
   } catch (err) {
-    return { repo, action: 'failed', error: describe(err) }
+    return { repo, action: 'failed', error: describeError(err) }
   }
 }
 
@@ -166,7 +167,7 @@ async function deleteOne(
     }
     return { ...hook, action: 'deleted' }
   } catch (err) {
-    return { ...hook, action: 'failed', error: describe(err) }
+    return { ...hook, action: 'failed', error: describeError(err) }
   }
 }
 
@@ -350,8 +351,4 @@ function toCoarseEvents(events: readonly string[]): string[] {
     if (coarse && coarse.length > 0) seen.add(coarse)
   }
   return [...seen]
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

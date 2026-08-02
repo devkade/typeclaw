@@ -5,6 +5,7 @@ import type { ChannelSelfIdentityResolver, InboundMessage } from '@/channels/typ
 import { resolveSecret } from '@/secrets/resolve'
 import type { GithubSecretsBlock } from '@/secrets/schema'
 
+import { describeError } from '../../describe-error'
 import { buildAuthStrategy, type GithubAuthContext } from './auth'
 import { createGithubChannelNameResolver } from './channel-resolver'
 import { createDeliveryDedup } from './dedup'
@@ -206,7 +207,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     void Promise.resolve()
       .then(() => options.router.route(message))
       .catch((err: unknown) => {
-        logger.error(`[github] route failed: ${err instanceof Error ? err.message : String(err)}`)
+        logger.error(`[github] route failed: ${describeError(err)}`)
       })
   }
   const handlerOptions: GithubWebhookHandlerOptions = {
@@ -281,9 +282,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         if (tokenRefreshIntervalMs > 0) {
           const refresh = () => {
             seedGhToken().catch((err) => {
-              logger.error(
-                `[github] periodic token refresh failed: ${err instanceof Error ? err.message : String(err)}`,
-              )
+              logger.error(`[github] periodic token refresh failed: ${describeError(err)}`)
             })
           }
           tokenRefreshTimer = setIntervalFn(refresh, tokenRefreshIntervalMs)
@@ -389,7 +388,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
           fetchImpl,
           cooldownStore: store,
         }).catch((err: unknown) => {
-          logger.warn(`[github] reconcile pass failed: ${err instanceof Error ? err.message : String(err)}`)
+          logger.warn(`[github] reconcile pass failed: ${describeError(err)}`)
         })
       if (reconcileCooldownStore !== null) {
         await runReconcile(reconcileCooldownStore)
@@ -421,7 +420,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
             logger,
             fetchImpl,
           }).catch((err: unknown) => {
-            logger.warn(`[github] delivery recovery sweep failed: ${err instanceof Error ? err.message : String(err)}`)
+            logger.warn(`[github] delivery recovery sweep failed: ${describeError(err)}`)
           })
         }
         deliveryRecoveryTimer = setIntervalFn(sweep, deliveryRecoveryIntervalMs)
@@ -589,9 +588,7 @@ async function runAppPermissionPreflight(
     try {
       grants = await getGrants(context)
     } catch (err) {
-      logger.warn(
-        `[github] permission preflight skipped for ${label}: ${err instanceof Error ? err.message : String(err)}`,
-      )
+      logger.warn(`[github] permission preflight skipped for ${label}: ${describeError(err)}`)
       continue
     }
     if (grants === undefined) continue

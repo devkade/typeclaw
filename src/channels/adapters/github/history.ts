@@ -1,5 +1,6 @@
 import type { ChannelHistoryMessage, FetchHistoryArgs, FetchHistoryResult, HistoryCallback } from '@/channels/types'
 
+import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { parseChat, parseRepo } from './outbound'
@@ -38,7 +39,7 @@ export function createGithubHistoryCallback(options: {
         ? { ok: true, messages: raw.map(mapComment), nextCursor }
         : { ok: true, messages: raw.map(mapComment) }
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      return { ok: false, error: describeError(err) }
     }
   }
 }

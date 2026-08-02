@@ -1,3 +1,4 @@
+import { describeError } from '../../describe-error'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 
 // Recovers webhook events whose delivery to our ingress FAILED and that GitHub
@@ -99,7 +100,7 @@ export async function recoverFailedGithubDeliveries(options: RecoverFailedDelive
     } catch (err) {
       // Per-hook isolation: one repo's token/list/detail failure must not abort
       // the others. The next interval retries this hook.
-      options.logger.warn(`[github] delivery recovery failed for ${hook.repo}: ${describe(err)}`)
+      options.logger.warn(`[github] delivery recovery failed for ${hook.repo}: ${describeError(err)}`)
     }
   }
   return { recovered, scanned }
@@ -263,8 +264,4 @@ function nextLink(linkHeader: string | null): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
