@@ -2,6 +2,8 @@ import type { DiscordGatewayInteractionEvent } from 'agent-messenger/discordbot'
 
 import type { ChannelKey } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 const DISCORD_API_BASE = 'https://discord.com/api/v10'
 
 // CHAT_INPUT is the only Discord application-command type that maps to the
@@ -63,7 +65,7 @@ export async function registerCommands(args: RegisterCommandsArgs): Promise<Regi
     }
     return { ok: true }
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    return { ok: false, error: describeError(err) }
   }
 }
 

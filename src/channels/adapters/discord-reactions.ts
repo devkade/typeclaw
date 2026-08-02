@@ -8,6 +8,8 @@ import type {
   RemoveReactionCallback,
 } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 export type DiscordReactionTarget = { channel: string; message: string }
 export type DiscordReactionRemovalTarget = { channel: string; message: string; emoji: string }
 
@@ -78,7 +80,7 @@ export function createDiscordReactionCallback(deps: { client: Pick<DiscordClient
     try {
       await deps.client.addReaction(target.channel, target.message, unicode)
     } catch (err) {
-      return { ok: false, error: describe(err), code: classifyDiscordError(err) }
+      return { ok: false, error: describeError(err), code: classifyDiscordError(err) }
     }
     return { ok: true, reactionRef: encodeDiscordRemovalRef({ ...target, emoji: unicode }) }
   }
@@ -94,7 +96,7 @@ export function createDiscordRemoveReactionCallback(deps: {
     try {
       await deps.client.removeReaction(target.channel, target.message, target.emoji)
     } catch (err) {
-      return { ok: false, error: describe(err), code: classifyDiscordError(err) }
+      return { ok: false, error: describeError(err), code: classifyDiscordError(err) }
     }
     return { ok: true }
   }
@@ -131,8 +133,4 @@ function parseRecord(value: string): Record<string, unknown> | null {
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : null
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

@@ -8,6 +8,8 @@ import type {
   RemoveReactionCallback,
 } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 // The reactable target on Discord: a message is addressed by its channel id
 // plus the message id. The classifier stamps this because both values are on
 // the gateway event but `chat`/`externalMessageId` are the only ones that
@@ -99,7 +101,7 @@ export function createDiscordReactionCallback(deps: {
     try {
       await deps.client.addReaction(target.channel, target.message, unicode)
     } catch (err) {
-      return { ok: false, error: describe(err), code: classifyDiscordError(err) }
+      return { ok: false, error: describeError(err), code: classifyDiscordError(err) }
     }
     return { ok: true, reactionRef: encodeDiscordRemovalRef({ ...target, emoji: unicode }) }
   }
@@ -117,7 +119,7 @@ export function createDiscordRemoveReactionCallback(deps: {
     try {
       await deps.client.removeReaction(target.channel, target.message, target.emoji)
     } catch (err) {
-      return { ok: false, error: describe(err), code: classifyDiscordError(err) }
+      return { ok: false, error: describeError(err), code: classifyDiscordError(err) }
     }
     return { ok: true }
   }
@@ -158,8 +160,4 @@ function parseRecord(value: string): Record<string, unknown> | null {
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : null
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

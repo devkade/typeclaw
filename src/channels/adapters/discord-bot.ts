@@ -50,6 +50,7 @@ import type {
   TypingTarget,
 } from '@/channels/types'
 
+import { describeError } from '../describe-error'
 import { createDiscordChannelResolver } from './discord-bot-channel-resolver'
 import {
   classifyInbound,
@@ -174,7 +175,7 @@ export function createTypingCallback(deps: {
         logger.warn(`[discord-bot] typing ${tag} status=${response.status}`)
       }
     } catch (err) {
-      logger.warn(`[discord-bot] typing ${tag} failed: ${describe(err)}`)
+      logger.warn(`[discord-bot] typing ${tag} failed: ${describeError(err)}`)
     }
   }
 }
@@ -503,7 +504,7 @@ async function fetchDiscordJson<T>(fetchFn: typeof fetch, url: string, token: st
   try {
     response = await fetchFn(url, { method: 'GET', headers: { Authorization: `Bot ${token}` } })
   } catch (err) {
-    return { ok: false, status: null, reason: describe(err), failure: { kind: 'transient' } }
+    return { ok: false, status: null, reason: describeError(err), failure: { kind: 'transient' } }
   }
   if (!response.ok) {
     return {
@@ -516,7 +517,7 @@ async function fetchDiscordJson<T>(fetchFn: typeof fetch, url: string, token: st
   try {
     return { ok: true, value: (await response.json()) as T }
   } catch (err) {
-    return { ok: false, status: null, reason: `parse failed: ${describe(err)}`, failure: { kind: 'transient' } }
+    return { ok: false, status: null, reason: `parse failed: ${describeError(err)}`, failure: { kind: 'transient' } }
   }
 }
 
@@ -578,7 +579,7 @@ export function createDiscordHistoryCallback(deps: {
         headers: { Authorization: `Bot ${token}` },
       })
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.warn(`[discord-bot] history fetch failed: ${message}`)
       return { ok: false, error: message }
     }
@@ -588,7 +589,7 @@ export function createDiscordHistoryCallback(deps: {
     try {
       raw = (await response.json()) as DiscordRawHistoryMessage[]
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       return { ok: false, error: `parse failed: ${message}` }
     }
 
@@ -628,7 +629,7 @@ export function createDiscordMessageGetCallback(deps: {
         headers: { Authorization: `Bot ${token}` },
       })
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.warn(`[discord-bot] message get failed: ${message}`)
       return { ok: false, error: message }
     }
@@ -638,7 +639,7 @@ export function createDiscordMessageGetCallback(deps: {
     try {
       raw = (await response.json()) as DiscordRawHistoryMessage
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       return { ok: false, error: `parse failed: ${message}` }
     }
     return { ok: true, message: mapDiscordMessage(raw, botUserIdRef()) }
@@ -665,7 +666,7 @@ export function createDiscordListCallback(deps: {
         headers: { Authorization: `Bot ${token}` },
       })
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.warn(`[discord-bot] channel list failed: ${message}`)
       return { ok: false, error: message }
     }
@@ -674,7 +675,7 @@ export function createDiscordListCallback(deps: {
     try {
       raw = (await response.json()) as DiscordListChannel[]
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       return { ok: false, error: `parse failed: ${message}` }
     }
     const entries = raw
@@ -819,7 +820,7 @@ export function createOutboundCallback(deps: {
           )
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
+        const message = describeError(err)
         logger.error(`[discord-bot] uploadFile failed for ${path}: ${message}`)
         return { ok: false, error: `uploadFile failed: ${message}` }
       }
@@ -841,7 +842,7 @@ export function createOutboundCallback(deps: {
       logger.info(`[discord-bot] sent id=${sent.id} ${tag}`)
       return { ok: true, messageId: sent.id, messageIds: [sent.id] }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.error(`[discord-bot] sendMessage failed: ${message}`)
       return { ok: false, error: message }
     }
@@ -938,7 +939,7 @@ export function createFetchAttachmentCallback(deps: {
         size: buffer.length,
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.error(`[discord-bot] fetchAttachment failed for ${url.toString()}: ${message}`)
       return { ok: false, error: message }
     }
@@ -1016,11 +1017,11 @@ export function createInteractionHandler(
         deps.logger.info(`[discord-bot] interaction /${command.name} result=${result.kind} ${inboundTag}`)
       } catch (err) {
         deps.logger.info(
-          `[discord-bot] interaction /${command.name} result=${result.kind} (channel-tag resolution failed: ${describe(err)})`,
+          `[discord-bot] interaction /${command.name} result=${result.kind} (channel-tag resolution failed: ${describeError(err)})`,
         )
       }
     } catch (err) {
-      deps.logger.error(`[discord-bot] handleInteraction failed: ${describe(err)}`)
+      deps.logger.error(`[discord-bot] handleInteraction failed: ${describeError(err)}`)
     }
   }
 }
@@ -1180,7 +1181,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       )
       await options.router.route(payload)
     } catch (err) {
-      logger.error(`[discord-bot] handleInbound failed: ${describe(err)}`)
+      logger.error(`[discord-bot] handleInbound failed: ${describeError(err)}`)
     } finally {
       inflightInbounds--
       if (inflightInbounds === 0 && stopWaiters.length > 0) {
@@ -1199,7 +1200,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         await client.login({ token: options.token })
       } catch (err) {
         started = false
-        logger.error(`[discord-bot] login failed: ${describe(err)}`)
+        logger.error(`[discord-bot] login failed: ${describeError(err)}`)
         throw err
       }
 
@@ -1246,7 +1247,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         // distinct SDK error contract without treating transient transport
         // errors as disconnects.
         if (isTerminalGatewayClose(err)) connected = false
-        logger.error(`[discord-bot] gateway error: ${describe(err)}`)
+        logger.error(`[discord-bot] gateway error: ${describeError(err)}`)
       })
       listener.on('message_create', (event) => {
         void handleMessageCreate(event)
@@ -1293,7 +1294,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         botUserId = null
         connected = false
         started = false
-        logger.error(`[discord-bot] listener start failed: ${describe(err)}`)
+        logger.error(`[discord-bot] listener start failed: ${describeError(err)}`)
         throw err
       }
 
@@ -1333,7 +1334,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
             )
           },
           (error: unknown) => {
-            logger.warn(`[discord-bot] historical provenance enrichment failed: ${describe(error)}`)
+            logger.warn(`[discord-bot] historical provenance enrichment failed: ${describeError(error)}`)
           },
         )
       }
@@ -1375,10 +1376,6 @@ const TERMINAL_GATEWAY_CLOSE_PATTERN = /^Discord gateway closed with non-recover
 
 function isTerminalGatewayClose(err: unknown): boolean {
   return err instanceof Error && TERMINAL_GATEWAY_CLOSE_PATTERN.test(err.message)
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
 
 // Operator hints appended to drop logs. Kept short — full guidance lives in
