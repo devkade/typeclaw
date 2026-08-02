@@ -24,6 +24,7 @@ import { detectWsl, isWindows, isWindowsDriveMount, type WslInfo } from '@/share
 
 import { buildChannelChecks } from './channel-checks'
 import { agentFileOwnership, type FileOwnershipDeps } from './file-ownership'
+import { buildOperationalIncidentChecks } from './operational-incidents'
 import type { DoctorCheck } from './types'
 
 export function buildStaticChecks(opts: { dockerExec?: DockerExec } & FileOwnershipDeps = {}): DoctorCheck[] {
@@ -47,6 +48,7 @@ export function buildStaticChecks(opts: { dockerExec?: DockerExec } & FileOwners
     windowsBindMount(),
     containerState(dockerExec),
     containerHostPort(),
+    ...buildOperationalIncidentChecks(),
     ...buildChannelChecks(),
   ]
 }
