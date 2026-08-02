@@ -2,6 +2,8 @@ import type { InstagramChatSummary } from 'agent-messenger/instagram'
 
 import type { ChannelKey, ChannelNameResolver, ResolvedChannelNames } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 const DEFAULT_TTL_MS = 5 * 60 * 1000
 const CHAT_FETCH_LIMIT = 500
 
@@ -64,7 +66,7 @@ export function createInstagramChannelResolver(options: InstagramChannelResolver
       const expiresAt = now() + ttlMs
       for (const chat of chats) ingest(chat, expiresAt)
     } catch (err) {
-      options.logger?.warn(`[instagram] channel resolver refresh failed: ${describe(err)}`)
+      options.logger?.warn(`[instagram] channel resolver refresh failed: ${describeError(err)}`)
     }
   }
 
@@ -106,8 +108,4 @@ export function createInstagramChannelResolver(options: InstagramChannelResolver
   }
 
   return { resolve, lookupChat, refresh, ingestProvisional }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
