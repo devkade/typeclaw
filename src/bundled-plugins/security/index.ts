@@ -1,4 +1,4 @@
-import { definePlugin } from '@/plugin'
+import { definePlugin, type PluginLogger } from '@/plugin'
 import { resolveHiddenPaths } from '@/sandbox'
 
 import { HIGH_TIER_PER_GUARD_PERMISSIONS, SECURITY_PERMISSIONS, SEVERITY_PERMISSION } from './permissions'
@@ -87,6 +87,15 @@ function withPermissionHint(
   }
 }
 
+const INTERNAL_SECURITY_GUARD_REASON =
+  'The tool call was blocked because an internal security guard error prevented safe evaluation.'
+
+function reportInternalGuardError(logger: PluginLogger, guard: string, error: unknown): void {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
+  const code = error instanceof Error && 'code' in error && typeof error.code === 'string' ? ` code=${error.code}` : ''
+  logger.error(`internal security guard error guard=${guard}${code}: ${detail}`)
+}
+
 export default definePlugin({
   permissions: Object.values(SECURITY_PERMISSIONS),
   // No wildcard exclusions: owner bypasses every security tier by default
@@ -102,148 +111,189 @@ export default definePlugin({
         applyPromptInjectionDefense(event)
       },
       'tool.before': async (event) => {
-        const can = (perm: string) => ctx.permissions.has(event.origin, perm)
-        const canBypass = (severity: SecuritySeverity, perGuardPerm: string): boolean =>
-          can(SEVERITY_PERMISSION[severity]) || can(perGuardPerm)
+        try {
+          const can = (perm: string) => ctx.permissions.has(event.origin, perm)
+          const canBypass = (severity: SecuritySeverity, perGuardPerm: string): boolean =>
+            can(SEVERITY_PERMISSION[severity]) || can(perGuardPerm)
 
-        // The cron guard blocks deferred work that fires as a role granting
-        // permissions the caller lacks. Capability dominance — target's
-        // permission set must be a SUBSET of the caller's — not the coarse
-        // `compareRoleSeverity` tower: every configured custom role ranks
-        // equal there, so rank `>= 0` would let one custom role schedule as a
-        // different custom role (or `trusted` schedule as a custom role with
-        // an extra grant), laundering permissions the caller never had. Unknown
-        // caller/target role => undefined permissions => fail closed.
-        const callerRole = ctx.permissions.resolveRole(event.origin)
-        const canScheduleAs = (targetRole: string | undefined): boolean => {
-          if (targetRole === undefined) return false
-          const callerPermissions = ctx.permissions.permissionsForRole(callerRole)
-          const targetPermissions = ctx.permissions.permissionsForRole(targetRole)
-          if (callerPermissions === undefined || targetPermissions === undefined) return false
-          const callerSet = new Set(callerPermissions)
-          return targetPermissions.every((permission) => callerSet.has(permission))
-        }
+          // The cron guard blocks deferred work that fires as a role granting
+          // permissions the caller lacks. Capability dominance — target's
+          // permission set must be a SUBSET of the caller's — not the coarse
+          // `compareRoleSeverity` tower: every configured custom role ranks
+          // equal there, so rank `>= 0` would let one custom role schedule as a
+          // different custom role (or `trusted` schedule as a custom role with
+          // an extra grant), laundering permissions the caller never had. Unknown
+          // caller/target role => undefined permissions => fail closed.
+          const callerRole = ctx.permissions.resolveRole(event.origin)
+          const canScheduleAs = (targetRole: string | undefined): boolean => {
+            if (targetRole === undefined) return false
+            const callerPermissions = ctx.permissions.permissionsForRole(callerRole)
+            const targetPermissions = ctx.permissions.permissionsForRole(targetRole)
+            if (callerPermissions === undefined || targetPermissions === undefined) return false
+            const callerSet = new Set(callerPermissions)
+            return targetPermissions.every((permission) => callerSet.has(permission))
+          }
 
-        const rolePromotionResult = canBypass(GUARD_ROLE_PROMOTION_SEVERITY, SECURITY_PERMISSIONS.bypassRolePromotion)
-          ? undefined
-          : withPermissionHint(
-              await checkRolePromotionGuard({ tool: event.tool, args: event.args, agentDir: ctx.agentDir }),
-              SECURITY_PERMISSIONS.bypassRolePromotion,
-              GUARD_ROLE_PROMOTION_SEVERITY,
-            )
-        if (rolePromotionResult) return rolePromotionResult
+          const rolePromotionResult = canBypass(GUARD_ROLE_PROMOTION_SEVERITY, SECURITY_PERMISSIONS.bypassRolePromotion)
+            ? undefined
+            : withPermissionHint(
+                await checkRolePromotionGuard({ tool: event.tool, args: event.args, agentDir: ctx.agentDir }),
+                SECURITY_PERMISSIONS.bypassRolePromotion,
+                GUARD_ROLE_PROMOTION_SEVERITY,
+              )
+          if (rolePromotionResult) return rolePromotionResult
 
-        const cronPromotionResult = canBypass(GUARD_CRON_PROMOTION_SEVERITY, SECURITY_PERMISSIONS.bypassCronPromotion)
-          ? undefined
-          : withPermissionHint(
-              await checkCronPromotionGuard({
-                tool: event.tool,
-                args: event.args,
-                agentDir: ctx.agentDir,
-                canScheduleAs,
-              }),
-              SECURITY_PERMISSIONS.bypassCronPromotion,
-              GUARD_CRON_PROMOTION_SEVERITY,
-            )
-        if (cronPromotionResult) return cronPromotionResult
+          const cronPromotionResult = canBypass(GUARD_CRON_PROMOTION_SEVERITY, SECURITY_PERMISSIONS.bypassCronPromotion)
+            ? undefined
+            : withPermissionHint(
+                await checkCronPromotionGuard({
+                  tool: event.tool,
+                  args: event.args,
+                  agentDir: ctx.agentDir,
+                  canScheduleAs,
+                }),
+                SECURITY_PERMISSIONS.bypassCronPromotion,
+                GUARD_CRON_PROMOTION_SEVERITY,
+              )
+          if (cronPromotionResult) return cronPromotionResult
 
-        const pluginAdditionResult = canBypass(
-          GUARD_PLUGIN_ADDITION_SEVERITY,
-          SECURITY_PERMISSIONS.bypassPluginAddition,
-        )
-          ? undefined
-          : withPermissionHint(
-              await checkPluginAdditionGuard({ tool: event.tool, args: event.args, agentDir: ctx.agentDir }),
-              SECURITY_PERMISSIONS.bypassPluginAddition,
-              GUARD_PLUGIN_ADDITION_SEVERITY,
-            )
-        if (pluginAdditionResult) return pluginAdditionResult
+          const pluginAdditionResult = canBypass(
+            GUARD_PLUGIN_ADDITION_SEVERITY,
+            SECURITY_PERMISSIONS.bypassPluginAddition,
+          )
+            ? undefined
+            : withPermissionHint(
+                await checkPluginAdditionGuard({ tool: event.tool, args: event.args, agentDir: ctx.agentDir }),
+                SECURITY_PERMISSIONS.bypassPluginAddition,
+                GUARD_PLUGIN_ADDITION_SEVERITY,
+              )
+          if (pluginAdditionResult) return pluginAdditionResult
 
-        // Taint-recording runs FIRST, independently of the gitExfil guard.
-        // The gitRemoteTainted defense depends on it. We pass through
-        // `permittedBypass` for actors who can skip gitExfil (via either the
-        // per-guard permission or the medium-tier permission) so the
-        // recorder still fires for them — an acked or permission-bypassed
-        // command will actually run, so its remote change must be remembered.
-        recordGitRemoteTaintIfAny({
-          tool: event.tool,
-          args: event.args,
-          sessionId: event.sessionId,
-          permittedBypass: canBypass(GUARD_GIT_EXFIL_SEVERITY, SECURITY_PERMISSIONS.bypassGitExfil),
-        })
+          // Taint-recording runs FIRST, independently of the gitExfil guard.
+          // The gitRemoteTainted defense depends on it. We pass through
+          // `permittedBypass` for actors who can skip gitExfil (via either the
+          // per-guard permission or the medium-tier permission) so the
+          // recorder still fires for them — an acked or permission-bypassed
+          // command will actually run, so its remote change must be remembered.
+          recordGitRemoteTaintIfAny({
+            tool: event.tool,
+            args: event.args,
+            sessionId: event.sessionId,
+            permittedBypass: canBypass(GUARD_GIT_EXFIL_SEVERITY, SECURITY_PERMISSIONS.bypassGitExfil),
+          })
 
-        const checks: (SecurityBlock | undefined)[] = [
-          canBypass(GUARD_GIT_REMOTE_TAINTED_SEVERITY, SECURITY_PERMISSIONS.bypassGitRemoteTainted)
+          const gitRemoteTaintedResult = canBypass(
+            GUARD_GIT_REMOTE_TAINTED_SEVERITY,
+            SECURITY_PERMISSIONS.bypassGitRemoteTainted,
+          )
             ? undefined
             : withPermissionHint(
                 checkGitRemoteTaintedGuard({ tool: event.tool, args: event.args, sessionId: event.sessionId }),
                 SECURITY_PERMISSIONS.bypassGitRemoteTainted,
                 GUARD_GIT_REMOTE_TAINTED_SEVERITY,
-              ),
-          canBypass(GUARD_SECRET_EXFIL_BASH_SEVERITY, SECURITY_PERMISSIONS.bypassSecretExfilBash)
+              )
+          if (gitRemoteTaintedResult) return gitRemoteTaintedResult
+
+          const secretExfilBashResult = canBypass(
+            GUARD_SECRET_EXFIL_BASH_SEVERITY,
+            SECURITY_PERMISSIONS.bypassSecretExfilBash,
+          )
             ? undefined
             : withPermissionHint(
                 checkSecretExfilBashGuard({ tool: event.tool, args: event.args }),
                 SECURITY_PERMISSIONS.bypassSecretExfilBash,
                 GUARD_SECRET_EXFIL_BASH_SEVERITY,
-              ),
-          canBypass(GUARD_GIT_EXFIL_SEVERITY, SECURITY_PERMISSIONS.bypassGitExfil)
+              )
+          if (secretExfilBashResult) return secretExfilBashResult
+
+          const gitExfilResult = canBypass(GUARD_GIT_EXFIL_SEVERITY, SECURITY_PERMISSIONS.bypassGitExfil)
             ? undefined
             : withPermissionHint(
                 checkGitExfilGuard({ tool: event.tool, args: event.args, sessionId: event.sessionId }),
                 SECURITY_PERMISSIONS.bypassGitExfil,
                 GUARD_GIT_EXFIL_SEVERITY,
-              ),
-          canBypass(GUARD_SECRET_EXFIL_READ_SEVERITY, SECURITY_PERMISSIONS.bypassSecretExfilRead)
+              )
+          if (gitExfilResult) return gitExfilResult
+
+          const secretExfilReadResult = canBypass(
+            GUARD_SECRET_EXFIL_READ_SEVERITY,
+            SECURITY_PERMISSIONS.bypassSecretExfilRead,
+          )
             ? undefined
             : withPermissionHint(
                 checkSecretExfilReadGuard({ tool: event.tool, args: event.args }),
                 SECURITY_PERMISSIONS.bypassSecretExfilRead,
                 GUARD_SECRET_EXFIL_READ_SEVERITY,
-              ),
+              )
+          if (secretExfilReadResult) return secretExfilReadResult
+
           // Not severity-bypassed: private directories remain role-derived,
           // while canonical credential-store denial is unconditional. Mirrors
           // the bash masks onto every non-bash path-bearing tool.
-          checkPrivateSurfaceReadGuard({
-            tool: event.tool,
-            args: event.args,
-            agentDir: ctx.agentDir,
-            hidden: resolveHiddenPaths(ctx.permissions, event.origin, ctx.agentDir),
-            ...(event.fileOperands !== undefined ? { fileOperands: event.fileOperands } : {}),
-          }),
-          canBypass(GUARD_SSRF_SEVERITY, SECURITY_PERMISSIONS.bypassSsrf)
+          const privateSurfaceReadResult = checkPrivateSurfaceReadGuard(
+            {
+              tool: event.tool,
+              args: event.args,
+              agentDir: ctx.agentDir,
+              hidden: resolveHiddenPaths(ctx.permissions, event.origin, ctx.agentDir),
+              ...(event.fileOperands !== undefined ? { fileOperands: event.fileOperands } : {}),
+            },
+            {
+              onInternalError: (error) => reportInternalGuardError(ctx.logger, 'privateSurfaceRead', error),
+            },
+          )
+          if (privateSurfaceReadResult) return privateSurfaceReadResult
+
+          const ssrfResult = canBypass(GUARD_SSRF_SEVERITY, SECURITY_PERMISSIONS.bypassSsrf)
             ? undefined
             : withPermissionHint(
                 checkSsrfGuard({ tool: event.tool, args: event.args }),
                 SECURITY_PERMISSIONS.bypassSsrf,
                 GUARD_SSRF_SEVERITY,
-              ),
-          canBypass(GUARD_SESSION_SEARCH_SECRETS_SEVERITY, SECURITY_PERMISSIONS.bypassSessionSearchSecrets)
+              )
+          if (ssrfResult) return ssrfResult
+
+          const sessionSearchSecretsResult = canBypass(
+            GUARD_SESSION_SEARCH_SECRETS_SEVERITY,
+            SECURITY_PERMISSIONS.bypassSessionSearchSecrets,
+          )
             ? undefined
             : withPermissionHint(
                 checkSessionSearchSecretsGuard({ tool: event.tool, args: event.args }),
                 SECURITY_PERMISSIONS.bypassSessionSearchSecrets,
                 GUARD_SESSION_SEARCH_SECRETS_SEVERITY,
-              ),
-          canBypass(GUARD_SYSTEM_PROMPT_LEAK_SEVERITY, SECURITY_PERMISSIONS.bypassSystemPromptLeak)
+              )
+          if (sessionSearchSecretsResult) return sessionSearchSecretsResult
+
+          const systemPromptLeakResult = canBypass(
+            GUARD_SYSTEM_PROMPT_LEAK_SEVERITY,
+            SECURITY_PERMISSIONS.bypassSystemPromptLeak,
+          )
             ? undefined
             : withPermissionHint(
                 checkSystemPromptLeakGuard({ tool: event.tool, args: event.args }),
                 SECURITY_PERMISSIONS.bypassSystemPromptLeak,
                 GUARD_SYSTEM_PROMPT_LEAK_SEVERITY,
-              ),
-          canBypass(GUARD_OUTBOUND_SECRET_SEVERITY, SECURITY_PERMISSIONS.bypassOutboundSecret)
+              )
+          if (systemPromptLeakResult) return systemPromptLeakResult
+
+          const outboundSecretResult = canBypass(
+            GUARD_OUTBOUND_SECRET_SEVERITY,
+            SECURITY_PERMISSIONS.bypassOutboundSecret,
+          )
             ? undefined
             : withPermissionHint(
                 checkOutboundSecretGuard({ tool: event.tool, args: event.args }),
                 SECURITY_PERMISSIONS.bypassOutboundSecret,
                 GUARD_OUTBOUND_SECRET_SEVERITY,
-              ),
-        ]
-        for (const result of checks) {
-          if (result) return result
+              )
+          if (outboundSecretResult) return outboundSecretResult
+
+          return undefined
+        } catch (error) {
+          reportInternalGuardError(ctx.logger, 'tool.before', error)
+          return { block: true, reason: INTERNAL_SECURITY_GUARD_REASON }
         }
-        return undefined
       },
       'session.end': async (event) => {
         clearSessionTaints(event.sessionId)

@@ -1,9 +1,13 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 
+import { z } from 'zod'
+
+import { wrapPluginTool } from '@/agent/plugin-tools'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { createInternalDestinationPolicy } from '@/network/internal-destinations'
 import { createPermissionService, noopPermissionService, type PermissionService, type RolesConfig } from '@/permissions'
-import type { HookContext, PluginContext, SessionPromptEvent, ToolBeforeEvent } from '@/plugin'
+import { createHookBus, defineTool } from '@/plugin'
+import type { HookContext, PluginContext, PluginLogger, SessionPromptEvent, ToolBeforeEvent } from '@/plugin'
 
 import securityPlugin from './index'
 import { HIGH_TIER_PER_GUARD_PERMISSIONS, SECURITY_PERMISSIONS } from './permissions'
@@ -267,6 +271,80 @@ describe('security plugin wiring', () => {
     const hook = await toolBeforeHook()
     const result = await hook(toolEvent('bash', { command: 'env' }), hookContext('/agent'))
     expect(result?.reason).toContain('secretExfilBash')
+  })
+
+  test('returns an earlier block without evaluating a later check that throws', async () => {
+    let evaluatedLaterCheck = false
+    const permissions: PermissionService = {
+      ...noopPermissionService,
+      has: (_origin, permission) => {
+        if (permission === SECURITY_PERMISSIONS.bypassSecretExfilRead) {
+          evaluatedLaterCheck = true
+          throw new Error('later check failed')
+        }
+        return false
+      },
+    }
+    const hook = await toolBeforeHookWith(permissions)
+
+    const result = await hook(toolEvent('bash', { command: 'env' }), hookContext('/agent'))
+
+    expect(result?.reason).toContain('secretExfilBash')
+    expect(evaluatedLaterCheck).toBe(false)
+  })
+
+  test('blocks a wrapped tool through HookBus when security evaluation throws internally', async () => {
+    const inaccessible = '/agent/protected/MEMORY.md'
+    const errors: string[] = []
+    const logger: PluginLogger = {
+      info: () => {},
+      warn: () => {},
+      error: (message) => errors.push(message),
+    }
+    const permissions: PermissionService = {
+      ...noopPermissionService,
+      has: () => {
+        throw Object.assign(new Error(`permission denied while inspecting ${inaccessible}`), { code: 'EACCES' })
+      },
+    }
+    const exports = await securityPlugin.plugin({ ...pluginContext('/agent'), logger, permissions })
+    const hooks = createHookBus()
+    hooks.registerAll('security', '/agent', logger, exports.hooks ?? {})
+    let executed = false
+    const wrapped = wrapPluginTool(
+      defineTool({
+        description: '',
+        parameters: z.object({}),
+        async execute() {
+          executed = true
+          return { content: [{ type: 'text', text: 'executed' }] }
+        },
+      }),
+      {
+        pluginName: 'fixture',
+        toolName: 'fixture_tool',
+        agentDir: '/agent',
+        sessionId: 's',
+        logger,
+        hooks,
+      },
+    )
+
+    const result = (await wrapped.execute('c', {}, undefined, undefined, {} as never)) as {
+      content: Array<{ type: string; text?: string }>
+      isError?: boolean
+    }
+    const modelText = result.content.map((part) => part.text ?? '').join('\n')
+
+    expect(executed).toBe(false)
+    expect(result.isError).toBe(true)
+    expect(modelText).toMatch(/internal security guard error/i)
+    expect(modelText).not.toContain(inaccessible)
+    expect(modelText).not.toContain('EACCES')
+    expect(modelText).not.toContain('permission denied')
+    expect(errors.join('\n')).toContain(inaccessible)
+    expect(errors.join('\n')).toContain('EACCES')
+    expect(errors.join('\n')).toContain('permission denied')
   })
 
   test('two-step attack end-to-end: tool.before+tool.before in same session double-gates the push', async () => {
