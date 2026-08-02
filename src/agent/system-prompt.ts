@@ -1,7 +1,7 @@
 import { formatLocalDateTime, formatLocalWeekday, resolveLocalTimezoneName } from '@/shared'
 
 const PACKAGE_JSON_INSTALL_RULE =
-  "After editing `package.json` (adding, removing, or bumping dependencies/plugins), run the project's package manager to update the lockfile and installed dependency state — e.g. `bun install`, `npm install`, `pnpm install`, or `yarn install`, matching the existing lockfile. Commit the lockfile change alongside the `package.json` edit."
+  '`package.json` is operator-owned because direct dependencies define sandbox-visible commands. Do not edit it or install dependencies; tell the operator which package and command are needed.'
 
 // The orchestration roster (the `Briefly: ...` enumeration of public subagents)
 // is GENERATED from the registry by `renderPublicSubagentRoster` and threaded in

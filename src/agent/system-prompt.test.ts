@@ -54,15 +54,14 @@ describe('delivering reports and documents', () => {
   })
 })
 
-describe('version control dependency changes', () => {
+describe('operator-owned dependencies', () => {
   test.each([
     ['default prompt', DEFAULT_SYSTEM_PROMPT],
     ['slim prompt', SLIM_SYSTEM_PROMPT],
-  ])('requires package manager install after package.json dependency edits in the %s', (_name, prompt) => {
-    expect(prompt).toContain('After editing `package.json`')
-    expect(prompt).toContain('bumping dependencies/plugins')
-    expect(prompt).toContain('matching the existing lockfile')
-    expect(prompt).toContain('Commit the lockfile change alongside the `package.json` edit')
+  ])('forbids package.json edits and dependency installation in the %s', (_name, prompt) => {
+    expect(prompt).toContain('`package.json` is operator-owned')
+    expect(prompt).toContain('Do not edit it or install dependencies')
+    expect(prompt).toContain('tell the operator which package and command are needed')
   })
 })
 
