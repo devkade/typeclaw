@@ -24,6 +24,16 @@ Memory is split across two on-disk surfaces and two subagents that move data bet
 
 The loop is **observe → dream → apply**: `memory-logger` observes, `dreaming` consolidates, and the next prompt applies the updated shards automatically.
 
+## Boundary with operational incidents
+
+Memory is not a repair system. A deterministic environment defect that TypeClaw can classify mechanically is owned by the [operational incident subsystem](/docs/internals/operational-incidents), never solely by a remembered workaround. This boundary is enforced before consolidation:
+
+1. `tool.after` classifies exact failure shapes and appends a `TYPECLAW_OPERATIONAL_INCIDENT` marker to the tool error that reaches the transcript. Marker rendering is independent of ledger persistence; if recurrence tracking cannot be written, the privacy-safe marker says so and the fence remains closed.
+2. `memory-logger` skips the marked failure turn and its immediately following user correction or workaround.
+3. `append` reads the parent transcript and mechanically validates the full model-claimed interval from `entry` through `latestEntryId`. It rejects a fragment when that interval contains the incident result or a response/correction owned by it, even if the model selects an earlier pre-incident request as `entry`. Prompt compliance and a model-selected anchor are therefore not the only fences.
+
+Topic frontmatter has an optional `kind` field: `belief | procedure | environmental-incident`. Legacy shards without it parse as `belief`. `environmental-incident` shards remain available for explicit inspection but are excluded from automatic heading injection, hybrid retrieval, and vector passage construction. Existing workaround shards are not deleted or bulk-migrated; citation history stays intact.
+
 ## Dreaming: the consolidation run
 
 `createDreamingSubagent` (`src/bundled-plugins/memory/dreaming.ts`) builds the subagent; the `handler` is the orchestrator. The order of operations is load-bearing — each step depends on the previous one's on-disk state.
@@ -119,7 +129,7 @@ Why a bad LLM run can't corrupt memory:
 - **Snapshot/restore** — byte-exact rollback anchor; a bad run leaves zero trace.
 - **Fragment-GC gating** — fragments are deleted only on a fresh citation judgment, never on stale citations.
 - **Dreamed-ids advance even on revert** — conscious anti-loop tradeoff; a repeatedly-failing LLM can't wedge the system.
-- **Runtime owns frontmatter** — the LLM can't corrupt the strength signals; they're re-derived from citations every run.
+- **Runtime owns frontmatter** — the LLM can't corrupt the strength signals; they're re-derived from citations every run. Legacy `kind` defaults to `belief`.
 - **Atomic writes** — tmp+rename for streams, byte-comparison for shards; crash-safe mid-loop.
 - **Origin enrichment is runtime-only** — no provenance file is written; historical stream JSONL is never rewritten, and timeout/failure leaves raw IDs usable.
 - **`inFlightKey: agentDir`** — per-agent coalescing collapses concurrent cron fires into one run.

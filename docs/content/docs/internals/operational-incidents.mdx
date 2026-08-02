@@ -1,0 +1,59 @@
+---
+title: Operational incidents
+description: Deterministic tool-failure classification, recurrence ledger, repair allowlist, and the memory boundary
+icon: Siren
+---
+
+The operational incident subsystem keeps mechanically reproducible TypeClaw environment defects out of semantic memory. Its governing rule is: **memory must never be the sole remediation path for a deterministic defect TypeClaw can reproduce or validate mechanically.**
+
+## Outcome pipeline
+
+The observation point is the existing `tool.after` path in `src/agent/plugin-tools.ts`. Pi's bash tool throws on non-zero exit, and TypeClaw already turns thrown errors into an after-hook result; the incident path extends that funnel rather than creating a second tool stack.
+
+1. `src/operations/classify-tool-outcome.ts` applies exact classifiers. Initial classes are bash exit 127 with an anchored `command not found` line (including bounded positive `bash: line N:` prefixes), a typed declared-skill-bin resolution error, and the permanent degraded `/proc` sandbox error. Near matches and credential-shaped executable tokens remain ordinary tool failures.
+2. `src/operations/incidents.ts` records the normalized fingerprint in `<agentDir>/.typeclaw/incidents.json`, increments the occurrence count, and maintains first/last timestamps, status, and the last session identity. An incident becomes recurrent only after the same fingerprint appears in a different session; retries in one session do not escalate it.
+3. The tool error receives one machine-readable line beginning `TYPECLAW_OPERATIONAL_INCIDENT`. The marker is rendered from the already-classified fact even when ledger persistence fails; that fallback reports `recurrenceTracking: "unavailable"` rather than failing the memory boundary open. On recurrence its action is `escalate-recurrent-environment-issue-to-operator`; it explicitly says not to delegate the original task to the user.
+4. `src/operations/remediations.ts` looks up repairs by classifier kind in an explicit, idempotently populated registry. The production builtin-tool funnel records the failure, invokes a matching handler, reconstructs the tool boundary, and retries the original operation once. Unknown incidents receive no automatic action, a failed repair receives no retry, and a failed retry stops after that one attempt. A successful retry resolves the recorded fingerprint only when the shared mechanical-success derivation includes that exact fingerprint.
+5. A later successful builtin invocation also closes manually repaired incidents. `deriveMechanicallyVerifiedIncidentFingerprints()` converts mechanically verified success signals into normalized candidate fingerprints for both resolution entry points. Only exact matching open fingerprints are resolved.
+
+The default registry intentionally has no skill-bin repair and never installs packages. Skill-bin capability and PATH repair belong to their owning subsystem; adding one later requires an explicit registry entry rather than a heuristic catch-all.
+
+Resolution signals are defined for every classifier fact kind:
+
+| Fact kind                       | Mechanically verified success signal                                                                                                                                                                                                                                                                                                           |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bash-command-not-found`        | The command word from one unconditional invocation in the original, pre-sandbox bash arguments executes successfully. The word passes the same `isSafeBin()` basename and secret-shape rejection as failure classification.                                                                                                                    |
+| `declared-skill-bin-unresolved` | The same successful safe command-word signal. One successful `<bin>` therefore produces both bin-scoped candidate fingerprints and clears either or both open classes for that bin.                                                                                                                                                            |
+| `sandbox-proc-unavailable`      | One unconditional real-`/proc`-dependent invocation (`commandNeedsRealProc`) succeeds after `applyBashSandbox()` returned a prepared runtime, runtime verification completed, and the wrapped bash execution returned successfully. A tmpfs fallback would fail before execution, so this proves the missing sandbox capability is functional. |
+
+Resolution deliberately under-resolves: a stale warning remains visible and recoverable, while false resolution can silently make `doctor` green on a broken environment. Both successful remediation retries and later observed successes use the same mechanical fingerprint derivation; aggregate retry success alone never resolves an incident. Aggregate exit zero counts only for a single invocation with optional leading environment assignments. Derivation rejects shell control operators (`||`, `&&`, `;`, `|`, `&`, or multiple lines), subshells and command substitutions (`(...)`, `$(...)`, or backticks), redirections, comments, unmatched quoting, assignment-only commands, and shell constructs such as `if`, `while`, `for`, `case`, and function bodies. The same gate applies to bin and sandbox candidates. Leading assignments are retained because, absent rejected command substitution or control syntax, the shell executes the following command directly and preserves its exit status.
+
+`OPERATIONAL_INCIDENT_RESOLUTION_SIGNAL_BY_KIND` is declared with `satisfies Record<OperationalIncidentFact['kind'], ...>`. Adding a fourth fact kind therefore fails typechecking until its resolution signal is explicitly mapped; the mapping also has a value-level guard test.
+
+## Fingerprints and persistence safety
+
+Fingerprints contain structured facts only:
+
+```text
+bash:command-not-found:<normalized-bin>
+sandbox:proc-unavailable
+skill-bin:declared-but-unresolved:<normalized-bin>
+```
+
+`<normalized-bin>` must match a bounded executable-basename grammar and is lowercased. Before classification, the basename also passes the shared memory secret detector plus token-only guards for JWT-shaped and long opaque hex/base64 values. A credential-shaped command name therefore never reaches fingerprint construction. The ledger never receives the command string, arguments, stdout, arbitrary stderr, paths, or environment values; only classifier-owned fields are serialized. Writes use a private `.typeclaw/` directory, an inter-process `proper-lockfile` critical section around read-modify-rename, an atomic temporary-file rename, and mode `0600`.
+
+Operational metadata is a separate runtime-private surface (`CANONICAL_AGENT_RUNTIME_PRIVATE_FILES`), not a canonical secret or credential directory. It is masked from model-driven tools without distorting the credential model. `.typeclaw/` is already truly ignored and never enters agent git history.
+
+## Recurrence and doctor
+
+Recurrence comes only from the ledger's exact fingerprint and persisted last-session identity. The raw count remains diagnostic, but only an occurrence from a different session flips `recurrent` to true. Memory `cites`, `days`, and `lastReinforced` are LLM-selected consolidation statistics and never influence repair or escalation.
+
+`src/doctor/operational-incidents.ts` reports unresolved incidents and elevates recurrent unresolved incidents to an error requiring operator repair. `IncidentLedger.resolve()` is the atomic lifecycle transition used after a mechanically verified automatic remediation retry; `resolveObservedSuccess()` uses the same locked transition when a later invocation mechanically proves a manual repair. Both consume `deriveMechanicallyVerifiedIncidentFingerprints()`, are idempotent, leave unrelated entries unchanged, and make doctor return to healthy only after verified repair. Doctor reports fingerprints and ledger timing/count metadata, not captured tool output.
+
+The observed-success check is gated for the success-path hot loop. Calls with no bin or verified-sandbox candidate return before filesystem I/O. Otherwise the process performs one ledger-file metadata inspection; adding the sandbox candidate is only an in-memory boolean check and does not add I/O. A missing or zero-byte mask target returns without parsing or locking. A process-local snapshot caches the ledger file identity plus its unresolved fingerprint set, so an unchanged file with no matching open incident also returns without parsing or locking. The ledger is parsed only when a non-empty file is first seen or its atomic-rename identity changes, and the inter-process lock is acquired only when the cached/refreshed open set contains an exact candidate fingerprint.
+
+## Memory fence
+
+The transcript marker makes ownership visible to both the model and the memory logger. The append tool does not trust the model-selected anchor: it validates every transcript entry from `entry` through `latestEntryId`, including incident ownership inherited from a preceding marker. A marker, its response, or the following correction anywhere in that evaluated interval is rejected before a stream fragment can be written. This prevents the failure → correction → workaround sequence from becoming a reinforced belief or procedure even if the logger disregards its prompt.
+
+Shard frontmatter may still use `kind: environmental-incident` for explicit historical material. Those shards are excluded from automatic retrieval and vector indexing but remain readable through explicit memory inspection. No destructive migration is performed on legacy shards.
