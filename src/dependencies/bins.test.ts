@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -30,11 +30,19 @@ describe('discoverDependencyBins', () => {
       bin: { 'direct-cli': 'cli.js' },
     })
     await writeFile(join(directRoot, 'cli.js'), '')
-    const workspaceRoot = await writePackage(agentDir, '@acme/workspace-cli', {
-      name: '@acme/workspace-cli',
-      bin: 'bin.js',
-    })
+    const workspaceRoot = join(agentDir, 'packages', 'workspace-cli')
+    await mkdir(workspaceRoot, { recursive: true })
+    await writeFile(
+      join(workspaceRoot, 'package.json'),
+      JSON.stringify({
+        name: '@acme/workspace-cli',
+        bin: 'bin.js',
+      }),
+    )
     await writeFile(join(workspaceRoot, 'bin.js'), '')
+    const workspaceLink = join(agentDir, 'node_modules', '@acme', 'workspace-cli')
+    await mkdir(join(agentDir, 'node_modules', '@acme'), { recursive: true })
+    await symlink(workspaceRoot, workspaceLink, process.platform === 'win32' ? 'junction' : 'dir')
     const transitiveRoot = await writePackage(agentDir, 'transitive-package', {
       name: 'transitive-package',
       bin: { 'transitive-cli': 'cli.js' },
@@ -46,11 +54,31 @@ describe('discoverDependencyBins', () => {
     expect(discovery.declarations).toEqual(
       expect.arrayContaining([
         { package: 'direct-package', bin: 'direct-cli', entry: 'cli.js' },
-        { package: '@acme/workspace-cli', bin: 'workspace-cli', entry: 'bin.js' },
+        { package: '@acme/workspace-cli', bin: 'workspace-cli', entry: 'bin.js', workspace: true },
       ]),
     )
     expect(discovery.declarations.some((entry) => entry.bin === 'transitive-cli')).toBe(false)
   })
+
+  test.skipIf(process.platform === 'win32')(
+    'rejects a workspace dependency symlink outside the agent root',
+    async () => {
+      const agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-dependency-bins-'))
+      const external = await mkdtemp(join(tmpdir(), 'typeclaw-external-workspace-'))
+      await writeRootPackage(agentDir, { escaped: 'workspace:*' })
+      await writeFile(join(external, 'package.json'), JSON.stringify({ name: 'escaped', bin: 'cli.js' }))
+      await writeFile(join(external, 'cli.js'), '')
+      await mkdir(join(agentDir, 'node_modules'), { recursive: true })
+      await symlink(external, join(agentDir, 'node_modules', 'escaped'))
+
+      const discovery = await discoverDependencyBins(agentDir)
+
+      expect(discovery.declarations).toEqual([])
+      expect(discovery.issues).toContainEqual(
+        expect.objectContaining({ package: 'escaped', message: expect.stringContaining('allowed agent path') }),
+      )
+    },
+  )
 
   test('explicitly denies the typeclaw binary', async () => {
     const agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-dependency-bins-'))
@@ -67,6 +95,22 @@ describe('discoverDependencyBins', () => {
     expect(DEPENDENCY_BIN_DENYLIST.has('typeclaw')).toBe(true)
     expect(discovery.declarations.some((entry) => entry.bin === 'typeclaw')).toBe(false)
     expect(discovery.declarations).toContainEqual({ package: 'typeclaw', bin: 'helper', entry: 'helper.js' })
+  })
+
+  test('refuses ambiguous bin names exposed by multiple direct dependencies', async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-dependency-bins-'))
+    await writeRootPackage(agentDir, { alpha: '^1.0.0', beta: '^1.0.0' })
+    const alpha = await writePackage(agentDir, 'alpha', { name: 'alpha', bin: { shared: 'cli.js' } })
+    const beta = await writePackage(agentDir, 'beta', { name: 'beta', bin: { shared: 'cli.js' } })
+    await writeFile(join(alpha, 'cli.js'), '')
+    await writeFile(join(beta, 'cli.js'), '')
+
+    const discovery = await discoverDependencyBins(agentDir)
+
+    expect(discovery.declarations.some((entry) => entry.bin === 'shared')).toBe(false)
+    expect(discovery.issues.map((issue) => issue.message).join('\n')).toContain(
+      'direct dependencies alpha, beta expose duplicate bin shared',
+    )
   })
 
   test('degrades gracefully for missing or malformed manifests, absent bins, and uninstalled dependencies', async () => {

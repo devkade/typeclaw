@@ -20,6 +20,7 @@ export type DependencyBinIssue = {
 export type DependencyBinDiscovery = {
   declarations: DependencyBinDeclaration[]
   issues: DependencyBinIssue[]
+  protectedFiles: string[]
 }
 
 export type DependencyBinValidation = DependencyBinDiscovery & {
@@ -31,32 +32,59 @@ const PACKAGE_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i
 const BIN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 
 export async function discoverDependencyBins(agentDir: string): Promise<DependencyBinDiscovery> {
-  const rootManifest = await readManifest(join(agentDir, 'package.json'))
-  if (!rootManifest.ok) return { declarations: [], issues: [{ message: rootManifest.message }] }
+  const rootManifestPath = join(agentDir, 'package.json')
+  const resolvedRootManifest = await realpath(rootManifestPath).catch(() => undefined)
+  const rootManifest = await readManifest(rootManifestPath)
+  if (!rootManifest.ok) {
+    return {
+      declarations: [],
+      issues: [{ message: rootManifest.message }],
+      protectedFiles: resolvedRootManifest === undefined ? [] : [resolvedRootManifest],
+    }
+  }
   if (!isRecord(rootManifest.value)) {
-    return { declarations: [], issues: [{ message: 'agent package.json must contain an object' }] }
+    return {
+      declarations: [],
+      issues: [{ message: 'agent package.json must contain an object' }],
+      protectedFiles: [resolvedRootManifest ?? rootManifestPath],
+    }
   }
   const dependencies = rootManifest.value.dependencies
-  if (dependencies === undefined) return { declarations: [], issues: [] }
+  if (dependencies === undefined) {
+    return { declarations: [], issues: [], protectedFiles: [resolvedRootManifest ?? rootManifestPath] }
+  }
   if (!isRecord(dependencies)) {
-    return { declarations: [], issues: [{ message: 'agent package.json dependencies must be an object' }] }
+    return {
+      declarations: [],
+      issues: [{ message: 'agent package.json dependencies must be an object' }],
+      protectedFiles: [resolvedRootManifest ?? rootManifestPath],
+    }
   }
 
   const declarations: DependencyBinDeclaration[] = []
   const issues: DependencyBinIssue[] = []
+  const protectedFiles = [resolvedRootManifest ?? rootManifestPath]
+  const agentRoot = await realpath(agentDir).catch(() => undefined)
   const nodeModulesRoot = await realpath(join(agentDir, 'node_modules')).catch(() => undefined)
   for (const packageName of Object.keys(dependencies).sort()) {
     if (!PACKAGE_PATTERN.test(packageName)) {
       issues.push({ package: packageName, message: 'direct dependency has an unsafe package name' })
       continue
     }
+    const workspace =
+      typeof dependencies[packageName] === 'string' && dependencies[packageName].startsWith('workspace:')
     const packageRoot = join(agentDir, 'node_modules', ...packageName.split('/'))
     const resolvedRoot = await realpath(packageRoot).catch(() => undefined)
-    if (nodeModulesRoot === undefined || resolvedRoot === undefined || !isInside(nodeModulesRoot, resolvedRoot)) {
-      issues.push({ package: packageName, message: 'direct dependency is not installed inside agent node_modules' })
+    const packageRootAllowed =
+      resolvedRoot !== undefined &&
+      ((nodeModulesRoot !== undefined && isInside(nodeModulesRoot, resolvedRoot)) ||
+        (workspace && agentRoot !== undefined && isInside(agentRoot, resolvedRoot)))
+    if (!packageRootAllowed) {
+      issues.push({ package: packageName, message: 'direct dependency is not installed in an allowed agent path' })
       continue
     }
-    const packageManifest = await readManifest(join(resolvedRoot, 'package.json'))
+    const packageManifestPath = join(resolvedRoot, 'package.json')
+    const packageManifest = await readManifest(packageManifestPath)
     if (!packageManifest.ok) {
       issues.push({ package: packageName, message: packageManifest.message })
       continue
@@ -73,10 +101,28 @@ export async function discoverDependencyBins(agentDir: string): Promise<Dependen
         continue
       }
       if (DEPENDENCY_BIN_DENYLIST.has(bin)) continue
-      declarations.push({ package: packageName, bin, entry })
+      declarations.push({ package: packageName, bin, entry, ...(workspace ? { workspace: true } : {}) })
     }
   }
-  return { declarations, issues }
+  const packagesByBin = new Map<string, string[]>()
+  for (const declaration of declarations) {
+    const packages = packagesByBin.get(declaration.bin) ?? []
+    packages.push(declaration.package)
+    packagesByBin.set(declaration.bin, packages)
+  }
+  const ambiguousBins = new Set<string>()
+  for (const [bin, packages] of packagesByBin) {
+    if (packages.length < 2) continue
+    ambiguousBins.add(bin)
+    issues.push({
+      message: `direct dependencies ${packages.join(', ')} expose duplicate bin ${bin}; no wrapper generated`,
+    })
+  }
+  return {
+    declarations: declarations.filter((entry) => !ambiguousBins.has(entry.bin)),
+    issues,
+    protectedFiles: [...new Set(protectedFiles)],
+  }
 }
 
 export async function validateDependencyBins(
