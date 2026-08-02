@@ -22,7 +22,7 @@ import type {
   TypingTarget,
 } from '@/channels/types'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { classifyInbound, type InboundDropReason, TELEGRAM_WORKSPACE } from './telegram-bot-classify'
 import { createTelegramEditMessageCallback } from './telegram-bot-edit'
 import { toTelegramMarkdownV2 } from './telegram-bot-format'

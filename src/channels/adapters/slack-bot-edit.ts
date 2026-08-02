@@ -1,6 +1,6 @@
 import type { EditMessageCallback, EditMessageResult } from '@/channels/types'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 
 const SLACK_API_BASE = 'https://slack.com/api'
 

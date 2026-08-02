@@ -39,7 +39,7 @@ import type {
 } from '@/channels/types'
 import type { WebexAccountRecord } from '@/secrets/schema'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { createWebexChannelNameResolver } from './webex-channel-resolver'
 import { classifyInbound, type InboundDropReason, type WebexInboundMessage } from './webex-classify'
 import { createWebexEditMessageCallback } from './webex-edit'

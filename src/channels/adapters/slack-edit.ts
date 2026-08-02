@@ -2,6 +2,8 @@ import type { SlackClient } from 'agent-messenger/slack'
 
 import type { EditMessageCallback, EditMessageResult } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 export function createSlackUserEditMessageCallback(deps: {
   client: Pick<SlackClient, 'updateMessage'>
 }): EditMessageCallback {
@@ -13,7 +15,7 @@ export function createSlackUserEditMessageCallback(deps: {
       await deps.client.updateMessage(req.chat, req.messageId, req.text)
     } catch (err) {
       const code = slackErrorCode(err)
-      return { ok: false, error: describe(err), code: classifyEditError(code) }
+      return { ok: false, error: describeError(err), code: classifyEditError(code) }
     }
     return { ok: true }
   }
@@ -40,8 +42,4 @@ function classifyEditError(code: string | null): NonNullable<(EditMessageResult 
     default:
       return 'not-found'
   }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

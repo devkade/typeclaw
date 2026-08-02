@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { describeError } from '@/channels/adapters/describe-error'
+import { describeError } from '@/channels/describe-error'
 
 describe('describeError', () => {
   test('returns the message of a plain Error', () => {
@@ -13,6 +13,23 @@ describe('describeError', () => {
     expect(String(errorEvent)).toBe('[object Object]')
 
     expect(describeError(errorEvent)).toBe('Unexpected server response: 401')
+  })
+
+  test('reports the nested reason from a WebSocket ErrorEvent-like object', () => {
+    // given: the gateway outage shape stringifies as [object ErrorEvent]
+    const errorEvent = {
+      [Symbol.toStringTag]: 'ErrorEvent',
+      type: 'error',
+      error: new Error('WebSocket closed: 1006 abnormal closure'),
+    }
+    expect(String(errorEvent)).toBe('[object ErrorEvent]')
+
+    // when
+    const reason = describeError(errorEvent)
+
+    // then
+    expect(reason).toBe('WebSocket closed: 1006 abnormal closure')
+    expect(reason).not.toContain('[object ErrorEvent]')
   })
 
   test('digs into a nested .error when .message is absent', () => {

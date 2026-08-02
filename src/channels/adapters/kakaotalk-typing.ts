@@ -2,7 +2,7 @@ import type { KakaoTypingResult } from 'agent-messenger/kakaotalk'
 
 import type { TypingCallback } from '@/channels/types'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 
 export type KakaoTypingLogger = {
   info: (msg: string) => void

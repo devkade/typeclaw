@@ -3,6 +3,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { GithubReviewOn } from '@/channels/schema'
 import type { InboundMessage } from '@/channels/types'
 
+import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { removeRequestedReviewer } from './decoy-reviewer'
@@ -204,9 +205,7 @@ function maybeScheduleDecoyReviewerDrop(input: {
         options.logger.warn(`[github] failed to drop decoy reviewer @${decoyLogin} from ${target}: ${result.reason}`)
       }
     } catch (err) {
-      options.logger.warn(
-        `[github] failed to drop decoy reviewer @${decoyLogin} from ${target}: ${err instanceof Error ? err.message : String(err)}`,
-      )
+      options.logger.warn(`[github] failed to drop decoy reviewer @${decoyLogin} from ${target}: ${describeError(err)}`)
     }
   })
 }
@@ -295,9 +294,7 @@ function scheduleReviewFollowup(input: {
         ),
       )
     } catch (err) {
-      options.logger.warn(
-        `[github] review followup failed for ${target}: ${err instanceof Error ? err.message : String(err)}`,
-      )
+      options.logger.warn(`[github] review followup failed for ${target}: ${describeError(err)}`)
     }
   })
 }
@@ -944,7 +941,7 @@ async function resolveTeamMembership(
   try {
     return await options.isBotInTeam({ org, slug: team.slug, login: selfLogin })
   } catch (err) {
-    options.logger.warn(`[github] team membership lookup failed: ${describe(err)}`)
+    options.logger.warn(`[github] team membership lookup failed: ${describeError(err)}`)
     return false
   }
 }
@@ -1104,8 +1101,4 @@ function readBoolean(obj: Record<string, unknown> | null, key: string): boolean 
 
 function ok(): Response {
   return new Response('ok', { status: 200 })
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

@@ -6,6 +6,7 @@ import type {
   ReactionResult,
 } from '@/channels/types'
 
+import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import {
@@ -194,7 +195,7 @@ async function postReaction(
       body: JSON.stringify({ content: options.content }),
     })
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err), code: 'transient' }
+    return { ok: false, error: describeError(err), code: 'transient' }
   }
   // 201 = reaction created, 200 = the actor already left this same reaction.
   // Both are success: an :eyes: that's already there is the desired end state,
@@ -229,7 +230,7 @@ async function deleteReaction(
       headers: githubJsonHeaders(token),
     })
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err), code: 'transient' }
+    return { ok: false, error: describeError(err), code: 'transient' }
   }
   if (response.status === 204) return { ok: true }
   const text = await response.text().catch(() => '')

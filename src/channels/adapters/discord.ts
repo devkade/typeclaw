@@ -33,7 +33,7 @@ import type {
 import { chunkMarkdown } from '@/markdown'
 import type { DiscordAccountRecord } from '@/secrets/schema'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { createDiscordAuthorResolver } from './discord-author-resolver'
 import { createDiscordChannelResolver } from './discord-channel-resolver'
 import { classifyInbound, type InboundDropReason } from './discord-classify'

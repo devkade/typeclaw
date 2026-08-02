@@ -19,7 +19,7 @@ import type {
   SendResult,
 } from '@/channels/types'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { createInstagramChannelResolver } from './instagram-channel-resolver'
 import { classifyInbound } from './instagram-classify'
 import { toInstagramPlainText } from './instagram-format'

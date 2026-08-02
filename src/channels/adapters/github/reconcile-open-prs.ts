@@ -1,6 +1,7 @@
 import type { GithubReviewOn } from '@/channels/schema'
 import type { InboundMessage } from '@/channels/types'
 
+import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { DEFAULT_RECONCILE_COOLDOWN_MS, type ReconcileCooldownStore } from './reconcile-cooldown-store'
@@ -67,7 +68,7 @@ export async function reconcileOpenPrs(options: ReconcileOpenPrsOptions): Promis
         options.logger.info(`[github] reconcile ${repo}: replayed ${outcome.replayed}/${outcome.scanned} open PR(s)`)
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       options.logger.warn(`[github] reconcile ${repo} failed: ${message}`)
       outcomes.push({ repo, error: message })
     }
@@ -103,9 +104,9 @@ async function reconcileRepo(
         await cooldownStore.markReplayed(repo, pr.id, now())
       } catch (err) {
         options.logger.warn(
-          `[github] reconcile ${repo}: skipping PR #${pr.number} replay, cooldown persist failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          `[github] reconcile ${repo}: skipping PR #${pr.number} replay, cooldown persist failed: ${describeError(
+            err,
+          )}`,
         )
         continue
       }

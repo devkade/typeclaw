@@ -1,6 +1,8 @@
 import type { AdapterId } from '@/channels/schema'
 import type { EditMessageCallback, EditMessageResult } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 // Both WebexClient and WebexBotClient expose the same edit primitive
 // (webex-bot delegates to webex), so one factory serves both adapters —
 // parameterized on the adapter id it guards against. Webex addresses an edit
@@ -20,7 +22,7 @@ export function createWebexEditMessageCallback(deps: {
     try {
       await deps.client.editMessage(req.messageId, req.chat, req.text)
     } catch (err) {
-      return { ok: false, error: describe(err), code: classifyEditError(err) }
+      return { ok: false, error: describeError(err), code: classifyEditError(err) }
     }
     return { ok: true }
   }
@@ -40,8 +42,4 @@ function httpStatus(err: unknown): number | null {
     if (typeof status === 'number') return status
   }
   return null
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

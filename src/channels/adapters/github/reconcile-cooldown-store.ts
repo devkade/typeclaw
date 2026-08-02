@@ -1,6 +1,8 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import { describeError } from '../../describe-error'
+
 // Durable per-PR replay cooldown for the open-PR reconcile pass.
 //
 // The reconcile pass (reconcile-open-prs.ts) runs on every adapter start() and
@@ -128,7 +130,7 @@ export async function loadReconcileCooldownStore(
         try {
           await flush()
         } catch (err) {
-          logger.error(`[github] failed to persist reconcile cooldown: ${describe(err)}`)
+          logger.error(`[github] failed to persist reconcile cooldown: ${describeError(err)}`)
         }
       }
     },
@@ -146,7 +148,7 @@ async function readMarkers(path: string, logger: ReconcileCooldownLogger): Promi
   try {
     parsed = JSON.parse(raw)
   } catch (err) {
-    logger.error(`[github] ${path} corrupted: ${describe(err)}; starting fresh`)
+    logger.error(`[github] ${path} corrupted: ${describeError(err)}; starting fresh`)
     return []
   }
   if (!isObject(parsed)) {
@@ -171,8 +173,4 @@ function isValidMarker(v: unknown): v is ReconcileMarker {
   if (!isObject(v)) return false
   const r = v as Record<string, unknown>
   return typeof r.repo === 'string' && typeof r.prId === 'number' && typeof r.lastReplayAt === 'number'
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

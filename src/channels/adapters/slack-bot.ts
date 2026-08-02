@@ -40,7 +40,7 @@ import type {
 } from '@/channels/types'
 import { chunkMarkdown } from '@/markdown'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { addSlackMentionHints } from './mention-hints'
 import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-attachment-download'
 import { createSlackAuthorResolver, type SlackAuthorResolver } from './slack-bot-author-resolver'
@@ -720,7 +720,7 @@ export function createSlackHistoryCallback(deps: {
       })
       raw = (await response.json()) as SlackHistoryResponse
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.warn(`[slack-bot] history fetch failed: ${message}`)
       return { ok: false, error: message }
     }
@@ -800,7 +800,7 @@ export function createSlackMessageGetCallback(deps: {
       })
       raw = (await response.json()) as SlackHistoryResponse
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.warn(`[slack-bot] message get failed: ${message}`)
       return { ok: false, error: message }
     }
@@ -847,7 +847,7 @@ export function createSlackListCallback(deps: {
       })
       raw = (await response.json()) as SlackConversationsListResponse
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.warn(`[slack-bot] channel list failed: ${message}`)
       return { ok: false, error: message }
     }
@@ -1008,7 +1008,7 @@ export function createOutboundCallback(deps: {
         if (typingTracker) await typingTracker.clearAfterSend(msg.chat, msg.typingThread ?? msg.thread)
         return { ok: true, messageId: sentTs[0], messageIds: sentTs }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
+        const message = describeError(err)
         logger.error(`[slack-bot] postMessage failed: ${message}`)
         return { ok: false, error: message }
       }
@@ -1021,7 +1021,7 @@ export function createOutboundCallback(deps: {
       try {
         buffer = await readFile(attachment.path)
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
+        const message = describeError(err)
         logger.error(`[slack-bot] readFile failed for ${attachment.path}: ${message}`)
         return { ok: false, error: `readFile failed: ${message}` }
       }
@@ -1037,7 +1037,7 @@ export function createOutboundCallback(deps: {
         const file = await client.uploadFile(msg.chat, buffer, filename, uploadOptions)
         logger.info(`[slack-bot] uploaded id=${file.id} filename=${file.name} size=${file.size} ${tag}`)
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
+        const message = describeError(err)
         logger.error(`[slack-bot] uploadFile failed for ${attachment.path}: ${message}`)
         return { ok: false, error: `uploadFile failed: ${message}` }
       }
@@ -1085,7 +1085,7 @@ export function createFetchAttachmentCallback(deps: {
         size: buffer.length,
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.error(`[slack-bot] downloadFile failed for ${fileId}: ${message}`)
       return { ok: false, error: message }
     }

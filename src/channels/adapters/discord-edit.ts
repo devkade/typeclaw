@@ -2,6 +2,8 @@ import type { DiscordClient } from 'agent-messenger/discord'
 
 import type { EditMessageCallback, EditMessageResult } from '@/channels/types'
 
+import { describeError } from '../describe-error'
+
 export function createDiscordUserEditMessageCallback(deps: {
   client: Pick<DiscordClient, 'editMessage'>
 }): EditMessageCallback {
@@ -17,7 +19,7 @@ export function createDiscordUserEditMessageCallback(deps: {
     try {
       await deps.client.editMessage(channelId, req.messageId, req.text)
     } catch (err) {
-      return { ok: false, error: describe(err), code: classifyEditError(err) }
+      return { ok: false, error: describeError(err), code: classifyEditError(err) }
     }
     return { ok: true }
   }
@@ -44,8 +46,4 @@ function classifyEditError(err: unknown): NonNullable<(EditMessageResult & { ok:
     default:
       return 'not-found'
   }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

@@ -1,3 +1,4 @@
+import { describeError } from '../describe-error'
 import type { KakaoTalkClient } from './kakaotalk'
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000
@@ -50,7 +51,7 @@ export function createKakaoAuthorResolver(options: KakaoAuthorResolverOptions): 
       .catch((err: unknown): null => {
         // Author resolution is best-effort. Failing here makes the message
         // render with the raw user_id, which is uglier but still routes.
-        logger?.warn(`[kakaotalk] getMembers(${chatId}) failed: ${describe(err)}`)
+        logger?.warn(`[kakaotalk] getMembers(${chatId}) failed: ${describeError(err)}`)
         return null
       })
       .finally(() => {
@@ -71,8 +72,4 @@ export function createKakaoAuthorResolver(options: KakaoAuthorResolverOptions): 
   }
 
   return { resolve }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

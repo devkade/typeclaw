@@ -1,5 +1,6 @@
 import type { OutboundCallback, OutboundMessage, SendResult } from '@/channels/types'
 
+import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import {
@@ -160,7 +161,7 @@ async function graphql<T>(
     if (raw.data === undefined) return { ok: false, error: 'GraphQL response missing data' }
     return { ok: true, data: raw.data }
   } catch (err) {
-    return { ok: false, error: describe(err) }
+    return { ok: false, error: describeError(err) }
   }
 }
 
@@ -189,7 +190,7 @@ async function postJson(
       : baseError
     return { ok: false, error: decorated }
   } catch (err) {
-    return { ok: false, error: describe(err) }
+    return { ok: false, error: describeError(err) }
   }
 }
 
@@ -209,8 +210,4 @@ export function parseChat(chat: string): ChatRef | null {
     return null
   }
   return { kind, number }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }

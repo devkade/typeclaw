@@ -94,6 +94,68 @@ describe('discord-bot lifecycle', () => {
     expect(router.unregistered).toEqual(router.registered)
   })
 
+  test('logs the nested reason of a gateway ErrorEvent, never [object ErrorEvent]', async () => {
+    // given: a ws 'error' fires with an ErrorEvent, which is not an Error
+    const errors: string[] = []
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'token-1',
+      logger: { info: () => {}, warn: () => {}, error: (m) => errors.push(m) },
+      fetchImpl: (async () => new Response('{}', { status: 200 })) as unknown as typeof fetch,
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+    })
+    await adapter.start()
+
+    // when
+    const errorEvent = {
+      [Symbol.toStringTag]: 'ErrorEvent',
+      type: 'error',
+      error: new Error('Unexpected server response: 401'),
+    }
+    expect(String(errorEvent)).toBe('[object ErrorEvent]')
+    listener.emit('error', errorEvent)
+
+    // then
+    const logged = errors.find((m) => m.startsWith('[discord-bot] gateway error:'))
+    expect(logged).toBe('[discord-bot] gateway error: Unexpected server response: 401')
+    expect(logged).not.toContain('[object ErrorEvent]')
+
+    await adapter.stop()
+  })
+
+  test('logs the nested reason when listener startup fails with an ErrorEvent', async () => {
+    // given: the outage shape, surfaced through the start-failure rollback path
+    const errors: string[] = []
+    const errorEvent = {
+      [Symbol.toStringTag]: 'ErrorEvent',
+      type: 'error',
+      error: new Error('WebSocket closed: 1006 abnormal closure'),
+    }
+    const listener = new FakeDiscordBotListener({ failStart: errorEvent })
+    const router = new FakeDiscordBotRouter()
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'token-1',
+      logger: { info: () => {}, warn: () => {}, error: (m) => errors.push(m) },
+      fetchImpl: (async () => new Response('{}', { status: 200 })) as unknown as typeof fetch,
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+    })
+
+    // when
+    await expect(adapter.start()).rejects.toBe(errorEvent)
+
+    // then
+    const logged = errors.find((m) => m.startsWith('[discord-bot] listener start failed:'))
+    expect(logged).toBe('[discord-bot] listener start failed: WebSocket closed: 1006 abnormal closure')
+    expect(logged).not.toContain('[object ErrorEvent]')
+  })
+
   test('remains disconnected when listener startup fails', async () => {
     const listener = new FakeDiscordBotListener({ failStart: true })
     const router = new FakeDiscordBotRouter()
@@ -2092,7 +2154,7 @@ class FakeDiscordBotListener {
   readonly value = this as unknown as DiscordBotListener
   stopped = false
 
-  constructor(private readonly options: { failStart?: boolean } = {}) {}
+  constructor(private readonly options: { failStart?: boolean | unknown } = {}) {}
 
   on(event: string, listener: (arg: unknown) => void): this {
     this.handlers.set(event, [...(this.handlers.get(event) ?? []), listener])
@@ -2100,8 +2162,12 @@ class FakeDiscordBotListener {
   }
 
   async start(): Promise<void> {
-    if (this.options.failStart) throw new Error('start failed')
-    this.emit('connected', connectedInfo())
+    const { failStart } = this.options
+    if (failStart === undefined || failStart === false) {
+      this.emit('connected', connectedInfo())
+      return
+    }
+    throw failStart === true ? new Error('start failed') : failStart
   }
 
   stop(): void {

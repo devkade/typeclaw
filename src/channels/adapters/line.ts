@@ -25,7 +25,7 @@ import type {
   SendResult,
 } from '@/channels/types'
 
-import { describeError } from './describe-error'
+import { describeError } from '../describe-error'
 import { splitInboundLine } from './line-attachment'
 import { createLineChannelResolver } from './line-channel-resolver'
 import { classifyInbound } from './line-classify'

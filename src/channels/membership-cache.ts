@@ -1,3 +1,4 @@
+import { describeError } from './describe-error'
 import {
   MEMBERSHIP_CACHE_PERMANENT_TTL_MS,
   MEMBERSHIP_CACHE_TRANSIENT_TTL_MS,
@@ -76,7 +77,7 @@ export function createMembershipCache(options: MembershipCacheOptions): Membersh
     try {
       result = await options.resolver(key)
     } catch (err) {
-      options.logger?.warn(`[channels] membership resolver threw for ${keyId}: ${describe(err)}`)
+      options.logger?.warn(`[channels] membership resolver threw for ${keyId}: ${describeError(err)}`)
       result = { kind: 'transient' }
     }
     entries.set(keyId, { result, expiresAt: now() + ttlFor(result), servedStale: false })
@@ -107,10 +108,6 @@ function toMembership(result: MembershipResolverResult): MembershipCount | null 
 
 function isMembershipCount(result: MembershipResolverResult): result is MembershipCount {
   return 'humans' in result
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
 
 export type { MembershipResolverFailure }

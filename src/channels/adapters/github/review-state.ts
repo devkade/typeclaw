@@ -1,5 +1,6 @@
 import type { ReviewStateResolver, ReviewStateResult } from '@/channels/types'
 
+import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 
@@ -111,7 +112,7 @@ async function fetchSelfReviews(
     try {
       response = await fetchImpl(url, { headers: githubJsonHeaders(token) })
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err), code: 'transient' }
+      return { ok: false, error: describeError(err), code: 'transient' }
     }
     if (!response.ok) {
       const text = await response.text().catch(() => '')
@@ -153,7 +154,7 @@ async function fetchReviewDecision(
       }),
     })
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err), code: 'transient' }
+    return { ok: false, error: describeError(err), code: 'transient' }
   }
   if (!response.ok) {
     const text = await response.text().catch(() => '')

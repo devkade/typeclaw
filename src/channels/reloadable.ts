@@ -1,5 +1,6 @@
 import type { Reloadable, ReloadResult } from '@/reload'
 
+import { describeError } from './describe-error'
 import type { ChannelManager } from './manager'
 
 export type CreateChannelsReloadableOptions = {
@@ -20,7 +21,7 @@ export function createChannelsReloadable({ manager }: CreateChannelsReloadableOp
         const summary = parts.length === 0 ? 'no adapter changes' : parts.join(', ')
         return { scope: 'channels', ok: true, summary, details: diff }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
+        const message = describeError(err)
         return { scope: 'channels', ok: false, reason: message }
       }
     },

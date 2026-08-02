@@ -1,5 +1,6 @@
 import type { ReviewThreadResolveRequest, ReviewThreadResolveResult, ReviewThreadResolver } from '@/channels/types'
 
+import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 
@@ -233,7 +234,7 @@ async function walkThreadPages(
     } catch (err) {
       return {
         kind: 'error',
-        result: { ok: false, error: err instanceof Error ? err.message : String(err), code: 'transient' },
+        result: { ok: false, error: describeError(err), code: 'transient' },
       }
     }
     const parsed = await parseThreadsPage(response)
@@ -308,7 +309,7 @@ async function runResolveMutation(
       body: JSON.stringify({ query: RESOLVE_MUTATION, variables: { threadId } }),
     })
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err), code: 'transient' }
+    return { ok: false, error: describeError(err), code: 'transient' }
   }
   if (!response.ok) {
     const text = await response.text().catch(() => '')

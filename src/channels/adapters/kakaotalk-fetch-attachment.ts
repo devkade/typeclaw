@@ -5,6 +5,7 @@ import {
 } from '@/channels/fetch-attachment'
 import type { FetchAttachmentCallback } from '@/channels/types'
 
+import { describeError } from '../describe-error'
 import type { KakaotalkAdapterLogger } from './kakaotalk'
 
 // KakaoCDN hosts that the LOCO push payload mints pre-signed URLs against.
@@ -68,7 +69,7 @@ export function createFetchAttachmentCallback(deps: {
         size: buffer.length,
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = describeError(err)
       logger.error(`[kakaotalk] fetchAttachment failed for ${url.toString()}: ${message}`)
       return { ok: false, error: message }
     }
