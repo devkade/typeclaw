@@ -54,6 +54,15 @@ function makeFakeAdapter(): FakeAdapter & { connected: boolean } {
   return adapter
 }
 
+function makeStartFailingAdapter(message = '401: Unauthorized'): FakeAdapter & { connected: boolean } {
+  const adapter = makeFakeAdapter()
+  adapter.start = async () => {
+    adapter.startCalls++
+    throw new Error(message)
+  }
+  return adapter
+}
+
 function makeRecordingAdapter(
   events: string[],
   name: string,
@@ -165,6 +174,69 @@ function recordingLogger(): {
     error: (msg) => messages.push(`error:${msg}`),
     messages,
   }
+}
+
+function fakeRecoveryClock(
+  options: {
+    startMs?: number
+    checkIntervalMs?: number
+    disconnectedGraceMs?: number
+    retryBaseMs?: number
+    random?: () => number
+  } = {},
+): {
+  connectionRecovery: {
+    checkIntervalMs: number
+    disconnectedGraceMs: number
+    retryBaseMs: number
+    now: () => number
+    random: () => number
+    setInterval: (fn: () => void) => string
+    clearInterval: () => void
+  }
+  advanceBy: (ms: number) => boolean
+  fire: () => boolean
+  isArmed: () => boolean
+  intervalRegistrations: () => number
+  now: () => number
+} {
+  let nowMs = options.startMs ?? 0
+  let tick: (() => void) | null = null
+  let registrations = 0
+  const fire = (): boolean => {
+    if (tick === null) return false
+    tick()
+    return true
+  }
+  return {
+    connectionRecovery: {
+      checkIntervalMs: options.checkIntervalMs ?? 30_000,
+      disconnectedGraceMs: options.disconnectedGraceMs ?? 90_000,
+      retryBaseMs: options.retryBaseMs ?? options.checkIntervalMs ?? 30_000,
+      now: () => nowMs,
+      random: options.random ?? (() => 0.5),
+      setInterval: (fn) => {
+        tick = fn
+        registrations++
+        return `timer-${registrations}`
+      },
+      clearInterval: () => {
+        tick = null
+      },
+    },
+    advanceBy: (ms) => {
+      nowMs += ms
+      return fire()
+    },
+    fire,
+    isArmed: () => tick !== null,
+    intervalRegistrations: () => registrations,
+    now: () => nowMs,
+  }
+}
+
+const flushManagerWork = async (): Promise<void> => {
+  await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
 describe('channel manager — connection recovery', () => {
@@ -283,6 +355,542 @@ describe('channel manager — connection recovery', () => {
 
     await mgr.stop()
   })
+
+  test('retries a failed disconnect replacement until the adapter is live again', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock({ startMs: 1_000, checkIntervalMs: 10, disconnectedGraceMs: 100 })
+    const firstAdapter = makeFakeAdapter()
+    const failedReplacement = makeStartFailingAdapter()
+    const recoveredAdapter = makeFakeAdapter()
+    const adapters = [firstAdapter, failedReplacement, recoveredAdapter]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => adapters.shift()!,
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    firstAdapter.connected = false
+    clock.fire()
+    clock.advanceBy(101)
+    await flushManagerWork()
+
+    expect(firstAdapter.stopCalls).toBe(1)
+    expect(failedReplacement.startCalls).toBe(1)
+    expect(failedReplacement.stopCalls).toBe(1)
+    expect(recoveredAdapter.startCalls).toBe(0)
+
+    clock.advanceBy(9)
+    await flushManagerWork()
+    expect(recoveredAdapter.startCalls).toBe(0)
+
+    clock.advanceBy(1)
+    await flushManagerWork()
+    expect(recoveredAdapter.startCalls).toBe(1)
+
+    await mgr.stop()
+    expect(recoveredAdapter.stopCalls).toBe(1)
+  })
+
+  test('heals a boot-time start failure only when its retry deadline is due', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock()
+    const failedAdapter = makeStartFailingAdapter()
+    const recoveredAdapter = makeFakeAdapter()
+    const adapters = [failedAdapter, recoveredAdapter]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => adapters.shift()!,
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    expect(failedAdapter.startCalls).toBe(1)
+
+    clock.advanceBy(29_999)
+    await flushManagerWork()
+    expect(recoveredAdapter.startCalls).toBe(0)
+
+    clock.advanceBy(1)
+    await flushManagerWork()
+    expect(recoveredAdapter.startCalls).toBe(1)
+
+    await mgr.stop()
+  })
+
+  test('uses exponential retry deadlines capped at fifteen minutes and never fires early', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock()
+    const attemptTimes: number[] = []
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => {
+        const adapter = makeStartFailingAdapter()
+        adapter.start = async () => {
+          adapter.startCalls++
+          attemptTimes.push(clock.now())
+          throw new Error('still unavailable')
+        }
+        return adapter
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    const nominals = [30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000]
+    let expectedAttempts = 1
+    for (const nominal of nominals) {
+      const floor = nominal * 0.8
+      clock.advanceBy(floor - 1)
+      await flushManagerWork()
+      expect(attemptTimes).toHaveLength(expectedAttempts)
+
+      clock.advanceBy(nominal * 1.2 - (floor - 1))
+      await flushManagerWork()
+      expectedAttempts++
+      expect(attemptTimes).toHaveLength(expectedAttempts)
+    }
+
+    // every observed gap sits inside its own ±20% window, and the last two
+    // share the 15-minute cap rather than continuing to double
+    const gaps = attemptTimes.slice(1).map((at, i) => at - attemptTimes[i]!)
+    expect(gaps).toHaveLength(nominals.length)
+    for (const [i, nominal] of nominals.entries()) {
+      expect(gaps[i]!).toBeGreaterThanOrEqual(nominal * 0.8)
+      expect(gaps[i]!).toBeLessThanOrEqual(nominal * 1.2)
+    }
+    expect(nominals.at(-1)).toBe(900_000)
+    await mgr.stop()
+  })
+
+  test('claims a due retry before enqueue so repeated ticks cannot construct duplicates', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock()
+    const startGate = deferred()
+    const failedAdapter = makeStartFailingAdapter()
+    const retryAdapter = makeRecordingAdapter([], 'retry', { start: startGate.promise })
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => {
+        constructions++
+        return constructions === 1 ? failedAdapter : retryAdapter
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    clock.advanceBy(30_000)
+    await Promise.resolve()
+    expect(retryAdapter.startCalls).toBe(1)
+
+    for (let i = 0; i < 5; i++) clock.fire()
+    await flushManagerWork()
+    expect(constructions).toBe(2)
+    expect(retryAdapter.startCalls).toBe(1)
+
+    startGate.resolve()
+    await flushManagerWork()
+    await mgr.stop()
+  })
+
+  test('clears failed supervision after recovery succeeds', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock()
+    const failedAdapter = makeStartFailingAdapter()
+    const recoveredAdapter = makeFakeAdapter()
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => {
+        constructions++
+        return constructions === 1 ? failedAdapter : recoveredAdapter
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    clock.advanceBy(30_000)
+    await flushManagerWork()
+    expect(recoveredAdapter.startCalls).toBe(1)
+
+    for (let i = 0; i < 20; i++) {
+      clock.advanceBy(900_000)
+      await flushManagerWork()
+    }
+    expect(constructions).toBe(2)
+    expect(recoveredAdapter.startCalls).toBe(1)
+
+    await mgr.stop()
+  })
+
+  test('retries missing credentials and starts once the credential block appears', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const env: NodeJS.ProcessEnv = {}
+    const clock = fakeRecoveryClock()
+    const adapter = makeFakeAdapter()
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env,
+      createDiscordAdapter: () => {
+        constructions++
+        return adapter
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    expect(constructions).toBe(0)
+    env.DISCORD_BOT_TOKEN = 'token-added-later'
+
+    clock.advanceBy(30_000)
+    await flushManagerWork()
+    expect(constructions).toBe(1)
+    expect(adapter.startCalls).toBe(1)
+
+    await mgr.stop()
+  })
+
+  test('reload keeps a credential-stripped live adapter supervised so restoring the token revives it', async () => {
+    // given: a live adapter whose token is then removed from env
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const env: NodeJS.ProcessEnv = { DISCORD_BOT_TOKEN: 'token' }
+    const clock = fakeRecoveryClock()
+    const first = makeFakeAdapter()
+    const revived = makeFakeAdapter()
+    const adapters = [first, revived]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env,
+      createDiscordAdapter: () => adapters.shift()!,
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    expect(first.startCalls).toBe(1)
+
+    // when: the credential disappears and the operator reloads
+    delete env.DISCORD_BOT_TOKEN
+    const result = await mgr.reload()
+    expect(result.stopped).toContain('discord-bot')
+    expect(first.stopCalls).toBe(1)
+
+    // then: it stays under supervision rather than dropping out entirely
+    env.DISCORD_BOT_TOKEN = 'token-restored'
+    clock.advanceBy(30_000)
+    await flushManagerWork()
+    expect(revived.startCalls).toBe(1)
+
+    await mgr.stop()
+  })
+
+  test('reload reconciles credentials on an adapter a retry brought live, not just a boot start', async () => {
+    // given: boot fails, so the adapter only becomes live via the retry path
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const env: NodeJS.ProcessEnv = { DISCORD_BOT_TOKEN: 'token-old' }
+    const clock = fakeRecoveryClock()
+    const revived = makeFakeAdapter()
+    const adapters = [makeStartFailingAdapter(), revived]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env,
+      createDiscordAdapter: () => adapters.shift()!,
+      connectionRecovery: clock.connectionRecovery,
+    })
+    await mgr.start()
+    clock.advanceBy(30_000)
+    await flushManagerWork()
+    expect(revived.startCalls).toBe(1)
+
+    // when: the token rotates under an adapter that never went through boot start
+    env.DISCORD_BOT_TOKEN = 'token-rotated'
+    const reloaded = await mgr.reload()
+
+    // then: rotation is reported rather than silently skipped
+    expect(reloaded.restartRequired).toEqual(['discord-bot (token rotation)'])
+    expect(reloaded.started).toEqual([])
+
+    await mgr.stop()
+  })
+
+  test('retry deadlines stay within the jitter window at both extremes on production-cadence ticks', async () => {
+    // given: a 5s supervision tick against a 30s retry base, at both jitter ends
+    const base = 30_000
+    const windowMin = base * 0.8
+    const windowMax = base * 1.2
+    for (const random of [0, 0.5, 0.999] as const) {
+      cfg['discord-bot'] = enabledAdapterCfg()
+      const clock = fakeRecoveryClock({ checkIntervalMs: 5_000, retryBaseMs: 30_000, random: () => random })
+      let constructions = 0
+      const mgr = createChannelManager({
+        agentDir,
+        channelsConfigRef: () => cfg,
+        env: { DISCORD_BOT_TOKEN: 'token' },
+        createDiscordAdapter: () => {
+          constructions++
+          return makeStartFailingAdapter()
+        },
+        connectionRecovery: clock.connectionRecovery,
+      })
+      await mgr.start()
+      expect(constructions).toBe(1)
+
+      // when: ticking at the production 5s cadence until the retry fires
+      let elapsed = 0
+      while (constructions < 2 && elapsed < 120_000) {
+        clock.advanceBy(5_000)
+        await flushManagerWork()
+        elapsed += 5_000
+      }
+      // then: the OBSERVED retry time honours the advertised window, tick
+      // quantization included — not merely the unobservable computed deadline
+      expect(constructions).toBe(2)
+      expect(elapsed).toBeGreaterThanOrEqual(windowMin)
+      expect(elapsed).toBeLessThanOrEqual(windowMax)
+
+      await mgr.stop()
+    }
+  })
+
+  test('does not retry disabled or permanently unconstructable adapters', async () => {
+    cfg['discord-bot'] = { ...enabledAdapterCfg(), enabled: false }
+    cfg.slack = enabledAdapterCfg()
+    await writeSlackSecrets(agentDir)
+    const clock = fakeRecoveryClock()
+    const logger = recordingLogger()
+    let discordConstructions = 0
+    let slackConstructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      logger,
+      createDiscordAdapter: () => {
+        discordConstructions++
+        return makeFakeAdapter()
+      },
+      createSlackUserAdapter: () => {
+        slackConstructions++
+        return makeFakeAdapter()
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    for (let i = 0; i < 20; i++) {
+      clock.advanceBy(900_000)
+      await flushManagerWork()
+    }
+
+    expect(discordConstructions).toBe(0)
+    expect(slackConstructions).toBe(0)
+    expect(logger.messages.filter((message) => message.includes('could not be constructed'))).toHaveLength(1)
+    await mgr.stop()
+  })
+
+  test('throttles capped retry logs to one heartbeat every six hours', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock()
+    const logger = recordingLogger()
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      logger,
+      createDiscordAdapter: () => makeStartFailingAdapter(),
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    for (const delay of [30_000, 60_000, 120_000, 240_000, 480_000]) {
+      clock.advanceBy(delay)
+      await flushManagerWork()
+    }
+    for (let i = 0; i < 48; i++) {
+      clock.advanceBy(900_000)
+      await flushManagerWork()
+    }
+
+    const retryLogs = logger.messages.filter((message) => message.includes('retrying in'))
+    expect(retryLogs).toHaveLength(8)
+    expect(retryLogs.filter((message) => message.startsWith('error:'))).toHaveLength(1)
+    expect(retryLogs.filter((message) => message.startsWith('warn:'))).toHaveLength(7)
+    expect(
+      retryLogs.filter((message) => message.includes('attempt 30') || message.includes('attempt 54')),
+    ).toHaveLength(2)
+    await mgr.stop()
+  })
+
+  test('stop is a hard barrier against an in-flight retry resurrection', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock()
+    const startGate = deferred()
+    const failedAdapter = makeStartFailingAdapter()
+    const retryAdapter = makeRecordingAdapter([], 'retry', { start: startGate.promise })
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => {
+        constructions++
+        return constructions === 1 ? failedAdapter : retryAdapter
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    clock.advanceBy(30_000)
+    await Promise.resolve()
+    expect(retryAdapter.startCalls).toBe(1)
+
+    const stopCall = mgr.stop()
+    expect(clock.isArmed()).toBe(false)
+    startGate.resolve()
+    await stopCall
+
+    expect(retryAdapter.stopCalls).toBe(1)
+    expect(clock.fire()).toBe(false)
+    expect(constructions).toBe(2)
+  })
+
+  test('reload serializes behind a queued retry without leaking a second current adapter', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const env: NodeJS.ProcessEnv = { DISCORD_BOT_TOKEN: 'old-token' }
+    const clock = fakeRecoveryClock()
+    const failedAdapter = makeStartFailingAdapter()
+    const recoveredAdapter = makeFakeAdapter()
+    const leakedAdapter = makeFakeAdapter()
+    const adapters = [failedAdapter, recoveredAdapter, leakedAdapter]
+    const constructedWithTokens: string[] = []
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env,
+      createDiscordAdapter: (adapterOptions) => {
+        constructedWithTokens.push(adapterOptions.token)
+        return adapters.shift()!
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    clock.advanceBy(30_000)
+    env.DISCORD_BOT_TOKEN = 'new-token'
+    cfg['discord-bot'] = enabledAdapterCfg()
+    await mgr.reload()
+
+    expect(constructedWithTokens).toEqual(['old-token', 'new-token'])
+    expect(recoveredAdapter.startCalls).toBe(1)
+    expect(leakedAdapter.startCalls).toBe(0)
+
+    await mgr.stop()
+    expect(recoveredAdapter.stopCalls).toBe(1)
+    expect(leakedAdapter.stopCalls).toBe(0)
+  })
+
+  test('restartAdapter revives a failed adapter immediately but skips missing or disabled config', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock()
+    const failedAdapter = makeStartFailingAdapter()
+    const recoveredAdapter = makeFakeAdapter()
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => {
+        constructions++
+        return constructions === 1 ? failedAdapter : recoveredAdapter
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    await mgr.restartAdapter('discord-bot')
+    expect(recoveredAdapter.startCalls).toBe(1)
+    expect(constructions).toBe(2)
+
+    delete cfg['discord-bot']
+    await mgr.restartAdapter('discord-bot')
+    cfg['discord-bot'] = { ...enabledAdapterCfg(), enabled: false }
+    await mgr.restartAdapter('discord-bot')
+    clock.advanceBy(30_000)
+    await flushManagerWork()
+    expect(constructions).toBe(2)
+
+    await mgr.stop()
+  })
+
+  test('does not start a replacement when recovery cannot stop the disconnected adapter', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock({ startMs: 1_000, checkIntervalMs: 10, disconnectedGraceMs: 100 })
+    const firstAdapter = makeFakeAdapter()
+    firstAdapter.stop = async () => {
+      firstAdapter.stopCalls++
+      throw new Error('SDK stop failed')
+    }
+    const replacement = makeFakeAdapter()
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => {
+        constructions++
+        return constructions === 1 ? firstAdapter : replacement
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    firstAdapter.connected = false
+    clock.fire()
+    clock.advanceBy(101)
+    await flushManagerWork()
+
+    expect(firstAdapter.stopCalls).toBe(1)
+    expect(replacement.startCalls).toBe(0)
+    expect(constructions).toBe(1)
+
+    clock.fire()
+    await flushManagerWork()
+    expect(firstAdapter.stopCalls).toBe(2)
+    expect(replacement.startCalls).toBe(0)
+
+    await mgr.stop()
+  })
+
+  test('best-effort stops a partially initialized adapter after start throws', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const failedAdapter = makeStartFailingAdapter()
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => failedAdapter,
+    })
+
+    await mgr.start()
+
+    expect(failedAdapter.startCalls).toBe(1)
+    expect(failedAdapter.stopCalls).toBe(1)
+    await mgr.stop()
+  })
 })
 
 describe('channel manager — restartAdapter serialization', () => {
@@ -373,13 +981,13 @@ describe('channel manager — restartAdapter serialization', () => {
     await mgr.stop()
   })
 
-  test('restartAdapter is a no-op when the adapter is not live', async () => {
+  test('restartAdapter is a no-op when the adapter config is missing', async () => {
     const logger = recordingLogger()
     const mgr = createChannelManager({ agentDir, channelsConfigRef: () => cfg, logger })
 
     await mgr.restartAdapter('github')
 
-    expect(logger.messages).toContain("info:[channels] restartAdapter('github'): adapter not live, skipping")
+    expect(logger.messages).toContain("info:[channels] restartAdapter('github'): adapter config missing, skipping")
     await mgr.stop()
   })
 
@@ -445,8 +1053,9 @@ describe('channel manager — restartAdapter serialization', () => {
     await mgr.stop()
   })
 
-  test('start() rejects when adapter construction throws outside startAdapter catch', async () => {
+  test('start() preserves construction fail-fast and does not arm supervision', async () => {
     cfg['slack-bot'] = enabledAdapterCfg()
+    let timerArmCalls = 0
     const mgr = createChannelManager({
       agentDir,
       channelsConfigRef: () => cfg,
@@ -454,9 +1063,16 @@ describe('channel manager — restartAdapter serialization', () => {
       createSlackAdapter: () => {
         throw new Error('hostd env missing')
       },
+      connectionRecovery: {
+        setInterval: () => {
+          timerArmCalls++
+          return 'timer'
+        },
+      },
     })
 
     await expect(mgr.start()).rejects.toThrow('hostd env missing')
+    expect(timerArmCalls).toBe(0)
     await mgr.stop()
   })
 
