@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 import { z } from 'zod'
@@ -28,11 +28,13 @@ export type OriginProvider = () => SessionOrigin | undefined
 // is already on disk by append time). Lets the append tool strip hallucinated
 // slugs the model invents without ever calling `store_reference`.
 export type ReferenceSlugResolver = (agentDir: string) => Promise<Iterable<string>>
+export type TranscriptPathProvider = () => string | undefined
 
 export type CreateAppendToolOptions = {
   onFragmentsAppended?: FragmentsAppendedHook
   originProvider?: OriginProvider
   referenceSlugResolver?: ReferenceSlugResolver
+  transcriptPathProvider?: TranscriptPathProvider
 }
 
 // Stamped fields are the stable channel coordinates only. Author identity is
@@ -64,7 +66,7 @@ export function provenanceFromOrigin(origin: SessionOrigin | undefined): Fragmen
 }
 
 export function createAppendTool(options: CreateAppendToolOptions = {}) {
-  const { onFragmentsAppended, originProvider, referenceSlugResolver } = options
+  const { onFragmentsAppended, originProvider, referenceSlugResolver, transcriptPathProvider } = options
   return defineTool({
     description:
       "Append a memory fragment to today's JSONL daily stream and advance the watermark. The runtime serializes your call into a JSON line and chooses the filename — do not emit raw JSON and do not pass a path. `topic`/`body` are the fragment's substance; `source` is the parent session id; `entry` is the transcript-entry-id this fragment anchors to; `latestEntryId` is the latest transcript-entry-id you evaluated in this run (advances the watermark, may equal `entry` or be later). `references` may ONLY contain slugs returned by `store_reference` (it returns the slug it wrote) — never topic ids, PR names, stream paths, or invented labels; unknown slugs are dropped. `who` is the display name/handle of the person the fragment's evidence is attributable to — set it ONLY when one transcript speaker clearly owns the evidence; omit it when the fact is the user's own, spans multiple speakers, or is not attributable. The channel/room/platform (`where`) is stamped automatically from the session origin — do not pass it and do not restate it in the body. Refuses content with recognized credential patterns and refuses byte-equivalent topic+body within the same daily stream.",
@@ -87,6 +89,16 @@ export function createAppendTool(options: CreateAppendToolOptions = {}) {
     async execute({ topic, body, source, entry, latestEntryId, references, who }, ctx) {
       const streamPath = dailyStreamPath(ctx.agentDir)
       const where = provenanceFromOrigin(originProvider?.())
+      const transcriptPath = transcriptPathProvider?.()
+      if (
+        transcriptPath !== undefined &&
+        (await anchorBelongsToOperationalIncident(transcriptPath, entry, latestEntryId))
+      ) {
+        throw new Error(
+          'Refusing to append: the transcript anchor belongs to a deterministic operational incident sequence. ' +
+            'Operational defects are owned by the incident ledger, not semantic memory.',
+        )
+      }
       // `who` is LLM-supplied and force-committed to memory, so it clears the
       // same secret guard as topic/body — a token-shaped display name is refused
       // with the same retryable error. (`where` names are origin-derived and the
@@ -153,6 +165,67 @@ export function createAppendTool(options: CreateAppendToolOptions = {}) {
       }
     },
   })
+}
+
+const OPERATIONAL_INCIDENT_MARKER = 'TYPECLAW_OPERATIONAL_INCIDENT '
+
+export async function anchorBelongsToOperationalIncident(
+  transcriptPath: string,
+  entryId: string,
+  latestEntryId = entryId,
+): Promise<boolean> {
+  let raw: string
+  try {
+    raw = await readFile(transcriptPath, 'utf8')
+  } catch {
+    return false
+  }
+  const entries = raw
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .flatMap((line): unknown[] => {
+      try {
+        return [JSON.parse(line) as unknown]
+      } catch {
+        return []
+      }
+    })
+  const anchorIndex = entries.findIndex((entry) => entryIdOf(entry) === entryId)
+  const latestIndex = entries.findIndex((entry) => entryIdOf(entry) === latestEntryId)
+  if (anchorIndex < 0 || latestIndex < anchorIndex) return false
+
+  for (let i = anchorIndex; i <= latestIndex; i++) {
+    if (entryBelongsToOperationalIncident(entries, i)) return true
+  }
+  return false
+}
+
+function entryBelongsToOperationalIncident(entries: unknown[], entryIndex: number): boolean {
+  if (containsIncidentMarker(entries[entryIndex])) return true
+  for (let i = entryIndex - 1; i >= 0; i--) {
+    const entry = entries[i]
+    if (containsIncidentMarker(entry)) return true
+    if (messageRole(entry) === 'user') return false
+  }
+  return false
+}
+
+function entryIdOf(entry: unknown): string | undefined {
+  if (typeof entry !== 'object' || entry === null) return undefined
+  const id = (entry as { id?: unknown }).id
+  return typeof id === 'string' ? id : undefined
+}
+
+function messageRole(entry: unknown): string | undefined {
+  if (typeof entry !== 'object' || entry === null) return undefined
+  const message = (entry as { message?: unknown }).message
+  if (typeof message !== 'object' || message === null) return undefined
+  const role = (message as { role?: unknown }).role
+  return typeof role === 'string' ? role : undefined
+}
+
+function containsIncidentMarker(entry: unknown): boolean {
+  return JSON.stringify(entry).includes(OPERATIONAL_INCIDENT_MARKER)
 }
 
 export const appendTool = createAppendTool()

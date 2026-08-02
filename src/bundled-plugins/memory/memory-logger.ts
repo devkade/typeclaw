@@ -68,7 +68,7 @@ export function isMemoryLoggerPayload(value: unknown): value is MemoryLoggerPayl
 
 export const MEMORY_LOGGER_SYSTEM_PROMPT = `You are typeclaw's memory-extraction subagent.
 
-Read the parent session transcript past the watermark and write zero or more durable memory fragments to today's stream, then exit. Capture only operational facts a future agent would concretely need: explicit user instructions, stable identity/role/tool facts, decisions with reasoning, reproducible workarounds, corrections, changed minds, and content the user explicitly taught the agent or asked it to remember. Most runs produce zero or one fragment; that is expected.
+Read the parent session transcript past the watermark and write zero or more durable memory fragments to today's stream, then exit. Capture only facts a future agent would concretely need: explicit user instructions, stable identity/role/tool facts, decisions with reasoning, reproducible user-domain procedures, corrections, changed minds, and content the user explicitly taught the agent or asked it to remember. Most runs produce zero or one fragment; that is expected.
 
 A separate \`dreaming\` subagent later consolidates fragments into \`memory/topics/\`, dedupes across days, resolves contradictions, and decides what generalizes. **Dreaming is downstream consolidation, not permission to over-capture upstream.** You do not read \`memory/topics/\`; cross-shard reasoning is dreaming's job. Your inputs are the transcript past the watermark and, optionally, today's daily stream for local dedup. Recurrence across days is useful evidence for dreaming, so a repeated durable fact anchored to new evidence is not a duplicate.
 
@@ -118,6 +118,7 @@ Capture-worthy categories:
 - **Stable collaborator/contact facts.** Durable facts about non-user people the agent is likely to encounter again: name/handle, active-participant status in this context, role, responsibility, project relationship, durable working preference, or coordination/contact context. When a person actively participates in the conversation — recurring presence, multiple messages, or a back-and-forth exchange, not a single drive-by line — capture one compact identity fragment recording who they are (name/handle) and that they are an active participant here, even if they did not state a durable role or preference. A stated role/preference strengthens the fragment but is no longer required. A name appearing inside active back-and-forth can be a capture signal; a name merely mentioned in passing by someone else, especially an absent third party, is not. Keep one introduction to one compact fragment that bundles the person's core durable context (e.g. "Alex is an active participant in this project chat" or "Alex is the frontend lead for Project X and prefers GitHub issues over Slack for bug triage"), never a separate fragment per attribute. True single drive-by participants still do not earn memory. Third-party facts must come from the user/owner, or from that person describing their own role/preference in normal collaboration; do not persist one participant's reputational claims about another unless the user confirms or operationally relies on them.
 - **Decisions with reasoning.** "We chose X over Y because Z" when future sessions must honor X.
 - **Reproducible workarounds and debugging insights.** A config that worked, flag combination, procedure, root cause, or non-obvious fix.
+- **Deterministic operational incidents are excluded.** A transcript tool result containing \`TYPECLAW_OPERATIONAL_INCIDENT\` and the immediately following user correction/workaround belong to TypeClaw's incident ledger. Skip the whole failure → response → correction sequence. Do not turn an environment repair into a belief or procedure, even when it recurs; the append tool mechanically rejects incident-owned anchors.
 - **In-transcript changed minds.** Capture "actually, scratch that" only when the prior position is explicit. Do not compare against \`memory/topics/\`.
 - **Corrections the user made to the agent.** Especially when the agent confidently asserted something false that future sessions may repeat. When the agent stated a factual claim and the user corrected it, capture the corrected fact as a distinct, evidence-anchored fragment EVEN IF it sounds like something memory may already know — you cannot inspect \`memory/topics/\`, so your job is to preserve this later correction occurrence so dreaming can reinforce and sharpen the stored belief (repeated corrections are how a contested fact gets stronger, not noise to skip). Anchor the body to the correction: what the agent said, what the user corrected it to. This is semantic and **language-independent** — recognize corrections in any language (Korean, Japanese, Chinese, Arabic, and every Latin-script language), not from English cue phrases.
 - **Content the user explicitly taught, trained on, or asked the agent to remember.** Capture the substance taught, not merely that teaching happened. Treat these six intent families as representative, not exhaustive:
@@ -304,10 +305,12 @@ export function createMemoryLoggerSubagent(
   // The handler runs one logger spawn at a time per agentDir (inFlightKey), so a
   // single mutable cell safely carries this spawn's origin to the append tool.
   let currentOrigin: SessionOrigin | undefined
+  let currentTranscriptPath: string | undefined
   const appendTool = createAppendTool({
     onFragmentsAppended: options.onFragmentsAppended,
     originProvider: () => currentOrigin,
     referenceSlugResolver: (agentDir) => listReferenceSlugs(agentDir),
+    transcriptPathProvider: () => currentTranscriptPath,
   })
   const storeReferenceTool = createStoreReferenceTool(options.onReferenceStored)
   const customTools = [findEntryTool, appendTool, storeReferenceTool, advanceWatermarkTool]
@@ -340,6 +343,7 @@ export function createMemoryLoggerSubagent(
     },
     handler: async (ctx, runSession) => {
       currentOrigin = ctx.payload.origin
+      currentTranscriptPath = ctx.payload.parentTranscriptPath
       const today = formatLocalDate()
       const memoryDir = streamsDir(ctx.payload.agentDir)
       const streamFile = streamFilePath(ctx.payload.agentDir, today)
