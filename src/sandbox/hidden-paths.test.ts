@@ -14,6 +14,7 @@ import {
   resolveHiddenPaths,
   verifyHiddenMaskTargets,
 } from './hidden-paths'
+import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 
 const AGENT = '/agent'
 const hiddenDirs = (agentDir: string) => [
@@ -35,6 +36,7 @@ const secretFiles = (agentDir: string) => [
   join(agentDir, '.env'),
   join(agentDir, 'secrets.json'),
   join(agentDir, 'auth.json'),
+  join(agentDir, '.typeclaw', 'incidents.json'),
 ]
 
 function parseRoles(raw: unknown): RolesConfig {
@@ -53,9 +55,14 @@ describe('resolveHiddenPaths — builtin tiers', () => {
   test('canonical secret masks have one non-empty source of truth', () => {
     expect(CANONICAL_AGENT_SECRET_DIRS.length).toBeGreaterThan(0)
     expect(CANONICAL_AGENT_SECRET_FILES.length).toBeGreaterThan(0)
+    expect(CANONICAL_AGENT_RUNTIME_PRIVATE_FILES).toEqual(['.typeclaw/incidents.json'])
+    expect(CANONICAL_AGENT_SECRET_FILES).not.toContain('.typeclaw/incidents.json')
     const resolved = resolveHiddenPaths(createPermissionService(), tui, AGENT)
     expect(resolved.dirs).toEqual(CANONICAL_AGENT_SECRET_DIRS.map((entry) => join(AGENT, entry)))
-    expect(resolved.files).toEqual(CANONICAL_AGENT_SECRET_FILES.map((entry) => join(AGENT, entry)))
+    expect(resolved.files).toEqual([
+      ...CANONICAL_AGENT_SECRET_FILES.map((entry) => join(AGENT, entry)),
+      ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES.map((entry) => join(AGENT, entry)),
+    ])
   })
 
   test('owner (tui) still masks canonical agent secret files', () => {
