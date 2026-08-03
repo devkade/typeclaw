@@ -1,6 +1,14 @@
+import {
+  AGENT_MESSENGER_CONFIG_RELATIVE_DIR,
+  LEGACY_AGENT_MESSENGER_CONFIG_RELATIVE_DIR,
+} from '@/agent-messenger/config-dir'
+
 export const CANONICAL_AGENT_SECRET_DIRS = [
   'workspace/.config/gws',
-  'workspace/.agent-messenger',
+  AGENT_MESSENGER_CONFIG_RELATIVE_DIR,
+  // Retained permanently for interrupted migrations, operator backups under
+  // the old name, and older installs. This is not an active config location.
+  LEGACY_AGENT_MESSENGER_CONFIG_RELATIVE_DIR,
   '.typeclaw/home',
   '.typeclaw/logs',
 ] as const
@@ -17,6 +25,7 @@ export const CANONICAL_HOME_SECRET_DIRS = [
   '.ssh',
   '.config/gh',
   '.config/gws',
+  '.config/agent-messenger',
   '.agent-messenger',
   '.codex',
   '.claude',
