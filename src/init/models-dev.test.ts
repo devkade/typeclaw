@@ -2,6 +2,20 @@ import { describe, expect, test } from 'bun:test'
 
 import { curatedOptions, fetchModelOptions } from './models-dev'
 
+const MODELS_DEV_URL = 'https://models.dev/api.json'
+const OPENGATEWAY_CATALOG_URL = 'https://apis.opengateway.ai/v1/models'
+const OPENGATEWAY_PRICES_URL = 'https://opengateway.ai/api/model-prices'
+
+function routedFetch(routes: Record<string, unknown | Error>): typeof fetch {
+  return (async (input: string | URL | Request) => {
+    const url = input instanceof Request ? input.url : String(input)
+    const value = routes[url]
+    if (value === undefined) throw new Error(`unexpected URL: ${url}`)
+    if (value instanceof Error) throw value
+    return new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as unknown as typeof fetch
+}
+
 describe('curatedOptions', () => {
   test('returns one entry per (provider, model) pair in KNOWN_PROVIDERS', () => {
     const options = curatedOptions()
@@ -134,5 +148,121 @@ describe('fetchModelOptions', () => {
     expect(opengateway.length).toBeGreaterThan(0)
     expect(opengateway.every((o) => o.curated)).toBe(true)
     expect(opengateway.every((o) => o.modelId.includes('/'))).toBe(true)
+  })
+
+  test('models.dev failure does not suppress live OpenGateway models', async () => {
+    const fetchImpl = routedFetch({
+      [MODELS_DEV_URL]: new Error('models.dev down'),
+      [OPENGATEWAY_CATALOG_URL]: {
+        data: [
+          {
+            id: 'anthropic/claude-sonnet-5',
+            owned_by: 'anthropic',
+            status: 'active',
+            modalities: { input: ['text'], output: ['text'] },
+            endpoints: ['chat_completions'],
+          },
+        ],
+      },
+      [OPENGATEWAY_PRICES_URL]: {
+        'anthropic/claude-sonnet-5': { inputCostPerToken: 0.000003, outputCostPerToken: 0.000015 },
+      },
+    })
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    expect(result.sources).toEqual({ modelsDev: 'unavailable', openGatewayCatalog: 'live', openGatewayPrices: 'live' })
+    expect(result.options).toContainEqual(
+      expect.objectContaining({
+        ref: 'opengateway/anthropic/claude-sonnet-5',
+        curated: false,
+        modelName: 'Claude Sonnet 5',
+        reasoning: true,
+        supportsVision: false,
+        contextWindow: 1000000,
+        maxTokens: 128000,
+        cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+      }),
+    )
+  })
+
+  test('survives a well-formed models.dev envelope carrying a malformed nested model', async () => {
+    // Only the root is shape-checked on fetch, so a valid envelope can still
+    // smuggle a null model. This used to escape the fallback and crash the
+    // whole wizard rather than degrading to the curated list.
+    const fetchImpl = routedFetch({
+      [MODELS_DEV_URL]: { openai: { models: { broken: null } } },
+      [OPENGATEWAY_CATALOG_URL]: new Error('gateway catalog down'),
+      [OPENGATEWAY_PRICES_URL]: new Error('gateway prices down'),
+    })
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    expect(result.options.length).toBeGreaterThan(0)
+    expect(result.options.some((o) => o.ref === 'opengateway/openai/gpt-5.4-nano')).toBe(true)
+  })
+
+  test('maps gateway creator namespaces onto native provider ids when enriching limits', async () => {
+    // The gateway says `x-ai`/`moonshotai` where this registry says `xai`/`moonshot`.
+    // Neither OpenGateway endpoint publishes a context window, so a missed alias
+    // silently drops limits instead of failing loudly.
+    const fetchImpl = routedFetch({
+      [MODELS_DEV_URL]: new Error('models.dev down'),
+      [OPENGATEWAY_CATALOG_URL]: {
+        data: [
+          {
+            id: 'x-ai/grok-4.3',
+            owned_by: 'x-ai',
+            status: 'active',
+            modalities: { input: ['text'], output: ['text'] },
+            endpoints: ['chat_completions'],
+          },
+          {
+            id: 'moonshotai/kimi-k2.6',
+            owned_by: 'moonshotai',
+            status: 'active',
+            modalities: { input: ['text'], output: ['text'] },
+            endpoints: ['chat_completions'],
+          },
+        ],
+      },
+      [OPENGATEWAY_PRICES_URL]: {},
+    })
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    const grok = result.options.find((o) => o.ref === 'opengateway/x-ai/grok-4.3')
+    expect(grok?.modelName).toBe('Grok 4.3')
+    expect(grok?.contextWindow).toBe(1000000)
+    const kimi = result.options.find((o) => o.ref === 'opengateway/moonshotai/kimi-k2.6')
+    expect(kimi?.modelName).toBe('Kimi K2.6')
+    expect(kimi?.contextWindow).toBe(256000)
+  })
+
+  test('OpenGateway failure does not suppress models.dev models', async () => {
+    const fetchImpl = routedFetch({
+      [MODELS_DEV_URL]: {
+        openai: {
+          models: {
+            'gpt-live': {
+              id: 'gpt-live',
+              name: 'GPT Live',
+              modalities: { input: ['text'], output: ['text'] },
+            },
+          },
+        },
+      },
+      [OPENGATEWAY_CATALOG_URL]: new Error('gateway catalog down'),
+      [OPENGATEWAY_PRICES_URL]: new Error('gateway prices down'),
+    })
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    expect(result.sources).toEqual({
+      modelsDev: 'live',
+      openGatewayCatalog: 'unavailable',
+      openGatewayPrices: 'unavailable',
+    })
+    expect(result.options).toContainEqual(expect.objectContaining({ ref: 'openai/gpt-live', curated: false }))
   })
 })

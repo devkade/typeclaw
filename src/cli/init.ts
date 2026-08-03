@@ -64,7 +64,12 @@ import {
   type WizardCheckpointStore,
 } from '@/init/checkpoint'
 import { runKakaotalkBootstrap } from '@/init/kakaotalk-auth'
-import { customModelMetaFromOption, fetchModelOptions, type ModelOption } from '@/init/models-dev'
+import {
+  customModelMetaFromOption,
+  fetchModelOptions,
+  type FetchModelsResult,
+  type ModelOption,
+} from '@/init/models-dev'
 import { makeOAuthLoginRunner, type OAuthLoginResult } from '@/init/oauth-login'
 import { detectInitProgress } from '@/init/progress'
 import { runTeamsBootstrap } from '@/init/teams-auth'
@@ -1223,14 +1228,23 @@ function oauthDiscoveryRef(providerId: KnownProviderId): KnownModelRef {
 
 async function loadCatalog(): Promise<NonNullable<WizardState['catalog']>> {
   const s = spinner()
-  s.start('Loading model catalog from models.dev...')
-  const { options, source, warning } = await fetchModelOptions()
-  if (source === 'curated') {
-    s.stop(`Using built-in catalog (models.dev unavailable: ${warning ?? 'unknown'})`)
+  s.start('Loading model catalogs...')
+  const result = await fetchModelOptions()
+  const unavailable = catalogFallbackLabels(result)
+  if (unavailable.length > 0) {
+    s.stop(`Loaded model catalog with fallback for ${unavailable.join(', ')}.`)
   } else {
-    s.stop('Loaded model catalog.')
+    s.stop('Loaded model catalogs.')
   }
-  return warning !== undefined ? { options, source, warning } : { options, source }
+  return result
+}
+
+function catalogFallbackLabels(result: FetchModelsResult): string[] {
+  const labels: string[] = []
+  if (result.sources.modelsDev === 'unavailable') labels.push('native providers')
+  if (result.sources.openGatewayCatalog === 'unavailable') labels.push('OpenGateway models')
+  else if (result.sources.openGatewayPrices === 'unavailable') labels.push('OpenGateway prices')
+  return labels
 }
 
 async function pickVendor(
