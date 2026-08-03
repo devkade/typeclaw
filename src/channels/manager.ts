@@ -473,11 +473,11 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     } catch {}
   }
 
-  const startAdapter = async (
+  const startAdapterOnce = async (
     name: AdapterId,
     cfg: ChannelAdapterConfig,
     canCommit: () => boolean,
-  ): Promise<StartAdapterResult> => {
+  ): Promise<StartAdapterResult | { status: 'credential-changed' }> => {
     if (!canCommit()) return { status: 'aborted' }
     if (cfg.enabled === false) {
       logger.info(`[channels] adapter "${name}" is disabled; skipping`)
@@ -504,6 +504,10 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         await cleanupPartialStart(adapter)
         return { status: 'aborted' }
       }
+      if (buildCredentialSignature(name).signature !== signature) {
+        await cleanupPartialStart(adapter)
+        return { status: 'credential-changed' }
+      }
       live.set(name, {
         adapter,
         credentialSignature: signature,
@@ -519,6 +523,32 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         kind: 'start-failed',
         detail: `failed to start: ${describeError(err)}`,
         inputSignature: buildFailedInputSignature(name, cfg, credentials),
+      }
+    }
+  }
+
+  // The adapter reads the credential file itself inside start(), so a write
+  // landing mid-start would leave `live` holding a signature that describes a
+  // different token than the one now in memory: the entry looks current while
+  // running a superseded credential, and the next reload sees no rotation to
+  // apply. Retry once, which covers a renewal write racing a start; a second
+  // change means a persistent concurrent writer, and spinning on it is worse
+  // than handing the adapter to supervision's backoff.
+  const startAdapter = async (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    canCommit: () => boolean,
+  ): Promise<StartAdapterResult> => {
+    for (let attempt = 0; ; attempt += 1) {
+      const result = await startAdapterOnce(name, cfg, canCommit)
+      if (result.status !== 'credential-changed') return result
+      if (attempt >= 1) {
+        return {
+          status: 'failed',
+          kind: 'start-failed',
+          detail: 'credentials changed twice during start',
+          inputSignature: buildFailedInputSignature(name, cfg, buildCredentialSignature(name)),
+        }
       }
     }
   }

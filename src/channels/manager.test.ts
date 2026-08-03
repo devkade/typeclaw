@@ -1907,6 +1907,39 @@ describe('channel manager — kakaotalk credential preflight', () => {
     await mgr.stop()
   })
 
+  test('does not record a credential signature the started adapter never loaded', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    let rewroteDuringStart = false
+    fake.start = async () => {
+      fake.startCalls++
+      fake.connected = true
+      if (!rewroteDuringStart) {
+        rewroteDuringStart = true
+        await writeKakaoSecrets(agentDir, 'landed-mid-start')
+      }
+    }
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+
+    // The write landed after the pre-start signature was taken, so committing it
+    // would leave the entry describing a credential the adapter is not holding —
+    // and the next reload would then see nothing to apply.
+    const result = await mgr.reload()
+    expect(result.restartRequired).not.toContain('kakaotalk (credential rotation)')
+    expect(fake.startCalls).toBe(2)
+
+    await mgr.stop()
+  })
+
   test('reload reports the rotation as still owed when the adapter cannot be stopped', async () => {
     cfg.kakaotalk = enabledAdapterCfg()
     await writeKakaoSecrets(agentDir)
