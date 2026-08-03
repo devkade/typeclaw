@@ -37,6 +37,7 @@ import {
   _resetBwrapAvailabilityCacheForTests,
   _resetRealProcProbeCacheForTests,
   resolveProtectedZones,
+  resolveHiddenPaths,
   SandboxDegradedProcError,
   SESSION_TMP_ROOT,
   resolvePrivilegedSandboxRuntime,
@@ -3201,6 +3202,153 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
   const member: SessionOrigin = { kind: 'subagent', subagent: 'x', parentSessionId: 'p', spawnedByRole: 'member' }
   const guest: SessionOrigin = { kind: 'subagent', subagent: 'x', parentSessionId: 'p', spawnedByRole: 'guest' }
 
+  test('annotates only nonzero exits with the local sandbox policy', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-policy-provenance-'))
+    const plantedSecret = 'planted-secret-value'
+    const permissions = createPermissionService()
+    await writeFile(path.join(agentDir, '.env'), `NODE_OPTIONS=${plantedSecret}\nVISIBLE_NAME=visible-value\n`)
+    const boundary = {
+      ensureAvailable: async () => {},
+      resolveRuntime: async () => ({ env: {}, mounts: [] }),
+      buildCommand(command: string, options: SandboxPolicy | undefined) {
+        return { ...buildSandboxedCommand(command, options), commandString: command }
+      },
+    }
+    const makeTool = (exitCode: number) => ({
+      name: 'bash',
+      label: 'bash',
+      description: '',
+      parameters: Type.Object({ command: Type.String() }),
+      async execute() {
+        return {
+          content: [{ type: 'text' as const, text: exitCode === 0 ? 'unchanged success' : 'ordinary failure' }],
+          details: { exitCode },
+        }
+      },
+    })
+
+    try {
+      const failing = wrapBuiltinToolDefinition(makeTool(9), {
+        agentDir,
+        sessionId: 'policy-provenance-failure',
+        hooks: createHookBus(),
+        getOrigin: () => guest,
+        permissions,
+        bashSandboxBoundary: boundary,
+      })
+      const failure = await failing.execute('failure', { command: 'false' }, undefined, undefined, {} as never)
+      const hidden = resolveHiddenPaths(permissions, guest, agentDir)
+      const maskedPaths = [...hidden.dirs, ...hidden.files].map((target) => `agent/${path.relative(agentDir, target)}`)
+      const expectedNote =
+        `[TypeClaw sandbox policy (LOCAL): masked credential/private paths: ${maskedPaths.join(', ')}; ` +
+        'withheld env names: NODE_OPTIONS. This may be unrelated to this failure; it is NOT evidence about ' +
+        'authentication of any account, workspace, or upstream service and must not be reported as such.]'
+      expect(failure.content).toEqual([
+        { type: 'text', text: 'ordinary failure' },
+        { type: 'text', text: expectedNote },
+      ])
+      expect(JSON.stringify(failure)).not.toContain(plantedSecret)
+
+      const succeeding = wrapBuiltinToolDefinition(makeTool(0), {
+        agentDir,
+        sessionId: 'policy-provenance-success',
+        hooks: createHookBus(),
+        getOrigin: () => guest,
+        permissions,
+        bashSandboxBoundary: boundary,
+      })
+      expect(await succeeding.execute('success', { command: 'true' }, undefined, undefined, {} as never)).toEqual({
+        content: [{ type: 'text', text: 'unchanged success' }],
+        details: { exitCode: 0 },
+      })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('annotates a sandboxed builtin execution error', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-policy-error-provenance-'))
+    const plantedSecret = 'planted-secret-value'
+    const permissions = createPermissionService()
+    await writeFile(path.join(agentDir, '.env'), `NODE_OPTIONS=${plantedSecret}\n`)
+    const builtin = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'bash')
+    if (builtin === undefined) throw new Error('bash tool definition not found')
+    const wrapped = wrapBuiltinToolDefinition(builtin, {
+      agentDir,
+      sessionId: 'policy-error-provenance',
+      hooks: createHookBus(),
+      getOrigin: () => guest,
+      permissions,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        buildCommand(command, options) {
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    try {
+      const hidden = resolveHiddenPaths(permissions, guest, agentDir)
+      const maskedPaths = [...hidden.dirs, ...hidden.files].map((target) => `agent/${path.relative(agentDir, target)}`)
+      const expectedNote =
+        `[TypeClaw sandbox policy (LOCAL): masked credential/private paths: ${maskedPaths.join(', ')}; ` +
+        'withheld env names: NODE_OPTIONS. This may be unrelated to this failure; it is NOT evidence about ' +
+        'authentication of any account, workspace, or upstream service and must not be reported as such.]'
+      const thrown = await wrapped
+        .execute('failure', { command: 'exit 9' }, undefined, undefined, {} as never)
+        .catch((error: unknown) => error)
+
+      if (!(thrown instanceof Error)) throw new Error('expected command failure')
+      expect(thrown.message).toEndWith(`\n\n${expectedNote}`)
+      expect(thrown.message).not.toContain(plantedSecret)
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('the annotation is independent of command identity', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-policy-command-agnostic-'))
+    const tool = {
+      name: 'bash',
+      label: 'bash',
+      description: '',
+      parameters: Type.Object({ command: Type.String() }),
+      async execute() {
+        return { content: [{ type: 'text' as const, text: 'failed' }], details: { exitCode: 1 } }
+      },
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'policy-command-agnostic',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        buildCommand(command, options) {
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    try {
+      const firstCommand = 'false'
+      const secondCommand = '(exit 7)'
+      const first = await wrapped.execute('first', { command: firstCommand }, undefined, undefined, {} as never)
+      const second = await wrapped.execute('second', { command: secondCommand }, undefined, undefined, {} as never)
+      const firstAnnotation = first.content[1]
+      const secondAnnotation = second.content[1]
+
+      expect(firstAnnotation).toEqual(secondAnnotation)
+      expect(JSON.stringify(firstAnnotation)).not.toContain(firstCommand)
+      expect(JSON.stringify(firstAnnotation)).not.toContain(secondCommand)
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test('owner bash keeps the agent root writable while canonical secrets stay read-only masked and env stays cleared', () => {
     const permissions = createPermissionService()
     const policy = buildBashFilesystemPolicy({
@@ -3747,7 +3895,9 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     )
     expect(order).toEqual(['execute', 'cleanup', 'after'])
     expect(afterResults).toHaveLength(1)
-    expect(afterResults[0]?.details).toEqual({ error: 'execution failed' })
+    expect(afterResults[0]?.details).toEqual({
+      error: expect.stringContaining('[TypeClaw sandbox policy (LOCAL)'),
+    })
     await rm(agentDir, { recursive: true, force: true })
   })
 
