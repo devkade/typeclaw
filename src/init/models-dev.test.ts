@@ -186,6 +186,22 @@ describe('fetchModelOptions', () => {
     )
   })
 
+  test('survives a well-formed models.dev envelope carrying a malformed nested model', async () => {
+    // Only the root is shape-checked on fetch, so a valid envelope can still
+    // smuggle a null model. This used to escape the fallback and crash the
+    // whole wizard rather than degrading to the curated list.
+    const fetchImpl = routedFetch({
+      [MODELS_DEV_URL]: { openai: { models: { broken: null } } },
+      [OPENGATEWAY_CATALOG_URL]: new Error('gateway catalog down'),
+      [OPENGATEWAY_PRICES_URL]: new Error('gateway prices down'),
+    })
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    expect(result.options.length).toBeGreaterThan(0)
+    expect(result.options.some((o) => o.ref === 'opengateway/openai/gpt-5.4-nano')).toBe(true)
+  })
+
   test('maps gateway creator namespaces onto native provider ids when enriching limits', async () => {
     // The gateway says `x-ai`/`moonshotai` where this registry says `xai`/`moonshot`.
     // Neither OpenGateway endpoint publishes a context window, so a missed alias

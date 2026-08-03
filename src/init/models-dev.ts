@@ -140,9 +140,24 @@ export async function fetchModelOptions(
     fetchModelsDev(fetchImpl, timeoutMs),
     fetchOpenGatewayCatalog({ fetchImpl, timeoutMs }),
   ])
-  const baseOptions = modelsDev.status === 'live' ? mergeWithCurated(modelsDev.data) : curatedOptions()
+  // Composition is inside the guard because only the models.dev ROOT is shape-
+  // checked on fetch: a well-formed envelope can still carry a malformed nested
+  // model, and this function's contract is that `typeclaw init` keeps working
+  // on a fresh machine no matter what the network returns.
+  let baseOptions: ModelOption[]
+  let compositionWarning: string | undefined
+  try {
+    baseOptions = modelsDev.status === 'live' ? mergeWithCurated(modelsDev.data) : curatedOptions()
+  } catch (error) {
+    baseOptions = curatedOptions()
+    compositionWarning = `models.dev returned unusable data (${error instanceof Error ? error.message : String(error)})`
+  }
   const mergedOptions = mergeOpenGateway(baseOptions, openGateway.models)
-  const warnings = [...(modelsDev.status === 'unavailable' ? [modelsDev.warning] : []), ...openGateway.warnings]
+  const warnings = [
+    ...(modelsDev.status === 'unavailable' ? [modelsDev.warning] : []),
+    ...(compositionWarning !== undefined ? [compositionWarning] : []),
+    ...openGateway.warnings,
+  ]
   const warning = warnings.length > 0 ? warnings.join('; ') : undefined
   return {
     options: mergedOptions,
@@ -218,6 +233,7 @@ function mergeWithCurated(data: Record<string, ModelsDevProvider>): ModelOption[
     const upstream = upstreamProviderFor(data, providerId)
     const upstreamModels = upstream?.models ?? {}
     for (const [fallbackModelId, upstreamModel] of Object.entries(upstreamModels)) {
+      if (!isRecord(upstreamModel)) continue
       const modelId = upstreamModel.id ?? fallbackModelId
       if (modelId.trim().length === 0) continue
       const ref = `${providerId}/${modelId}`
