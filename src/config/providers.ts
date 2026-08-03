@@ -1036,6 +1036,178 @@ export const KNOWN_PROVIDERS = {
       },
     },
   },
+  // OpenGateway.ai (Sionic AI) — a multi-vendor LLM GATEWAY, not a lab. One
+  // OpenAI-compatible surface (Bearer + /chat/completions) fronts OpenAI,
+  // Anthropic, Google, Moonshot, MiniMax, DeepSeek, Z.AI, xAI, and Qwen, so by
+  // the granularity rule above it is ONE provider id: one endpoint, one wire
+  // transport, one key.
+  //
+  // Model ids are creator-qualified (`openai/gpt-5.5`, not `gpt-5.5`) — the
+  // namespace is mandatory upstream. TypeClaw refs therefore carry two slashes:
+  // `opengateway/anthropic/claude-sonnet-5`. That parses fine because
+  // `providerForModelRef()` matches on the registered provider prefix, the same
+  // mechanism that already handles the slash-heavy Fireworks router ids.
+  //
+  // Curation rule (why only six of the ~56 live chat models): every curated
+  // entry mirrors a model THIS registry already prices natively, so the numbers
+  // below are copied from a sibling entry rather than invented. Models with no
+  // in-repo price (google/*, qwen/*) and models whose native reasoning contract
+  // is NOT plain OpenAI `reasoning_effort` (deepseek's `thinking:{type}`,
+  // z-ai/qwen's `enable_thinking`) are deliberately left out: pi-ai picks
+  // thinkingFormat from the baseUrl, and `apis.opengateway.ai` resolves to
+  // "openai", so routing those here would silently send the wrong reasoning
+  // field. They all remain reachable as custom `opengateway/...` refs — curation
+  // only drives the picker, JSON-schema enum, and autocomplete.
+  //
+  // Costs are UPSTREAM LIST PRICES in USD per 1M tokens, pinned to the sibling
+  // entry by a guard test in providers.test.ts. OpenGateway bills upstream usage
+  // plus a platform fee and exposes no pricing in /v1/models, so `typeclaw usage`
+  // is an estimate that reads LOW against the real invoice. Do NOT "fix" these
+  // to zero: zero means "no attributable per-token charge" in this registry
+  // (flat-subscription products like the Fireworks Fire Pass router), and
+  // OpenGateway is metered. Replace with gateway-billed rates only if
+  // OpenGateway ever publishes them.
+  //
+  // Every model carries an explicit `compat` for the same reason Upstage does:
+  // pi-ai auto-detects compatibility from the baseUrl, and `apis.opengateway.ai`
+  // matches none of its known hosts, so it would otherwise assume a first-party
+  // OpenAI endpoint and send `store`, the `developer` role, `strict` tool
+  // schemas, and `max_completion_tokens` to a gateway fronting Anthropic and
+  // Moonshot. `supportsUsageInStreaming` is deliberately left unset (pi-ai
+  // defaults it true) — turning it off would break token and cost reporting.
+  opengateway: {
+    id: 'opengateway',
+    name: 'OpenGateway.ai',
+    baseUrl: 'https://apis.opengateway.ai/v1',
+    auth: ['api-key'],
+    apiKeyEnv: 'OPENGATEWAY_API_KEY',
+    oauthProviderId: null,
+    models: {
+      // Mirrors openai/gpt-5.4-nano.
+      'openai/gpt-5.4-nano': {
+        id: 'openai/gpt-5.4-nano',
+        name: 'GPT-5.4 nano',
+        api: 'openai-completions',
+        provider: 'opengateway',
+        baseUrl: 'https://apis.opengateway.ai/v1',
+        reasoning: true,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+        input: ['text', 'image'],
+        cost: { input: 0.2, output: 1.25, cacheRead: 0.02, cacheWrite: 0 },
+        contextWindow: 400000,
+        maxTokens: 128000,
+      },
+      // Mirrors openai/gpt-5.5.
+      'openai/gpt-5.5': {
+        id: 'openai/gpt-5.5',
+        name: 'GPT-5.5',
+        api: 'openai-completions',
+        provider: 'opengateway',
+        baseUrl: 'https://apis.opengateway.ai/v1',
+        reasoning: true,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+        input: ['text', 'image'],
+        cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+        contextWindow: 1050000,
+        maxTokens: 128000,
+      },
+      // Mirrors anthropic/claude-sonnet-5. Note the transport differs from the
+      // native entry: Anthropic is `anthropic-messages` first-party, but the
+      // gateway only speaks OpenAI chat-completions.
+      'anthropic/claude-sonnet-5': {
+        id: 'anthropic/claude-sonnet-5',
+        name: 'Claude Sonnet 5',
+        api: 'openai-completions',
+        provider: 'opengateway',
+        baseUrl: 'https://apis.opengateway.ai/v1',
+        reasoning: true,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+        input: ['text', 'image'],
+        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+        contextWindow: 1000000,
+        maxTokens: 128000,
+      },
+      // Mirrors anthropic/claude-opus-4-8.
+      'anthropic/claude-opus-4-8': {
+        id: 'anthropic/claude-opus-4-8',
+        name: 'Claude Opus 4.8',
+        api: 'openai-completions',
+        provider: 'opengateway',
+        baseUrl: 'https://apis.opengateway.ai/v1',
+        reasoning: true,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+        input: ['text', 'image'],
+        cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+        contextWindow: 1000000,
+        maxTokens: 128000,
+      },
+      // Mirrors moonshot/kimi-k2.6. The gateway namespaces Moonshot as
+      // `moonshotai`, so the id is NOT the native `kimi-k2.6`.
+      'moonshotai/kimi-k2.6': {
+        id: 'moonshotai/kimi-k2.6',
+        name: 'Kimi K2.6',
+        api: 'openai-completions',
+        provider: 'opengateway',
+        baseUrl: 'https://apis.opengateway.ai/v1',
+        reasoning: true,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+        input: ['text', 'image'],
+        cost: { input: 0.6, output: 2.5, cacheRead: 0.15, cacheWrite: 0 },
+        contextWindow: 256000,
+        maxTokens: 64000,
+      },
+      // Mirrors minimax/MiniMax-M3.
+      'minimax/MiniMax-M3': {
+        id: 'minimax/MiniMax-M3',
+        name: 'MiniMax M3',
+        api: 'openai-completions',
+        provider: 'opengateway',
+        baseUrl: 'https://apis.opengateway.ai/v1',
+        reasoning: true,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+        input: ['text', 'image'],
+        cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
+        contextWindow: 1000000,
+        maxTokens: 524288,
+      },
+    },
+  },
 } as const satisfies Record<string, KnownProvider>
 
 export type KnownProviderId = keyof typeof KNOWN_PROVIDERS
@@ -1122,6 +1294,13 @@ export const KNOWN_PROVIDER_VENDORS = {
       moonshot: { label: 'Pay-as-you-go', hint: 'Moonshot Open Platform API billing' },
       'moonshot-coding': { label: 'Coding Plan', hint: 'Kimi Code subscription' },
     },
+  },
+  // Listed last because it is a reseller, not a lab: a user who knows they want
+  // Anthropic should land on the Anthropic row, not the gateway that proxies it.
+  opengateway: {
+    id: 'opengateway',
+    name: 'OpenGateway.ai (multi-vendor gateway)',
+    providers: ['opengateway'],
   },
 } as const satisfies Record<string, KnownProviderVendor>
 

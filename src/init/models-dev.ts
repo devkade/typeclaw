@@ -16,7 +16,11 @@ const REQUEST_TIMEOUT_MS = 10_000
 // KnownProviderId. Specifically, they ship Fireworks under `fireworks-ai`.
 // This map is the single place that bridges the two namespaces; every other
 // helper in this file works in OUR namespace.
-const PROVIDER_TO_MODELS_DEV: Record<KnownProviderId, string> = {
+// `null` means "never merge upstream models into this provider". Reserved for
+// gateways whose ids are creator-qualified: models.dev lists bare ids like
+// `gpt-5.5`, but OpenGateway only accepts `openai/gpt-5.5`, so merging would
+// synthesize refs that pass `isModelRef()` and then 404 at request time.
+const PROVIDER_TO_MODELS_DEV: Record<KnownProviderId, string | null> = {
   openai: 'openai',
   // openai-codex models live under the `openai` namespace on models.dev too
   // (Codex is a backend, not a separate provider in their taxonomy). Curated
@@ -42,6 +46,16 @@ const PROVIDER_TO_MODELS_DEV: Record<KnownProviderId, string> = {
   // metadata under `moonshot`, so we route lookups there; the curated
   // `kimi-for-coding` alias is surfaced regardless of upstream membership.
   'moonshot-coding': 'moonshot',
+  opengateway: null,
+}
+
+function upstreamProviderFor(
+  data: Record<string, ModelsDevProvider>,
+  providerId: KnownProviderId,
+): ModelsDevProvider | undefined {
+  const modelsDevId = PROVIDER_TO_MODELS_DEV[providerId]
+  if (modelsDevId === null) return undefined
+  return data[modelsDevId]
 }
 
 export type ModelOption = {
@@ -156,7 +170,7 @@ function mergeWithCurated(data: Record<string, ModelsDevProvider>): ModelOption[
   const seen = new Set<string>()
   for (const providerId of Object.keys(KNOWN_PROVIDERS) as KnownProviderId[]) {
     const known = KNOWN_PROVIDERS[providerId]
-    const upstream = data[PROVIDER_TO_MODELS_DEV[providerId]]
+    const upstream = upstreamProviderFor(data, providerId)
     const upstreamModels = upstream?.models ?? {}
     for (const modelId of Object.keys(known.models)) {
       const upstreamModel = upstreamModels[modelId]
@@ -167,7 +181,7 @@ function mergeWithCurated(data: Record<string, ModelsDevProvider>): ModelOption[
   }
 
   for (const providerId of Object.keys(KNOWN_PROVIDERS) as KnownProviderId[]) {
-    const upstream = data[PROVIDER_TO_MODELS_DEV[providerId]]
+    const upstream = upstreamProviderFor(data, providerId)
     const upstreamModels = upstream?.models ?? {}
     for (const [fallbackModelId, upstreamModel] of Object.entries(upstreamModels)) {
       const modelId = upstreamModel.id ?? fallbackModelId

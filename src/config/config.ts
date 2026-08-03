@@ -839,6 +839,16 @@ export function resolveModel(ref: KnownModelRef | ModelRef | string): Model<Know
     provider: providerId,
     baseUrl: provider.baseUrl ?? template.baseUrl,
     api: template.api,
+    // Carried from the template for the same reason `api` and `baseUrl` are:
+    // it describes the PROVIDER's wire dialect, not the model. pi-ai infers
+    // compat from the baseUrl and only recognises first-party hosts, so a
+    // custom ref on a provider that pins compat (OpenGateway, Upstage) would
+    // otherwise fall back to OpenAI-native defaults and send `store`, the
+    // `developer` role, `strict` tool schemas and `max_completion_tokens` to
+    // an endpoint that never accepts them. `thinkingLevelMap` is deliberately
+    // NOT carried: it varies per model even within one provider, so copying
+    // the template's would be a guess.
+    ...(template.compat !== undefined ? { compat: template.compat } : {}),
     name: meta?.name ?? modelId,
     reasoning: meta?.reasoning ?? false,
     input: resolveCustomModelInput(meta?.input),

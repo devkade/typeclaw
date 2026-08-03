@@ -1,7 +1,20 @@
 import { effectiveBaseUrl } from '@/agent/model-overrides'
 import { KNOWN_PROVIDERS, type KnownProviderId } from '@/config/providers'
 
-const PROVIDER_PROBE: Partial<Record<KnownProviderId, { url: string; authHeader: 'bearer' | 'x-api-key' }>> = {
+// `successShape` is what a 200 must look like to count as a validated key.
+// Default `models-list` requires `{ data: [...] }`, which every /v1/models probe
+// below returns. `json-object` is the weaker check for probes that answer with a
+// bare object instead of a list — it still rejects the captive-portal HTML case
+// that motivated shape-checking in the first place.
+type ProbeSuccessShape = 'models-list' | 'json-object'
+
+type Probe = {
+  url: string
+  authHeader: 'bearer' | 'x-api-key'
+  successShape?: ProbeSuccessShape
+}
+
+const PROVIDER_PROBE: Partial<Record<KnownProviderId, Probe>> = {
   openai: { url: 'https://api.openai.com/v1/models', authHeader: 'bearer' },
   anthropic: { url: 'https://api.anthropic.com/v1/models', authHeader: 'x-api-key' },
   fireworks: { url: 'https://api.fireworks.ai/inference/v1/models', authHeader: 'bearer' },
@@ -13,6 +26,12 @@ const PROVIDER_PROBE: Partial<Record<KnownProviderId, { url: string; authHeader:
   upstage: { url: 'https://api.upstage.ai/v1/models', authHeader: 'bearer' },
   moonshot: { url: 'https://api.moonshot.ai/v1/models', authHeader: 'bearer' },
   'moonshot-coding': { url: 'https://api.kimi.com/coding/v1/models', authHeader: 'bearer' },
+  // NOT /v1/models: OpenGateway serves its catalog PUBLICLY (verified — HTTP 200
+  // with `{data:[...]}` for a missing key and for a garbage key), so probing it
+  // would hand back `ok` for any string the user pastes. That is worse than no
+  // validation, because init would vouch for a key that cannot complete a single
+  // request. /v1/me is the cheapest endpoint that actually 401s on a bad key.
+  opengateway: { url: 'https://apis.opengateway.ai/v1/me', authHeader: 'bearer', successShape: 'json-object' },
 }
 
 // When a base-URL override (ANTHROPIC_BASE_URL / OPENAI_BASE_URL) points at a
@@ -75,7 +94,7 @@ export async function validateApiKey(
       // Treat the response as "ok" only if it parses as the expected
       // JSON shape (`{ data: [...] }` for /v1/models on every probed
       // provider).
-      const shapeOk = await isModelsListShape(res)
+      const shapeOk = await hasExpectedShape(res, probe.successShape ?? 'models-list')
       if (shapeOk) return { kind: 'ok' }
       return { kind: 'skipped', reason: 'network-error', detail: 'unexpected response shape' }
     }
@@ -125,12 +144,14 @@ function isFireworksFirePassForbidden(body: string): boolean {
   }
 }
 
-async function isModelsListShape(res: Response): Promise<boolean> {
+async function hasExpectedShape(res: Response, shape: ProbeSuccessShape): Promise<boolean> {
   const text = await readCapped(res, MAX_BODY_BYTES)
   if (text === null) return false
   try {
     const parsed = JSON.parse(text) as unknown
-    return typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as { data?: unknown }).data)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false
+    if (shape === 'json-object') return true
+    return Array.isArray((parsed as { data?: unknown }).data)
   } catch {
     return false
   }
@@ -172,6 +193,7 @@ export const API_KEY_DASHBOARD_URL: Partial<Record<KnownProviderId, string>> = {
   upstage: 'https://console.upstage.ai/api-keys',
   moonshot: 'https://platform.moonshot.ai/console/api-keys',
   'moonshot-coding': 'https://www.kimi.com/code/console',
+  opengateway: 'https://opengateway.ai/docs/reference/guides/authentication',
 }
 
 // MiniMax sells the same `minimax` provider under two billing surfaces that

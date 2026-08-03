@@ -332,6 +332,117 @@ describe('KNOWN_PROVIDERS', () => {
       expect(model.api, `xai/${modelId} api drift`).toBe('openai-completions')
     }
   })
+
+  test('opengateway is a single api-key provider on the OpenAI-compatible gateway endpoint', () => {
+    const opengateway = KNOWN_PROVIDERS.opengateway
+    expect(opengateway.baseUrl).toBe('https://apis.opengateway.ai/v1')
+    expect(opengateway.apiKeyEnv).toBe('OPENGATEWAY_API_KEY')
+    expect(supportsApiKey(opengateway)).toBe(true)
+    expect(supportsOAuth(opengateway)).toBe(false)
+  })
+
+  test('every opengateway model uses the openai-completions api', () => {
+    // The gateway advertises a `responses` endpoint for some models, but this
+    // repo only wires its verified chat-completions surface; a second transport
+    // would be a separate provider id per the granularity rule.
+    for (const [modelId, model] of Object.entries(KNOWN_PROVIDERS.opengateway.models)) {
+      expect(model.api, `opengateway/${modelId} api drift`).toBe('openai-completions')
+    }
+  })
+
+  test('every opengateway model id is creator-qualified, as the gateway requires', () => {
+    for (const modelId of Object.keys(KNOWN_PROVIDERS.opengateway.models)) {
+      expect(modelId, `opengateway/${modelId} is missing its creator namespace`).toMatch(/^[a-z0-9-]+\/.+/)
+    }
+  })
+
+  test('opengateway model refs round-trip through providerForModelRef despite the second slash', () => {
+    for (const modelId of Object.keys(KNOWN_PROVIDERS.opengateway.models)) {
+      const ref = `opengateway/${modelId}`
+      expect(providerForModelRef(ref), `${ref} misrouted`).toBe('opengateway')
+      expect(isModelRef(ref), `${ref} rejected by isModelRef`).toBe(true)
+    }
+  })
+
+  test('every opengateway model pins compat, since pi-ai cannot auto-detect the gateway host', () => {
+    // Without this, pi-ai's baseUrl sniffing treats apis.opengateway.ai as a
+    // first-party OpenAI endpoint and sends `store`, the `developer` role,
+    // `strict` tool schemas, and max_completion_tokens through to Anthropic and
+    // Moonshot upstreams.
+    for (const [modelId, model] of Object.entries(KNOWN_PROVIDERS.opengateway.models)) {
+      const compat = (model as { compat?: Record<string, unknown> }).compat
+      expect(compat, `opengateway/${modelId} missing compat`).toBeDefined()
+      expect(compat!.supportsStore, `opengateway/${modelId} must not send store`).toBe(false)
+      expect(compat!.supportsDeveloperRole, `opengateway/${modelId} must not use the developer role`).toBe(false)
+      expect(compat!.supportsReasoningEffort, `opengateway/${modelId} must not send reasoning_effort`).toBe(false)
+      expect(compat!.supportsStrictMode, `opengateway/${modelId} must not send strict on tool defs`).toBe(false)
+      expect(compat!.maxTokensField, `opengateway/${modelId} must send max_tokens`).toBe('max_tokens')
+      // Left unset on purpose: pi-ai defaults it true and `typeclaw usage`
+      // needs streamed usage to attribute tokens.
+      expect(compat!.supportsUsageInStreaming, `opengateway/${modelId} must not pin streaming usage`).toBeUndefined()
+    }
+  })
+
+  test('no opengateway model declares a thinkingLevelMap', () => {
+    // supportsReasoningEffort is false, so a level map would advertise a
+    // control contract the gateway never receives.
+    for (const [modelId, model] of Object.entries(KNOWN_PROVIDERS.opengateway.models)) {
+      expect(
+        (model as { thinkingLevelMap?: unknown }).thinkingLevelMap,
+        `opengateway/${modelId} maps thinking levels it cannot send`,
+      ).toBeUndefined()
+    }
+  })
+
+  // OpenGateway publishes no pricing, so each curated entry copies the rate card
+  // of the sibling registry entry for the same underlying model. This pins that
+  // relationship: if the upstream entry is repriced, the gateway copy must move
+  // with it or this fails.
+  const OPENGATEWAY_UPSTREAM_SOURCE: Record<string, [KnownProviderId, string]> = {
+    'openai/gpt-5.4-nano': ['openai', 'gpt-5.4-nano'],
+    'openai/gpt-5.5': ['openai', 'gpt-5.5'],
+    'anthropic/claude-sonnet-5': ['anthropic', 'claude-sonnet-5'],
+    'anthropic/claude-opus-4-8': ['anthropic', 'claude-opus-4-8'],
+    'moonshotai/kimi-k2.6': ['moonshot', 'kimi-k2.6'],
+    'minimax/MiniMax-M3': ['minimax', 'MiniMax-M3'],
+  }
+
+  test('every opengateway model declares an upstream pricing source', () => {
+    expect(Object.keys(KNOWN_PROVIDERS.opengateway.models).sort()).toEqual(
+      Object.keys(OPENGATEWAY_UPSTREAM_SOURCE).sort(),
+    )
+  })
+
+  test('opengateway cost and limits mirror the native registry entry for the same model', () => {
+    type PricedModel = {
+      cost: Record<string, number>
+      contextWindow: number
+      maxTokens: number
+      input: ReadonlyArray<string>
+      reasoning?: boolean
+    }
+    const gatewayModels = KNOWN_PROVIDERS.opengateway.models as Record<string, PricedModel>
+    for (const [modelId, [upstreamProviderId, upstreamModelId]] of Object.entries(OPENGATEWAY_UPSTREAM_SOURCE)) {
+      const gateway = gatewayModels[modelId]!
+      const upstream = (KNOWN_PROVIDERS[upstreamProviderId].models as Record<string, PricedModel>)[upstreamModelId]
+      expect(upstream, `${upstreamProviderId}/${upstreamModelId} vanished`).toBeDefined()
+      expect(gateway.cost, `opengateway/${modelId} cost drifted from ${upstreamProviderId}/${upstreamModelId}`).toEqual(
+        upstream!.cost,
+      )
+      expect(gateway.contextWindow, `opengateway/${modelId} contextWindow drift`).toBe(upstream!.contextWindow)
+      expect(gateway.maxTokens, `opengateway/${modelId} maxTokens drift`).toBe(upstream!.maxTokens)
+      expect([...gateway.input], `opengateway/${modelId} input drift`).toEqual([...upstream!.input])
+      expect(gateway.reasoning, `opengateway/${modelId} reasoning drift`).toBe(upstream!.reasoning ?? false)
+    }
+  })
+
+  test('opengateway costs are non-zero, because the gateway is metered not flat-rate', () => {
+    for (const [modelId, model] of Object.entries(KNOWN_PROVIDERS.opengateway.models)) {
+      const cost = model.cost as { input: number; output: number }
+      expect(cost.input, `opengateway/${modelId} input cost must not be zeroed`).toBeGreaterThan(0)
+      expect(cost.output, `opengateway/${modelId} output cost must not be zeroed`).toBeGreaterThan(0)
+    }
+  })
 })
 
 describe('KNOWN_PROVIDER_VENDORS', () => {
@@ -411,6 +522,17 @@ describe('KNOWN_PROVIDER_VENDORS', () => {
   test('Upstage is a single-provider vendor (no variant step)', () => {
     expect(providerIdsForVendor('upstage')).toEqual(['upstage'])
     expect(vendorForProviderId('upstage')).toBe('upstage')
+  })
+
+  test('OpenGateway is a single-provider vendor listed after the labs it proxies', () => {
+    expect(providerIdsForVendor('opengateway')).toEqual(['opengateway'])
+    expect(vendorForProviderId('opengateway')).toBe('opengateway')
+    const vendorIds = listKnownProviderVendorIds()
+    expect(vendorIds[vendorIds.length - 1]).toBe('opengateway')
+  })
+
+  test('opengateway does not join the OpenAI family even though it proxies OpenAI models', () => {
+    expect(isOpenAiFamilyRef('opengateway/openai/gpt-5.5')).toBe(false)
   })
 
   test('Moonshot vendor splits paygo (moonshot) from Coding Plan (moonshot-coding)', () => {
