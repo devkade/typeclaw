@@ -11,9 +11,10 @@ import { posix } from 'node:path'
 //    consecutive detector cannot see, e.g. read(a)→edit(b)→read(a)→edit(b)…, or
 //    re-reading one file with drifting offsets. Over a sliding window of the
 //    last WINDOW_SIZE calls, if one signature recurs WINDOW_SOFT_WARN times it
-//    warns and WINDOW_HARD_BLOCK times it blocks. Path-bearing tools coarsen
-//    their signature to the path alone. Read calls additionally recognize one
-//    assistant tool batch and successfully-observed forward pagination so
+//    warns and WINDOW_HARD_BLOCK times it blocks. Path-only tools coarsen their
+//    signature to the path, while search tools retain the query as part of the
+//    target. Read and search calls additionally recognize one assistant tool
+//    batch, and reads recognize successfully-observed forward pagination, so
 //    productive inspection does not look like a reactive cycle.
 //
 // Both warn/block decisions carry the byte-identical or coarsened nudge text.
@@ -33,23 +34,25 @@ export const WINDOW_SIZE = 16
 export const WINDOW_SOFT_WARN = 4
 export const WINDOW_HARD_BLOCK = 6
 
-// Tools whose first path-like argument identifies the target. Their windowed
-// signature keys on that path alone so paging one file with drifting
-// offset/limit collapses to a single signature. Two classes, because the
-// builtins differ in whether the path is required:
+// Path-bearing tools need coarser window signatures so presentation-only args
+// cannot disguise repeated work. The target differs by tool class:
 //
 //   - REQUIRED-path tools (read/write/edit): path is mandatory. Coarsen only
 //     when a path key is present; an absent path is malformed input, not a
 //     default, so we must NOT collapse such calls to a shared target.
-//   - DEFAULT-path tools (grep/find/ls): path is OPTIONAL and defaults to the
-//     cwd ("."). Omitting the path and varying only non-target args (pattern,
-//     limit) still hits the same directory, so an omitted/empty path coarsens
-//     to `${tool}#path:.` — otherwise those calls would evade the detector.
+//   - DEFAULT-path tools (ls): path is OPTIONAL and defaults to the cwd (".").
+//     Omitting the path and varying only non-target args still hits the same
+//     directory, so an omitted/empty path coarsens to `${tool}#path:.` —
+//     otherwise those calls would evade the detector.
+//   - SEARCH-path tools (grep/find): path is also optional, but the pattern and
+//     matching controls are part of the research target. Different queries on
+//     one large file are legitimate fan-out, not repeated work.
 //
 // `glob` is intentionally absent: pi-coding-agent has no `glob` builtin (the
 // glob-pattern arg lives inside grep/find), so listing it here matched nothing.
 const REQUIRED_PATH_TOOLS = new Set(['read', 'write', 'edit'])
-const DEFAULT_PATH_TOOLS = new Set(['grep', 'find', 'ls'])
+const DEFAULT_PATH_TOOLS = new Set(['ls'])
+const SEARCH_PATH_TOOLS = new Set(['grep', 'find'])
 const PATH_ARG_KEYS = ['path', 'file', 'filePath', 'filename']
 const DEFAULT_PATH_TARGET = '.'
 
@@ -116,7 +119,7 @@ export type LoopGuard = {
   // Undoes the one observation a prior `check` recorded, identified by its
   // receipt. Pops that signature from the windowed history and, when the
   // current consecutive streak is the call this receipt named, rewinds the
-  // streak by one. Suppressed same-batch read receipts are explicit no-ops so
+  // streak by one. Suppressed same-batch target receipts are explicit no-ops so
   // parallel sibling completion cannot retract the recorded observation. Used
   // post-execution for a
   // `subagent_output` poll that returned `status: 'running'` — a still-pending
@@ -147,11 +150,11 @@ type SessionState = {
   // A block on such a signature is enforced pre-execute (not deferred), so a
   // completed task is not re-polled forever just to re-learn it is done.
   termKnown: Set<string>
-  // A model turn may emit several tool calls in one assistant message. Those
-  // calls cannot react to one another's results, so same-path reads in that
-  // batch count as one loop observation rather than a reactive cycle.
-  readTurnId: number | undefined
-  readPathsThisTurn: Set<string>
+  // Parallel research siblings cannot react to one another's results. Counting
+  // a duplicated target within that batch toward a session-aborting threshold
+  // gives the model no chance to heed the warning and choose another approach.
+  targetTurnId: number | undefined
+  targetsThisTurn: Set<string>
   // Observed contiguous line progress per recently-read canonical path.
   // Suppressed siblings may wait here for earlier siblings to complete, but
   // only exact adjacency advances the frontier.
@@ -263,20 +266,22 @@ export function createLoopGuard(options: CreateLoopGuardOptions = {}): LoopGuard
         window: [],
         windowWarned: new Set(),
         termKnown: new Set(),
-        readTurnId: undefined,
-        readPathsThisTurn: new Set(),
+        targetTurnId: undefined,
+        targetsThisTurn: new Set(),
         readFrontiers: new Map(),
       }
 
       const readTarget = parseReadTarget(tool, args, context?.cwd)
       const readPage = parseReadPage(tool, args, context?.cwd)
-      if (readTarget !== undefined && context?.turnId !== undefined) {
-        if (readPathSeenThisTurn(state, readTarget.path, context.turnId, windowSize)) {
+      const turnTarget =
+        readTarget !== undefined ? readPathSignature(readTarget.path) : makeSearchTargetSignature(tool, args)
+      if (turnTarget !== undefined && context?.turnId !== undefined) {
+        if (targetSeenThisTurn(state, turnTarget, context.turnId, windowSize)) {
           const receipt: LoopGuardReceipt = {
             sessionId,
             tool,
             signature,
-            windowSignature: readPathSignature(readTarget.path),
+            windowSignature: turnTarget,
             recorded: false,
             ...(readPage !== undefined ? { readPage } : {}),
           }
@@ -348,11 +353,11 @@ export function createLoopGuard(options: CreateLoopGuardOptions = {}): LoopGuard
       for (const sig of state.termKnown) {
         if (signatureBelongsToTool(sig, tool)) state.termKnown.delete(sig)
       }
-      if (tool === 'read') {
-        state.readTurnId = undefined
-        state.readPathsThisTurn.clear()
-        state.readFrontiers.clear()
+      for (const target of state.targetsThisTurn) {
+        if (signatureBelongsToTool(target, tool)) state.targetsThisTurn.delete(target)
       }
+      if (state.targetsThisTurn.size === 0) state.targetTurnId = undefined
+      if (tool === 'read') state.readFrontiers.clear()
     },
     retract(receipt) {
       if (!receipt.recorded) return
@@ -449,10 +454,10 @@ function makeCallSignature(tool: string, args: unknown): string {
   }
 }
 
-// Coarsened signature for windowed detection: path-bearing tools key on their
-// target path alone so re-reading one target with drifting non-path args
-// collapses to a single signature. All other tools fall back to the exact
-// signature.
+// Coarsened signature for windowed detection: path-only tools key on their
+// target path, while searches keep semantic query arguments so parallel
+// investigation of one large file does not look like repeated work. All other
+// tools fall back to the exact signature.
 function makeWindowSignature(tool: string, args: unknown, state: SessionState, cwd: string | undefined): string {
   const readPage = parseReadPage(tool, args, cwd)
   if (readPage !== undefined) {
@@ -462,6 +467,10 @@ function makeWindowSignature(tool: string, args: unknown, state: SessionState, c
       ? `${coarse}#frontier:${readPage.offset}`
       : coarse
   }
+
+  const searchTarget = makeSearchTargetSignature(tool, args)
+  if (searchTarget !== undefined) return searchTarget
+  if (SEARCH_PATH_TOOLS.has(tool)) return makeCallSignature(tool, args)
 
   const isRequiredPath = REQUIRED_PATH_TOOLS.has(tool)
   const isDefaultPath = DEFAULT_PATH_TOOLS.has(tool)
@@ -512,18 +521,39 @@ function readPathSignature(path: string): string {
   return `read#path:${path}`
 }
 
-function readPathSeenThisTurn(state: SessionState, path: string, turnId: number, maxReadPaths: number): boolean {
-  if (state.readTurnId !== turnId) {
-    state.readTurnId = turnId
-    state.readPathsThisTurn.clear()
+function makeSearchTargetSignature(tool: string, args: unknown): string | undefined {
+  if (!SEARCH_PATH_TOOLS.has(tool) || args === null || typeof args !== 'object') return undefined
+  const record = args as Record<string, unknown>
+  const { pattern } = record
+  if (typeof pattern !== 'string') return undefined
+
+  const path = PATH_ARG_KEYS.map((key) => record[key]).find(
+    (value): value is string => typeof value === 'string' && value.length > 0,
+  )
+  const query =
+    tool === 'grep'
+      ? {
+          pattern,
+          ...(typeof record.glob === 'string' && record.glob.length > 0 ? { glob: record.glob } : {}),
+          ...(record.ignoreCase === true ? { ignoreCase: true } : {}),
+          ...(record.literal === true ? { literal: true } : {}),
+        }
+      : { pattern }
+  return `${tool}#search:${stableStringify({ path: path ?? DEFAULT_PATH_TARGET, query })}`
+}
+
+function targetSeenThisTurn(state: SessionState, target: string, turnId: number, maxTargets: number): boolean {
+  if (state.targetTurnId !== turnId) {
+    state.targetTurnId = turnId
+    state.targetsThisTurn.clear()
   }
-  const seen = state.readPathsThisTurn.has(path)
-  if (seen) state.readPathsThisTurn.delete(path)
-  state.readPathsThisTurn.add(path)
-  while (state.readPathsThisTurn.size > maxReadPaths) {
-    const oldest = state.readPathsThisTurn.values().next().value
+  const seen = state.targetsThisTurn.has(target)
+  if (seen) state.targetsThisTurn.delete(target)
+  state.targetsThisTurn.add(target)
+  while (state.targetsThisTurn.size > maxTargets) {
+    const oldest = state.targetsThisTurn.values().next().value
     if (oldest === undefined) break
-    state.readPathsThisTurn.delete(oldest)
+    state.targetsThisTurn.delete(oldest)
   }
   return seen
 }
