@@ -26,38 +26,6 @@ export class SandboxPolicyError extends Error {
   }
 }
 
-// Raised when model-driven bash invokes an agent-messenger CLI. TypeClaw never
-// brokers those reusable auth profiles (resolvePrivilegedSandboxRuntime) AND
-// masks the whole `workspace/.agent-messenger` directory, so the CLI can never
-// authenticate here — every platform resolves credentials from a
-// `<platform>-credentials.json` file, never from the environment.
-//
-// The refusal MUST announce itself. A silent one lets the uncredentialed CLI
-// print its own "No current workspace set. Run `auth extract` first.", which the
-// model reads as a fact about the WORLD — and it will then tell a human the
-// runtime has no workspace authentication, laundering a local policy decision
-// into a false claim about the upstream service. The CLI is honest about ITS
-// state; it has no way to know it was deliberately deprived.
-//
-// Hence the message states its own provenance: what was withheld, that the
-// decision is local, that retrying cannot help, and which mediated tool does
-// work. The last part is load-bearing — a dead end the model cannot route
-// around produces exactly the confabulation this class exists to prevent.
-export class SandboxCredentialWithheldError extends Error {
-  override readonly name = 'SandboxCredentialWithheldError'
-  constructor(executable: string) {
-    super(
-      `credential withheld by TypeClaw policy: \`${executable}\` cannot authenticate in model-driven bash. ` +
-        'TypeClaw never brokers an agent-messenger auth profile to a model-controlled child (the CLI can upload ' +
-        'arbitrary files, so a brokered credential would make it a confused deputy), and its credential directory ' +
-        'is masked. This is a LOCAL sandbox policy decision. It is NOT evidence that the workspace, account, or ' +
-        'upstream service lacks authentication — do not report it as such. Retrying, running `auth extract`, or ' +
-        'switching package runner will not change it. Use the mediated channel_* tools instead (channel_read, ' +
-        'channel_history, channel_send), which run inside TypeClaw with the configured channel credential.',
-    )
-  }
-}
-
 // Raised when the /proc strategy degraded to the empty `tmpfs` fallback AND the
 // command needs a real /proc (bunx / bun run that reads the
 // kernel-backed /proc/self/{fd,maps}). Without this pre-check Bun aborts deep in
