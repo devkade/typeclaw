@@ -60,6 +60,32 @@ describe('re-review stranding guard', () => {
     expect(decision.block).toBe(true)
   })
 
+  it('allows a mixed verdict that keeps the thread open while the bot still blocks the PR', async () => {
+    const decision = await evaluateRereviewGuard(
+      input({
+        wantsResolve: false,
+        text:
+          'Verified: the original status-send latch issue is fixed at `2290b80`. ' +
+          'I can’t resolve this thread yet because the PR still has a blocking issue in the recovered-final-prose path.',
+        getReviewState: stateOk(true),
+      }),
+    )
+
+    expect(decision).toEqual({ block: false })
+  })
+
+  it('still blocks a genuine close-out while the bot holds a live CHANGES_REQUESTED', async () => {
+    const decision = await evaluateRereviewGuard(
+      input({
+        wantsResolve: false,
+        text: 'Verified, all fixed. Resolving this thread.',
+        getReviewState: stateOk(true),
+      }),
+    )
+
+    expect(decision.block).toBe(true)
+  })
+
   it('does not fire on ordinary discussion replies', async () => {
     let queried = false
     const decision = await evaluateRereviewGuard(

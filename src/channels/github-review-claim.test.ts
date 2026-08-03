@@ -2,6 +2,12 @@ import { describe, expect, test } from 'bun:test'
 
 import { classifyReviewClaim, isPositiveWarnCloseout, type ReviewClaim } from './github-review-claim'
 
+const PRODUCTION_FIXED_SEGMENT = 'Verified: the original status-send latch issue is fixed at `2290b80`.'
+const PRODUCTION_HOLD_OPEN_SEGMENT =
+  'I can’t resolve this thread yet because the PR still has a blocking issue in the recovered-final-prose path.'
+const PRODUCTION_KEEP_OPEN_SEGMENT =
+  'Keeping this thread open while the remaining recovery-path blocker is addressed, so the PR can receive one clean re-review verdict afterward.'
+
 const cases: ReadonlyArray<[string, ReviewClaim]> = [
   ['Approved!', 'block-approve'],
   ['**Approved** — nice work', 'block-approve'],
@@ -22,6 +28,7 @@ const cases: ReadonlyArray<[string, ReviewClaim]> = [
   ['That resolves it — closing this out.', 'block-resolve'],
   ['Verified — that closes it, thanks!', 'block-resolve'],
   ['Confirmed fixed.', 'block-resolve'],
+  [PRODUCTION_FIXED_SEGMENT, 'block-resolve'],
 
   // warn: soft signals, allowed through with a nudge
   ['LGTM', 'warn'],
@@ -46,6 +53,7 @@ const cases: ReadonlyArray<[string, ReviewClaim]> = [
   ['Who approved this?', 'ignore'],
   ['The pre-approved template text is unrelated.', 'ignore'],
   ['I confirmed the issue is not resolved yet.', 'ignore'],
+  [PRODUCTION_HOLD_OPEN_SEGMENT, 'ignore'],
   ['Can you clarify the second point?', 'ignore'],
   ['', 'ignore'],
 
@@ -59,6 +67,7 @@ const cases: ReadonlyArray<[string, ReviewClaim]> = [
   // A bare `to address` clause must NOT demote a hard claim in the same sentence (PR #675).
   ['Approved — thanks for updating the docs to address my feedback.', 'block-approve'],
   ['Requesting changes; please update the tests to address the leak.', 'block-request-changes'],
+  [PRODUCTION_KEEP_OPEN_SEGMENT, 'warn'],
 ]
 
 describe('classifyReviewClaim', () => {
@@ -82,6 +91,42 @@ describe('classifyReviewClaim', () => {
   test('separate non-negated sentence can still carry the receipt', () => {
     expect(classifyReviewClaim("I didn't approve the previous revision. This one is approved.")).toBe('block-approve')
     expect(classifyReviewClaim("I haven't approved yet. LGTM on the current diff.")).toBe('warn')
+  })
+
+  test('lets a later refusal to close the thread veto an earlier resolved finding', () => {
+    const text = `${PRODUCTION_FIXED_SEGMENT} ${PRODUCTION_HOLD_OPEN_SEGMENT}`
+
+    expect(classifyReviewClaim(text)).not.toBe('block-resolve')
+    expect(isPositiveWarnCloseout(text)).toBe(false)
+  })
+
+  test.each([
+    ['Verified: the original issue is fixed. One issue remains.'],
+    ['Verified: the original issue is fixed. 하지만 차단 문제가 남아 있어 이 스레드는 열어 둡니다.'],
+  ])('applies the hold-open veto across the whole multilingual reply: %p', (text) => {
+    expect(classifyReviewClaim(text)).not.toBe('block-resolve')
+    expect(isPositiveWarnCloseout(text)).toBe(false)
+  })
+
+  test('does not let a hold-open marker veto a formal approval receipt', () => {
+    expect(classifyReviewClaim('Approved. One minor issue remains.')).toBe('block-approve')
+    expect(classifyReviewClaim('Requesting changes. One issue remains.')).toBe('block-request-changes')
+  })
+
+  test.each([
+    ['The issue remained, but it is now fixed. Resolving this thread.'],
+    ['One concern remained and has been addressed. Closing this out.'],
+    ["Confirmed fixed. The issue that remained is now fixed, so I'm closing this out."],
+    ['問題が残っていたが、今は修正済みです。 Confirmed fixed. Closing this out.'],
+  ])('keeps completed remnant history in the close-out tier: %p', (text) => {
+    expect(classifyReviewClaim(text)).toBe('block-resolve')
+  })
+
+  test('still vetoes a close-out when present work remains and the thread stays open', () => {
+    const text = 'Confirmed fixed. One issue remains. Keeping this thread open.'
+
+    expect(classifyReviewClaim(text)).not.toBe('block-resolve')
+    expect(isPositiveWarnCloseout(text)).toBe(false)
   })
 })
 
@@ -164,4 +209,8 @@ describe('isPositiveWarnCloseout', () => {
       expect(isPositiveWarnCloseout(text)).toBe(false)
     },
   )
+
+  test('treats keeping the thread open as negative despite neighbouring positive-closeout words', () => {
+    expect(isPositiveWarnCloseout(PRODUCTION_KEEP_OPEN_SEGMENT)).toBe(false)
+  })
 })
