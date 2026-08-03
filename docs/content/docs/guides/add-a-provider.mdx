@@ -23,9 +23,25 @@ typeclaw provider add xai --key xai-...        # xAI (Grok) — also supports --
 typeclaw provider add minimax --key ...        # pay-as-you-go API key or Token Plan key (sk-cp-…)
 typeclaw provider add deepseek --key sk-...     # DeepSeek pay-as-you-go
 typeclaw provider add upstage --key up_...      # Upstage (Solar) pay-as-you-go
+typeclaw provider add moonshot --key sk-...     # Moonshot (Kimi) Open Platform pay-as-you-go
+typeclaw provider add moonshot-coding --key ... # Moonshot Kimi Code subscription
+typeclaw provider add opengateway --key ...     # OpenGateway.ai — one key, many vendors
 ```
 
-The supported providers are `openai`, `openai-codex`, `anthropic`, `fireworks`, `zai`, `zai-coding`, `xai`, `minimax`, `deepseek`, and `upstage`. The key (or browser login) is stored in `secrets.json`, git-ignored like the rest of your credentials.
+The supported providers are `openai`, `openai-codex`, `anthropic`, `fireworks`, `zai`, `zai-coding`, `xai`, `minimax`, `deepseek`, `upstage`, `moonshot`, `moonshot-coding`, and `opengateway`. The key (or browser login) is stored in `secrets.json`, git-ignored like the rest of your credentials.
+
+<Callout type="info" title="OpenGateway: one key, many vendors">
+  `opengateway` is a **gateway**, not a lab: a single OpenAI-compatible endpoint that routes to OpenAI, Anthropic,
+  Moonshot, MiniMax, and more, so one `OPENGATEWAY_API_KEY` reaches all of them. Its model ids are creator-qualified,
+  which means a TypeClaw ref carries two slashes — `opengateway/anthropic/claude-sonnet-5`, not
+  `opengateway/claude-sonnet-5`.
+
+Two caveats. Costs reported by `typeclaw usage` are **upstream list-price estimates**: OpenGateway bills upstream
+usage plus a platform fee and publishes no rate card, so your invoice will read higher. And `typeclaw model list
+  --available` shows only the curated models — any other id from OpenGateway's catalog still works if you set it by
+hand, e.g. `typeclaw model set default opengateway/google/gemini-3.5-flash`.
+
+</Callout>
 
 <Callout type="info" title="MiniMax: pay-as-you-go or Token Plan">
   MiniMax sells one `minimax` provider under two billing surfaces — pay-as-you-go API keys and Token Plan Subscription
