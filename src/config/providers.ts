@@ -1048,25 +1048,13 @@ export const KNOWN_PROVIDERS = {
   // `providerForModelRef()` matches on the registered provider prefix, the same
   // mechanism that already handles the slash-heavy Fireworks router ids.
   //
-  // Curation rule (why only six of the ~56 live chat models): every curated
-  // entry mirrors a model THIS registry already prices natively, so the numbers
-  // below are copied from a sibling entry rather than invented. Models with no
-  // in-repo price (google/*, qwen/*) and models whose native reasoning contract
-  // is NOT plain OpenAI `reasoning_effort` (deepseek's `thinking:{type}`,
-  // z-ai/qwen's `enable_thinking`) are deliberately left out: pi-ai picks
-  // thinkingFormat from the baseUrl, and `apis.opengateway.ai` resolves to
-  // "openai", so routing those here would silently send the wrong reasoning
-  // field. They all remain reachable as custom `opengateway/...` refs — curation
-  // only drives the picker, JSON-schema enum, and autocomplete.
-  //
-  // Costs are UPSTREAM LIST PRICES in USD per 1M tokens, pinned to the sibling
-  // entry by a guard test in providers.test.ts. OpenGateway bills upstream usage
-  // plus a platform fee and exposes no pricing in /v1/models, so `typeclaw usage`
-  // is an estimate that reads LOW against the real invoice. Do NOT "fix" these
-  // to zero: zero means "no attributable per-token charge" in this registry
-  // (flat-subscription products like the Fireworks Fire Pass router), and
-  // OpenGateway is metered. Replace with gateway-billed rates only if
-  // OpenGateway ever publishes them.
+  // The live picker gets ids and modalities from OpenGateway's public catalog,
+  // then best-effort joins its rate card. This registry intentionally keeps one
+  // anchor only: `resolveModel()` uses `Object.keys(provider.models)[0]` as the
+  // transport/limits template for every uncurated ref, so entries 2..N buy
+  // nothing. An empty map would make custom refs throw, making one the true
+  // floor. Nano is the cheapest conservative context/limit donor and keeps
+  // `curatedOptions()` useful as the offline fallback.
   //
   // Every model carries an explicit `compat` for the same reason Upstage does:
   // pi-ai auto-detects compatibility from the baseUrl, and `apis.opengateway.ai`
@@ -1083,7 +1071,6 @@ export const KNOWN_PROVIDERS = {
     apiKeyEnv: 'OPENGATEWAY_API_KEY',
     oauthProviderId: null,
     models: {
-      // Mirrors openai/gpt-5.4-nano.
       'openai/gpt-5.4-nano': {
         id: 'openai/gpt-5.4-nano',
         name: 'GPT-5.4 nano',
@@ -1099,112 +1086,14 @@ export const KNOWN_PROVIDERS = {
           maxTokensField: 'max_tokens',
         },
         input: ['text', 'image'],
+        // Offline snapshot of OpenGateway's published rate for this model, NOT
+        // the upstream OpenAI list price. Every other model is priced live from
+        // the rate card, so this is the one number that can go stale; it is the
+        // fallback used when the card is unreachable. Re-check it against
+        // https://opengateway.ai/api/model-prices if you touch it.
         cost: { input: 0.2, output: 1.25, cacheRead: 0.02, cacheWrite: 0 },
         contextWindow: 400000,
         maxTokens: 128000,
-      },
-      // Mirrors openai/gpt-5.5.
-      'openai/gpt-5.5': {
-        id: 'openai/gpt-5.5',
-        name: 'GPT-5.5',
-        api: 'openai-completions',
-        provider: 'opengateway',
-        baseUrl: 'https://apis.opengateway.ai/v1',
-        reasoning: true,
-        compat: {
-          supportsStore: false,
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-          supportsStrictMode: false,
-          maxTokensField: 'max_tokens',
-        },
-        input: ['text', 'image'],
-        cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
-        contextWindow: 1050000,
-        maxTokens: 128000,
-      },
-      // Mirrors anthropic/claude-sonnet-5. Note the transport differs from the
-      // native entry: Anthropic is `anthropic-messages` first-party, but the
-      // gateway only speaks OpenAI chat-completions.
-      'anthropic/claude-sonnet-5': {
-        id: 'anthropic/claude-sonnet-5',
-        name: 'Claude Sonnet 5',
-        api: 'openai-completions',
-        provider: 'opengateway',
-        baseUrl: 'https://apis.opengateway.ai/v1',
-        reasoning: true,
-        compat: {
-          supportsStore: false,
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-          supportsStrictMode: false,
-          maxTokensField: 'max_tokens',
-        },
-        input: ['text', 'image'],
-        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-        contextWindow: 1000000,
-        maxTokens: 128000,
-      },
-      // Mirrors anthropic/claude-opus-4-8.
-      'anthropic/claude-opus-4-8': {
-        id: 'anthropic/claude-opus-4-8',
-        name: 'Claude Opus 4.8',
-        api: 'openai-completions',
-        provider: 'opengateway',
-        baseUrl: 'https://apis.opengateway.ai/v1',
-        reasoning: true,
-        compat: {
-          supportsStore: false,
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-          supportsStrictMode: false,
-          maxTokensField: 'max_tokens',
-        },
-        input: ['text', 'image'],
-        cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-        contextWindow: 1000000,
-        maxTokens: 128000,
-      },
-      // Mirrors moonshot/kimi-k2.6. The gateway namespaces Moonshot as
-      // `moonshotai`, so the id is NOT the native `kimi-k2.6`.
-      'moonshotai/kimi-k2.6': {
-        id: 'moonshotai/kimi-k2.6',
-        name: 'Kimi K2.6',
-        api: 'openai-completions',
-        provider: 'opengateway',
-        baseUrl: 'https://apis.opengateway.ai/v1',
-        reasoning: true,
-        compat: {
-          supportsStore: false,
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-          supportsStrictMode: false,
-          maxTokensField: 'max_tokens',
-        },
-        input: ['text', 'image'],
-        cost: { input: 0.6, output: 2.5, cacheRead: 0.15, cacheWrite: 0 },
-        contextWindow: 256000,
-        maxTokens: 64000,
-      },
-      // Mirrors minimax/MiniMax-M3.
-      'minimax/MiniMax-M3': {
-        id: 'minimax/MiniMax-M3',
-        name: 'MiniMax M3',
-        api: 'openai-completions',
-        provider: 'opengateway',
-        baseUrl: 'https://apis.opengateway.ai/v1',
-        reasoning: true,
-        compat: {
-          supportsStore: false,
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-          supportsStrictMode: false,
-          maxTokensField: 'max_tokens',
-        },
-        input: ['text', 'image'],
-        cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
-        contextWindow: 1000000,
-        maxTokens: 524288,
       },
     },
   },

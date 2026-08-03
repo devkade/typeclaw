@@ -32,7 +32,7 @@ import {
   withDefaultPlugins,
   type Models,
 } from './config'
-import { isModelRef, type ModelRef } from './providers'
+import { isModelRef, KNOWN_PROVIDERS, type ModelRef } from './providers'
 
 const isRoot = typeof process.getuid === 'function' && process.getuid() === 0
 const onWindows = isWindows()
@@ -246,6 +246,22 @@ describe('resolveModel', () => {
     })
     expect(model.contextWindow).toBe(400000)
     expect(model.maxTokens).toBe(128000)
+  })
+
+  test('a formerly static OpenGateway ref still parses and resolves through the anchor transport', () => {
+    const ref = 'opengateway/anthropic/claude-opus-4-8'
+    const parsed = configSchema.parse({ models: { default: ref } })
+    const model = resolveModel(parsed.models.default.refs[0]!)
+
+    expect(model).toMatchObject({
+      id: 'anthropic/claude-opus-4-8',
+      provider: 'opengateway',
+      api: 'openai-completions',
+      baseUrl: 'https://apis.opengateway.ai/v1',
+      contextWindow: 400000,
+      maxTokens: 128000,
+    })
+    expect(model.compat).toEqual(KNOWN_PROVIDERS.opengateway.models['openai/gpt-5.4-nano'].compat)
   })
 
   test('uses customModels metadata when synthesizing a custom model', async () => {

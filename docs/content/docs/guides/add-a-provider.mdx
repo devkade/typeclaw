@@ -36,10 +36,10 @@ The supported providers are `openai`, `openai-codex`, `anthropic`, `fireworks`, 
   which means a TypeClaw ref carries two slashes — `opengateway/anthropic/claude-sonnet-5`, not
   `opengateway/claude-sonnet-5`.
 
-Two caveats. Costs reported by `typeclaw usage` are **upstream list-price estimates**: OpenGateway bills upstream
-usage plus a platform fee and publishes no rate card, so your invoice will read higher. And `typeclaw model list
-  --available` shows only the curated models — any other id from OpenGateway's catalog still works if you set it by
-hand, e.g. `typeclaw model set default opengateway/google/gemini-3.5-flash`.
+`typeclaw model list --available` fetches OpenGateway's own public catalog, so newly available chat models appear
+without waiting for a TypeClaw release. TypeClaw also consumes OpenGateway's live per-model rates for `typeclaw usage`.
+The rate card is best-effort: if it is temporarily unavailable, the models still appear and their cost remains unknown
+until pricing can be fetched again.
 
 </Callout>
 

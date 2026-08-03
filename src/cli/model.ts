@@ -541,15 +541,18 @@ function describeRef(ref: string): string {
 }
 
 async function printAvailableRefs(): Promise<void> {
-  const { options, source, warning } = await fetchModelOptions()
+  const { options, sources, warnings } = await fetchModelOptions()
   if (options.length === 0) {
     console.log(c.dim('No models registered.'))
     return
   }
   console.log(c.dim('Use `typeclaw model set <profile> <ref>` to apply.'))
-  if (source === 'curated' && warning !== undefined) {
-    console.log(c.dim(`Using built-in catalog (models.dev unavailable: ${warning}).`))
+  if (sources.modelsDev === 'unavailable') console.log(c.dim('Using built-in models for native providers.'))
+  if (sources.openGatewayCatalog === 'unavailable') console.log(c.dim('Using the built-in OpenGateway anchor.'))
+  else if (sources.openGatewayPrices === 'unavailable') {
+    console.log(c.dim('OpenGateway models loaded without live pricing.'))
   }
+  if (warnings.length > 0) console.log(c.dim(`Catalog warnings: ${warnings.join('; ')}`))
   for (const providerId of Object.keys(KNOWN_PROVIDERS) as KnownProviderId[]) {
     const providerOptions = options.filter((option) => option.providerId === providerId)
     if (providerOptions.length === 0) continue

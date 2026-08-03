@@ -9,6 +9,8 @@ import {
   type ModelRef,
 } from '@/config/providers'
 
+import { fetchOpenGatewayCatalog, type OpenGatewayModel } from './opengateway-catalog'
+
 const MODELS_DEV_URL = 'https://models.dev/api.json'
 const REQUEST_TIMEOUT_MS = 10_000
 
@@ -113,12 +115,17 @@ type ModelsDevProvider = {
 export type FetchModelsResult = {
   options: ModelOption[]
   source: 'models.dev' | 'curated'
+  sources: {
+    modelsDev: 'live' | 'unavailable'
+    openGatewayCatalog: 'live' | 'unavailable'
+    openGatewayPrices: 'live' | 'unavailable'
+  }
+  warnings: string[]
   warning?: string
 }
 
-// Pulls the live model catalog from models.dev, intersects it with our
-// curated KNOWN_PROVIDERS allowlist, and returns one ModelOption per
-// (provider, model) pair the user is allowed to pick at init time.
+// Pulls live catalogs from models.dev and OpenGateway, keeps every curated
+// entry, and appends non-curated models whose provider refs TypeClaw can route.
 //
 // Falls back to the curated list alone if the network is unreachable, the
 // response is malformed, or any unexpected error fires — the wizard MUST
@@ -129,16 +136,43 @@ export async function fetchModelOptions(
 ): Promise<FetchModelsResult> {
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS
+  const [modelsDev, openGateway] = await Promise.all([
+    fetchModelsDev(fetchImpl, timeoutMs),
+    fetchOpenGatewayCatalog({ fetchImpl, timeoutMs }),
+  ])
+  const baseOptions = modelsDev.status === 'live' ? mergeWithCurated(modelsDev.data) : curatedOptions()
+  const mergedOptions = mergeOpenGateway(baseOptions, openGateway.models)
+  const warnings = [...(modelsDev.status === 'unavailable' ? [modelsDev.warning] : []), ...openGateway.warnings]
+  const warning = warnings.length > 0 ? warnings.join('; ') : undefined
+  return {
+    options: mergedOptions,
+    source: modelsDev.status === 'live' ? 'models.dev' : 'curated',
+    sources: {
+      modelsDev: modelsDev.status,
+      openGatewayCatalog: openGateway.catalog,
+      openGatewayPrices: openGateway.prices,
+    },
+    warnings,
+    ...(warning !== undefined ? { warning } : {}),
+  }
+}
+
+type ModelsDevResult =
+  | { status: 'live'; data: Record<string, ModelsDevProvider> }
+  | { status: 'unavailable'; warning: string }
+
+async function fetchModelsDev(fetchImpl: typeof fetch, timeoutMs: number): Promise<ModelsDevResult> {
   try {
     const res = await fetchImpl(MODELS_DEV_URL, { signal: AbortSignal.timeout(timeoutMs) })
     if (!res.ok) {
-      return { options: curatedOptions(), source: 'curated', warning: `models.dev returned ${res.status}` }
+      return { status: 'unavailable', warning: `models.dev returned ${res.status}` }
     }
-    const data = (await res.json()) as Record<string, ModelsDevProvider>
-    return { options: mergeWithCurated(data), source: 'models.dev' }
+    const data: unknown = await res.json()
+    if (!isRecord(data)) return { status: 'unavailable', warning: 'models.dev returned malformed JSON' }
+    return { status: 'live', data: data as Record<string, ModelsDevProvider> }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
-    return { options: curatedOptions(), source: 'curated', warning: reason }
+    return { status: 'unavailable', warning: reason }
   }
 }
 
@@ -195,6 +229,59 @@ function mergeWithCurated(data: Record<string, ModelsDevProvider>): ModelOption[
   return out
 }
 
+function mergeOpenGateway(options: ModelOption[], models: OpenGatewayModel[]): ModelOption[] {
+  const out = [...options]
+  const seen = new Set(options.map((option) => option.ref))
+  for (const model of models) {
+    const ref = `opengateway/${model.id}`
+    if (seen.has(ref) || !isModelRef(ref)) continue
+    const sibling = nativeSiblingFor(model)
+    out.push({
+      ref,
+      providerId: 'opengateway',
+      providerName: KNOWN_PROVIDERS.opengateway.name,
+      modelId: model.id,
+      modelName: sibling?.name ?? model.id,
+      reasoning: sibling?.reasoning ?? false,
+      contextWindow: sibling?.contextWindow ?? null,
+      maxTokens: sibling?.maxTokens ?? null,
+      cost: model.cost,
+      curated: false,
+      supportsVision: model.input.includes('image'),
+    })
+    seen.add(ref)
+  }
+  return out
+}
+
+type NativeSibling = {
+  name: string
+  reasoning?: boolean
+  contextWindow?: number
+  maxTokens?: number
+}
+
+function nativeSiblingFor(model: OpenGatewayModel): NativeSibling | undefined {
+  const slash = model.id.indexOf('/')
+  if (slash === -1) return undefined
+  const creator = model.id.slice(0, slash)
+  const modelId = model.id.slice(slash + 1)
+  const providerId = nativeProviderId(model.ownedBy) ?? nativeProviderId(creator)
+  if (providerId === undefined) return undefined
+  return (KNOWN_PROVIDERS[providerId].models as Record<string, NativeSibling>)[modelId]
+}
+
+// The gateway namespaces some creators differently from this registry's
+// provider ids (`moonshotai` vs `moonshot`, `x-ai` vs `xai`, `z-ai` vs `zai`).
+// Without the alias the sibling lookup misses and the model loses its
+// contextWindow/maxTokens, which neither OpenGateway endpoint publishes.
+function nativeProviderId(value: string): KnownProviderId | undefined {
+  const aliases: Record<string, KnownProviderId> = { moonshotai: 'moonshot', 'x-ai': 'xai', 'z-ai': 'zai' }
+  const candidate = aliases[value] ?? value
+  if (!(candidate in KNOWN_PROVIDERS) || candidate === 'opengateway') return undefined
+  return candidate as KnownProviderId
+}
+
 type BuildOptionOpts = {
   curated: boolean
   upstream?: ModelsDevModel
@@ -249,4 +336,8 @@ function resolveCost(cost: ModelsDevModel['cost']): ModelOptionCost | null {
     cacheRead: cost.cacheRead ?? cost.cache_read ?? 0,
     cacheWrite: cost.cacheWrite ?? cost.cache_write ?? 0,
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
