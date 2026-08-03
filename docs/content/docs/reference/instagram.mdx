@@ -20,7 +20,7 @@ This is a **personal-account** adapter (`instagram`). It signs in as your own In
 
 ## Auth
 
-Username + password login. `typeclaw channel add instagram` prompts for credentials. The live session (cookies/tokens) is held by the upstream SDK under `workspace/.agent-messenger/`; `secrets.json#channels.instagram` stores only account **metadata** so the agent can list and select accounts.
+Username + password login. `typeclaw channel add instagram` prompts for credentials. The live session (cookies/tokens) is held by the upstream SDK under `workspace/.config/agent-messenger/`; `secrets.json#channels.instagram` stores only account **metadata** so the agent can list and select accounts. The former `workspace/.agent-messenger/` path is retained only as a security mask for legacy data.
 
 Unlike bot-token adapters, `secrets.json#channels.instagram` is not a flat credential object — it wraps one or more account records:
 
@@ -64,7 +64,8 @@ Each record under `accounts.<accountId>`:
 
 <Callout type="info" title="Session lives outside secrets.json">
   Only profile metadata lands in `secrets.json`. The actual login session is stored by the SDK under
-  `workspace/.agent-messenger/`, so rotating credentials means re-running the login flow, not editing `secrets.json`.
+  `workspace/.config/agent-messenger/`, so rotating credentials means re-running the login flow, not editing
+  `secrets.json`. The legacy `workspace/.agent-messenger/` location remains masked but is not used for active sessions.
 </Callout>
 
 CLI: `typeclaw channel add instagram` (interactive). **Do not use `channel set`** — Instagram uses a username/password flow; rotate with `typeclaw channel reauth instagram` instead.
