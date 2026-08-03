@@ -251,6 +251,30 @@ describe('planStart', () => {
     expect(plan.runArgs.at(-1)).toBe(plan.imageTag)
   })
 
+  test('overrides stale image defaults with the canonical agent-messenger config dir after --env-file', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, '.env'), 'FIREWORKS_API_KEY=fw_test\n')
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+    const envFileIndex = plan.runArgs.indexOf('--env-file')
+    const configIndex = plan.runArgs.indexOf('AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.config/agent-messenger')
+
+    expect(configIndex).toBeGreaterThan(envFileIndex)
+    expect(plan.runArgs[configIndex - 1]).toBe('-e')
+  })
+
+  test('preserves an operator AGENT_MESSENGER_CONFIG_DIR override from .env', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, '.env'), 'AGENT_MESSENGER_CONFIG_DIR=/operator/config\n')
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    expect(plan.runArgs).toContain('--env-file')
+    expect(plan.runArgs.some((arg) => arg.startsWith('AGENT_MESSENGER_CONFIG_DIR='))).toBe(false)
+  })
+
   test('sets --shm-size=2g unconditionally so the bundled Chrome survives heavy pages (Docker default /dev/shm is 64MB and crashes Chrome)', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -1616,6 +1640,159 @@ function fakeDockerExec(scenario: {
 }
 
 describe('start (composition)', () => {
+  test('fails closed before migration or launch when Docker container state is indeterminate', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const legacy = join(root, 'workspace', '.agent-messenger')
+    const current = join(root, 'workspace', '.config', 'agent-messenger')
+    await mkdir(join(legacy, 'line-storage'), { recursive: true })
+    await writeFile(join(legacy, 'line-storage', 'e2ee.key'), Buffer.from([0, 1, 2, 255]))
+    const before = await readFile(join(legacy, 'line-storage', 'e2ee.key'))
+    const calls: string[][] = []
+    let checkedConfigWritable = false
+    const exec: DockerExec = async (args) => {
+      calls.push(args)
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: 'permission denied while trying to connect to the Docker daemon socket',
+      }
+    }
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      assertConfigWritable: () => {
+        checkedConfigWritable = true
+      },
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toContain('Docker state could not be determined')
+    expect(result.reason).toContain(basename(root))
+    expect(result.reason).toContain('refusing to migrate or launch')
+    expect(await readFile(join(legacy, 'line-storage', 'e2ee.key'))).toEqual(before)
+    expect(existsSync(current)).toBe(false)
+    expect(checkedConfigWritable).toBe(false)
+    expect(calls.some((args) => isBuildCall(args))).toBe(false)
+    expect(calls.some((args) => args[0] === 'run')).toBe(false)
+  })
+
+  test('treats a genuine missing-container inspect response as missing and starts normally', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(true)
+  })
+
+  test('migrates legacy agent-messenger data before docker run and injects the canonical container path', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const legacy = join(root, 'workspace', '.agent-messenger')
+    const current = join(root, 'workspace', '.config', 'agent-messenger')
+    await mkdir(join(legacy, 'line-storage'), { recursive: true })
+    await writeFile(join(legacy, 'line-storage', 'e2ee.key'), 'key-material')
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let migratedBeforeRun = false
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'run') {
+        migratedBeforeRun =
+          !existsSync(legacy) && (await readFile(join(current, 'line-storage', 'e2ee.key'), 'utf8')) === 'key-material'
+      }
+      return docker.exec(args, options)
+    }
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(migratedBeforeRun).toBe(true)
+    const runCall = docker.calls.find((call) => call.args[0] === 'run')
+    expect(runCall?.args).toContain('AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.config/agent-messenger')
+  })
+
+  test('aborts before docker build or run when agent-messenger migration finds populated paths', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const legacy = join(root, 'workspace', '.agent-messenger')
+    const current = join(root, 'workspace', '.config', 'agent-messenger')
+    await mkdir(legacy, { recursive: true })
+    await mkdir(current, { recursive: true })
+    await writeFile(join(legacy, 'legacy.json'), 'legacy')
+    await writeFile(join(current, 'current.json'), 'current')
+    const { exec, calls } = fakeDockerExec({ imageExists: false, container: { exists: false } })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toContain('Merge them manually')
+    expect(calls.some((call) => isBuildCall(call.args))).toBe(false)
+    expect(calls.some((call) => call.args[0] === 'run')).toBe(false)
+  })
+
+  test('preserves populated legacy data when .env deliberately pins the legacy container path', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, '.env'), 'AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.agent-messenger\n')
+    const legacy = join(root, 'workspace', '.agent-messenger')
+    const current = join(root, 'workspace', '.config', 'agent-messenger')
+    await mkdir(legacy, { recursive: true })
+    await writeFile(join(legacy, 'session.json'), 'operator-pinned-session')
+    const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(await readFile(join(legacy, 'session.json'), 'utf8')).toBe('operator-pinned-session')
+    expect(existsSync(current)).toBe(false)
+    const runCall = calls.find((call) => call.args[0] === 'run')
+    expect(runCall?.args).toContain('--env-file')
+    expect(runCall?.args).toContain(join(root, '.env'))
+    expect(runCall?.args).not.toContain('AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.config/agent-messenger')
+  })
+
   test('fails before refreshing managed files when typeclaw.json is not writable by the host user', async () => {
     // given
     await writeFile(join(root, 'typeclaw.json'), '{}\n')
@@ -2992,6 +3169,9 @@ describe('start (composition)', () => {
     // Dockerfile on disk so we can prove the no-op path skips the refresh
     await writeFile(join(root, 'Dockerfile'), 'FROM stale\n')
     await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const legacyConfigDir = join(root, 'workspace', '.agent-messenger')
+    await mkdir(legacyConfigDir, { recursive: true })
+    await writeFile(join(legacyConfigDir, 'session.json'), 'live-container-session')
     const { exec, calls } = fakeDockerExec({
       imageExists: true,
       container: { exists: true, running: true },
@@ -3020,6 +3200,8 @@ describe('start (composition)', () => {
     expect(calls.find((c) => isBuildCall(c.args))).toBeUndefined()
     const onDisk = await readFile(join(root, 'Dockerfile'), 'utf8')
     expect(onDisk).toBe('FROM stale\n')
+    expect(await readFile(join(legacyConfigDir, 'session.json'), 'utf8')).toBe('live-container-session')
+    expect(existsSync(join(root, 'workspace', '.config', 'agent-messenger'))).toBe(false)
   })
 
   test('bounds gc/repack memory even when the container is already running', async () => {

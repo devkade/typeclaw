@@ -200,7 +200,11 @@ describe('typeclaw status render flow', () => {
     await rmTempDir(cwd)
   })
 
-  const missingContainerExec = async (): Promise<DockerExecResult> => ({ exitCode: 1, stdout: '', stderr: '' })
+  const missingContainerExec = async (): Promise<DockerExecResult> => ({
+    exitCode: 1,
+    stdout: '',
+    stderr: 'Error: No such container: tc-agent',
+  })
 
   async function captureStatus(deps: { fetchHostd?: () => Promise<HostdStatus> } = {}): Promise<string> {
     let out = ''

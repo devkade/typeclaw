@@ -4,6 +4,7 @@ import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
+import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } from '@/agent-messenger/config-dir'
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
 import { applyBoundGcConfig } from '@/git/bound-gc-config'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
@@ -45,6 +46,7 @@ import {
   dockerConfigDir,
   imageTagFromCwd,
   isContainerNameConflict,
+  isGenuineMissingContainer,
   isMissingDockerCredentialHelper,
   parseContainerInspectOutput,
   sanitizeDockerConfigJson,
@@ -263,11 +265,24 @@ export async function start({
       }
     }
 
+    if (state.kind === 'indeterminate') {
+      return {
+        ok: false,
+        reason: `Docker state could not be determined for container ${containerName}; TypeClaw is refusing to migrate or launch while the container may be live. Resolve Docker access and retry. ${state.reason}`,
+      }
+    }
+
     if (state.kind === 'present' && state.running) {
       return await reportAlreadyRunning(exec, cwd, containerName)
     }
 
     assertConfigWritable(cwd)
+
+    const agentMessengerPolicy = resolveAgentMessengerConfigPolicy(cwd)
+    if (agentMessengerPolicy.migrate) {
+      const agentMessengerMigration = await migrateAgentMessengerConfigDir(cwd)
+      if (!agentMessengerMigration.ok) return { ok: false, reason: agentMessengerMigration.reason }
+    }
 
     // TypeClaw owns Dockerfile, .gitignore, and the bun-workspaces shape of
     // package.json. Refresh them from the current CLI templates on every fresh
@@ -764,6 +779,10 @@ export async function planStart({
   if (existsSync(join(cwd, ENV_FILE))) {
     runArgs.push('--env-file', join(cwd, ENV_FILE))
   }
+  const agentMessengerPolicy = resolveAgentMessengerConfigPolicy(cwd)
+  if (agentMessengerPolicy.override === null) {
+    runArgs.push('-e', `AGENT_MESSENGER_CONFIG_DIR=${agentMessengerPolicy.containerDir}`)
+  }
 
   // Propagate the host timezone so cron schedules in typeclaw.json (and
   // cron.json jobs without an explicit `timezone`) fire at wall-clock times
@@ -1003,10 +1022,22 @@ type InspectedState =
   | { kind: 'missing' }
   | { kind: 'present'; running: boolean; containerId: string }
   | { kind: 'malformed'; reason: string }
+  | { kind: 'indeterminate'; reason: string }
 
 async function inspectContainer(exec: DockerExec, name: string): Promise<InspectedState> {
-  const result = await exec(['inspect', '--format', '{{.Id}}|{{.State.Running}}', name])
-  if (result.exitCode !== 0) return { kind: 'missing' }
+  let result: DockerExecResult
+  try {
+    result = await exec(['inspect', '--format', '{{.Id}}|{{.State.Running}}', name])
+  } catch (error) {
+    return { kind: 'indeterminate', reason: error instanceof Error ? error.message : String(error) }
+  }
+  if (result.exitCode !== 0) {
+    if (isGenuineMissingContainer(result.stderr)) return { kind: 'missing' }
+    return {
+      kind: 'indeterminate',
+      reason: result.stderr.trim() || `docker inspect exited with code ${result.exitCode}`,
+    }
+  }
   const parsed = parseContainerInspectOutput(result.stdout)
   if (!parsed.ok) return { kind: 'malformed', reason: parsed.reason }
   return { kind: 'present', running: parsed.running, containerId: parsed.containerId }
