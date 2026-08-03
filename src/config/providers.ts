@@ -1077,7 +1077,7 @@ export const KNOWN_PROVIDERS = {
   // defaults it true) — turning it off would break token and cost reporting.
   opengateway: {
     id: 'opengateway',
-    name: 'OpenGateway.ai',
+    name: 'OpenGateway',
     baseUrl: 'https://apis.opengateway.ai/v1',
     auth: ['api-key'],
     apiKeyEnv: 'OPENGATEWAY_API_KEY',
@@ -1299,7 +1299,7 @@ export const KNOWN_PROVIDER_VENDORS = {
   // Anthropic should land on the Anthropic row, not the gateway that proxies it.
   opengateway: {
     id: 'opengateway',
-    name: 'OpenGateway.ai (multi-vendor gateway)',
+    name: 'OpenGateway',
     providers: ['opengateway'],
   },
 } as const satisfies Record<string, KnownProviderVendor>
