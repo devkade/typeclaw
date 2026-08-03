@@ -41,7 +41,7 @@ import type { McpManager } from '@/mcp'
 import type { PermissionService } from '@/permissions'
 import type { HookBus } from '@/plugin'
 import type { BrokerWsData, ContainerBroker } from '@/portbroker'
-import type { ReloadAllResult, ReloadRegistry } from '@/reload'
+import type { ReloadAllResult, ReloadCause, ReloadContext, ReloadRegistry } from '@/reload'
 import type { ClaimController, ClaimResultEvent } from '@/role-claim'
 import type { PluginRuntime, PluginRuntimeState } from '@/run/plugin-runtime'
 import type { CommandOutbound, CommandRunner } from '@/server/command-runner'
@@ -64,7 +64,7 @@ import type {
 import type { Stream, StreamMessage, StreamMessageId, Unsubscribe } from '@/stream'
 import type { TunnelManager } from '@/tunnels'
 
-export type ReloadAllFn = () => Promise<ReloadAllResult>
+export type ReloadAllFn = (context?: ReloadContext) => Promise<ReloadAllResult>
 export type CreateSessionFn = (options?: CreateSessionOptions) => Promise<AgentSession | CreateSessionResult>
 
 export type ServerLogger = {
@@ -744,7 +744,7 @@ export function createServer({
           }
 
           if (msg.type === 'reload') {
-            await handleReload(ws, reloadAll, reloadRegistry, msg.scope)
+            await handleReload(ws, reloadAll, reloadRegistry, msg.scope, msg.cause)
             return
           }
 
@@ -1678,7 +1678,9 @@ async function handleReload(
   reloadAll: ReloadAllFn | undefined,
   reloadRegistry: ReloadRegistry | undefined,
   scope: string | undefined,
+  cause: ReloadCause | undefined,
 ): Promise<void> {
+  const context = cause === undefined ? undefined : { cause }
   if (scope !== undefined && scope.length > 0) {
     if (!reloadRegistry) {
       send(ws, {
@@ -1688,7 +1690,7 @@ async function handleReload(
       return
     }
     try {
-      const result = await reloadRegistry.reloadOne(scope)
+      const result = await reloadRegistry.reloadOne(scope, context)
       send(ws, { type: 'reload_result', results: [result] })
     } catch (err) {
       send(ws, {
@@ -1705,7 +1707,7 @@ async function handleReload(
     return
   }
   try {
-    const { results } = await reloadAll()
+    const { results } = await reloadAll(context)
     send(ws, { type: 'reload_result', results })
   } catch (err) {
     send(ws, {
