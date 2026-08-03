@@ -26,6 +26,12 @@ const PROVIDER_PROBE: Partial<Record<KnownProviderId, Probe>> = {
   upstage: { url: 'https://api.upstage.ai/v1/models', authHeader: 'bearer' },
   moonshot: { url: 'https://api.moonshot.ai/v1/models', authHeader: 'bearer' },
   'moonshot-coding': { url: 'https://api.kimi.com/coding/v1/models', authHeader: 'bearer' },
+  // NOT /v1/models: OpenGateway serves its catalog PUBLICLY (verified — HTTP 200
+  // with `{data:[...]}` for a missing key and for a garbage key), so probing it
+  // would hand back `ok` for any string the user pastes. That is worse than no
+  // validation, because init would vouch for a key that cannot complete a single
+  // request. /v1/me is the cheapest endpoint that actually 401s on a bad key.
+  opengateway: { url: 'https://apis.opengateway.ai/v1/me', authHeader: 'bearer', successShape: 'json-object' },
 }
 
 // When a base-URL override (ANTHROPIC_BASE_URL / OPENAI_BASE_URL) points at a
@@ -187,6 +193,7 @@ export const API_KEY_DASHBOARD_URL: Partial<Record<KnownProviderId, string>> = {
   upstage: 'https://console.upstage.ai/api-keys',
   moonshot: 'https://platform.moonshot.ai/console/api-keys',
   'moonshot-coding': 'https://www.kimi.com/code/console',
+  opengateway: 'https://opengateway.ai/docs/reference/guides/authentication',
 }
 
 // MiniMax sells the same `minimax` provider under two billing surfaces that

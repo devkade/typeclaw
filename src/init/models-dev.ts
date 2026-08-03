@@ -46,6 +46,7 @@ const PROVIDER_TO_MODELS_DEV: Record<KnownProviderId, string | null> = {
   // metadata under `moonshot`, so we route lookups there; the curated
   // `kimi-for-coding` alias is surfaced regardless of upstream membership.
   'moonshot-coding': 'moonshot',
+  opengateway: null,
 }
 
 function upstreamProviderFor(

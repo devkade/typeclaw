@@ -217,6 +217,60 @@ describe('validateApiKey', () => {
     }
   })
 
+  test('probes the opengateway /v1/me endpoint, never the publicly readable /v1/models', async () => {
+    // OpenGateway serves /v1/models without auth, so probing it would validate
+    // any garbage string. /me is the endpoint that actually rejects a bad key.
+    let seenUrl: string | null = null
+    const result = await validateApiKey(
+      'opengateway',
+      'og-test',
+      fakeFetch((url, init) => {
+        seenUrl = url
+        expect((init.headers as Record<string, string>).Authorization).toBe('Bearer og-test')
+        return new Response('{"id":"team_1","name":"Acme"}', { status: 200 })
+      }),
+    )
+    expect(seenUrl!).toBe('https://apis.opengateway.ai/v1/me')
+    expect(seenUrl!).not.toContain('/models')
+    expect(result).toEqual({ kind: 'ok' })
+  })
+
+  test('rejects an invalid opengateway key on 401', async () => {
+    const result = await validateApiKey(
+      'opengateway',
+      'og-bad',
+      fakeFetch(() => new Response('{"error":{"code":"invalid_api_key"}}', { status: 401 })),
+    )
+    expect(result).toEqual({ kind: 'rejected', status: 401 })
+  })
+
+  test('opengateway still rejects a captive-portal HTML 200 despite the looser shape check', async () => {
+    const result = await validateApiKey(
+      'opengateway',
+      'og-test',
+      fakeFetch(() => new Response('<html><body>Login required</body></html>', { status: 200 })),
+    )
+    expect(result).toEqual({ kind: 'skipped', reason: 'network-error', detail: 'unexpected response shape' })
+  })
+
+  test('the json-object shape does not accept a top-level array', async () => {
+    const result = await validateApiKey(
+      'opengateway',
+      'og-test',
+      fakeFetch(() => new Response('[{"id":"team_1"}]', { status: 200 })),
+    )
+    expect(result.kind).toBe('skipped')
+  })
+
+  test('models-list providers still require {data:[...]}, unaffected by the json-object shape', async () => {
+    const result = await validateApiKey(
+      'openai',
+      'sk-test',
+      fakeFetch(() => new Response('{"id":"acct_1"}', { status: 200 })),
+    )
+    expect(result).toEqual({ kind: 'skipped', reason: 'network-error', detail: 'unexpected response shape' })
+  })
+
   test('skips OAuth-only providers without contacting the network', async () => {
     let called = false
     const result = await validateApiKey('openai-codex', 'whatever', async () => {
