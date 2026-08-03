@@ -112,4 +112,27 @@ describe('fetchModelOptions', () => {
     // kimi-k2p6-turbo is curated-only; must still appear even though models.dev didn't list it.
     expect(result.options.some((o) => o.modelId === 'accounts/fireworks/routers/kimi-k2p6-turbo')).toBe(true)
   })
+
+  test('never synthesizes bare models.dev ids onto opengateway, which requires a creator prefix', async () => {
+    // given: models.dev listing an openai model that opengateway would only
+    // accept as `openai/gpt-6-live`.
+    const stub = {
+      openai: {
+        id: 'openai',
+        name: 'OpenAI',
+        models: { 'gpt-6-live': { id: 'gpt-6-live', name: 'GPT-6 Live' } },
+      },
+    }
+    const fetchImpl = (async () => new Response(JSON.stringify(stub), { status: 200 })) as unknown as typeof fetch
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    expect(result.source).toBe('models.dev')
+    expect(result.options.some((o) => o.ref === 'openai/gpt-6-live')).toBe(true)
+    expect(result.options.some((o) => o.ref === 'opengateway/gpt-6-live')).toBe(false)
+    const opengateway = result.options.filter((o) => o.providerId === 'opengateway')
+    expect(opengateway.length).toBeGreaterThan(0)
+    expect(opengateway.every((o) => o.curated)).toBe(true)
+    expect(opengateway.every((o) => o.modelId.includes('/'))).toBe(true)
+  })
 })
