@@ -340,30 +340,31 @@ describe('createMcpDispatcherTools', () => {
     }
   })
 
-  test.each(['secrets.json', 'workspace/.agent-messenger/credentials.json'])(
-    'mcp_call always denies canonical secret operand %s',
-    async (value) => {
-      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-canonical-filename-'))
-      let called = false
-      const connection = fakeConnection('files', [])
-      connection.callTool = async () => {
-        called = true
-        return { content: [{ type: 'text', text: 'unexpected' }] }
-      }
-      const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
-      try {
-        await expect(
-          callTool.execute(
-            { server: 'files', tool: 'inspect', args: { filename: value } } satisfies McpCallArgs,
-            toolContext(agentDir),
-          ),
-        ).rejects.toThrow(/not available|canonical|ambiguous/i)
-        expect(called).toBeFalse()
-      } finally {
-        await rm(agentDir, { recursive: true, force: true })
-      }
-    },
-  )
+  test.each([
+    'secrets.json',
+    'workspace/.config/agent-messenger/credentials.json',
+    'workspace/.agent-messenger/credentials.json',
+  ])('mcp_call always denies canonical secret operand %s', async (value) => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-canonical-filename-'))
+    let called = false
+    const connection = fakeConnection('files', [])
+    connection.callTool = async () => {
+      called = true
+      return { content: [{ type: 'text', text: 'unexpected' }] }
+    }
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    try {
+      await expect(
+        callTool.execute(
+          { server: 'files', tool: 'inspect', args: { filename: value } } satisfies McpCallArgs,
+          toolContext(agentDir),
+        ),
+      ).rejects.toThrow(/not available|canonical|ambiguous/i)
+      expect(called).toBeFalse()
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
 
   test('production system wrapper pins a 52 MiB MCP file exactly once without self-deadlock', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-single-pin-'))
