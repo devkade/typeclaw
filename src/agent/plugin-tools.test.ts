@@ -3238,7 +3238,9 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       })
       const failure = await failing.execute('failure', { command: 'false' }, undefined, undefined, {} as never)
       const hidden = resolveHiddenPaths(permissions, guest, agentDir)
-      const maskedPaths = [...hidden.dirs, ...hidden.files].map((target) => `agent/${path.relative(agentDir, target)}`)
+      const maskedPaths = [...hidden.dirs, ...hidden.files].map(
+        (target) => `agent/${path.relative(agentDir, target).split(path.sep).join('/')}`,
+      )
       const expectedNote =
         `[TypeClaw sandbox policy (LOCAL): masked credential/private paths: ${maskedPaths.join(', ')}; ` +
         'withheld env names: NODE_OPTIONS. This may be unrelated to this failure; it is NOT evidence about ' +
@@ -3290,7 +3292,9 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
 
     try {
       const hidden = resolveHiddenPaths(permissions, guest, agentDir)
-      const maskedPaths = [...hidden.dirs, ...hidden.files].map((target) => `agent/${path.relative(agentDir, target)}`)
+      const maskedPaths = [...hidden.dirs, ...hidden.files].map(
+        (target) => `agent/${path.relative(agentDir, target).split(path.sep).join('/')}`,
+      )
       const expectedNote =
         `[TypeClaw sandbox policy (LOCAL): masked credential/private paths: ${maskedPaths.join(', ')}; ` +
         'withheld env names: NODE_OPTIONS. This may be unrelated to this failure; it is NOT evidence about ' +
