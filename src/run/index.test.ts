@@ -106,7 +106,7 @@ describe('startAgent', () => {
         order.push('auth:sync-read')
       },
       stop: async () => {},
-      reload: async () => ({ started: [], stopped: [], restartRequired: [] }),
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
       restartAdapter: async () => {},
     })
 
@@ -175,7 +175,7 @@ describe('startAgent', () => {
         throw new Error('boot failure: channel manager start rejected')
       },
       stop: async () => {},
-      reload: async () => ({ started: [], stopped: [], restartRequired: [] }),
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
       restartAdapter: async () => {},
     })
 
@@ -207,7 +207,7 @@ describe('startAgent', () => {
         throw new Error('boot failure: second agent')
       },
       stop: async () => {},
-      reload: async () => ({ started: [], stopped: [], restartRequired: [] }),
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
       restartAdapter: async () => {},
     })
     await expect(
@@ -504,7 +504,7 @@ describe('startAgent', () => {
         router: createChannelRouter({ agentDir, configForAdapter: () => undefined }),
         start: async () => {},
         stop: async () => {},
-        reload: async () => ({ started: [], stopped: [], restartRequired: [] }),
+        reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
         restartAdapter: async (name) => void restarts.push(name),
       })
       const createTunnelManagerFor = (opts: TunnelManagerOptions): TunnelManager => ({
@@ -572,7 +572,7 @@ describe('startAgent', () => {
           router: createChannelRouter({ agentDir, configForAdapter: () => undefined }),
           start: async () => {},
           stop: async () => {},
-          reload: async () => ({ started: [], stopped: [], restartRequired: [] }),
+          reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
           restartAdapter: async () => {},
         }
       }

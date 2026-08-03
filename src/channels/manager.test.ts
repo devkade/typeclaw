@@ -1744,6 +1744,193 @@ describe('channel manager — kakaotalk credential preflight', () => {
 
     await mgr.stop()
   })
+
+  test('reload applies the rotation when the caller names that adapter', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+    await writeKakaoSecrets(agentDir, 'a2')
+
+    const result = await mgr.reload({ applyCredentialRotation: 'kakaotalk' })
+
+    expect(fake.stopCalls).toBe(1)
+    expect(fake.startCalls).toBe(2)
+    expect(result.restarted).toContain('kakaotalk')
+    expect(result.restartRequired).not.toContain('kakaotalk (credential rotation)')
+    expect(result.credentialApply).toEqual({ adapter: 'kakaotalk', outcome: 'restarted' })
+
+    await mgr.stop()
+  })
+
+  test('reload leaves a rotated adapter running when a different adapter is named', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+    await writeKakaoSecrets(agentDir, 'a2')
+
+    const result = await mgr.reload({ applyCredentialRotation: 'teams' })
+
+    expect(fake.stopCalls).toBe(0)
+    expect(result.restarted).not.toContain('kakaotalk')
+    expect(result.restartRequired).toContain('kakaotalk (credential rotation)')
+    expect(result.credentialApply).toBeUndefined()
+
+    await mgr.stop()
+  })
+
+  test('reload does not bounce a named adapter whose credential did not change', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+
+    const result = await mgr.reload({ applyCredentialRotation: 'kakaotalk' })
+
+    expect(fake.stopCalls).toBe(0)
+    expect(result.restarted).toEqual([])
+    // Reported rather than silent: a named adapter that reports nothing reads as
+    // "could not apply" and sends the caller to a container restart.
+    expect(result.credentialApply).toEqual({ adapter: 'kakaotalk', outcome: 'already-current' })
+
+    await mgr.stop()
+  })
+
+  test('applies the rotation by starting a named adapter that was already down', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    let failStart = true
+    fake.start = async () => {
+      if (failStart) throw new Error('token rejected')
+      fake.startCalls++
+      fake.connected = true
+    }
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+
+    failStart = false
+    await writeKakaoSecrets(agentDir, 'renewed')
+    const result = await mgr.reload({ applyCredentialRotation: 'kakaotalk' })
+
+    expect(result.started).toContain('kakaotalk')
+    expect(result.credentialApply).toEqual({ adapter: 'kakaotalk', outcome: 'restarted' })
+
+    await mgr.stop()
+  })
+
+  test('reports recovery-pending when a named down adapter still cannot start', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    fake.start = async () => {
+      throw new Error('token rejected')
+    }
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+
+    await writeKakaoSecrets(agentDir, 'renewed')
+    const result = await mgr.reload({ applyCredentialRotation: 'kakaotalk' })
+
+    expect(result.started).not.toContain('kakaotalk')
+    expect(result.credentialApply).toEqual({ adapter: 'kakaotalk', outcome: 'recovery-pending' })
+
+    await mgr.stop()
+  })
+
+  test('an unnamed reload still reports nothing for a down adapter it revived', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    let failStart = true
+    fake.start = async () => {
+      if (failStart) throw new Error('token rejected')
+      fake.startCalls++
+      fake.connected = true
+    }
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+
+    failStart = false
+    await writeKakaoSecrets(agentDir, 'renewed')
+    const result = await mgr.reload()
+
+    expect(result.started).toContain('kakaotalk')
+    expect(result.credentialApply).toBeUndefined()
+
+    await mgr.stop()
+  })
+
+  test('reload reports the rotation as still owed when the adapter cannot be stopped', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    fake.stop = async () => {
+      throw new Error('stop refused')
+    }
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => fake,
+    })
+
+    await mgr.start()
+    await writeKakaoSecrets(agentDir, 'a2')
+
+    const result = await mgr.reload({ applyCredentialRotation: 'kakaotalk' })
+
+    expect(result.credentialApply).toEqual({ adapter: 'kakaotalk', outcome: 'stop-failed' })
+    expect(result.restarted).not.toContain('kakaotalk')
+    expect(result.restartRequired).toContain('kakaotalk (credential rotation)')
+  })
 })
 
 describe('channel manager — router adapter-configured wiring', () => {

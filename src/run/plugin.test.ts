@@ -246,7 +246,7 @@ export default {
       stop: async () => {
         channelManagerStopped = true
       },
-      reload: async () => ({ started: [], stopped: [], restartRequired: [] }),
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
       restartAdapter: async () => {},
     })
     const failingTunnelManager = (): TunnelManager => ({
@@ -291,7 +291,7 @@ export default {
       stop: async () => {
         channelManagerStopped = true
       },
-      reload: async () => ({ started: [], stopped: [], restartRequired: [] }),
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
       restartAdapter: async () => {},
     })
 
