@@ -62,18 +62,13 @@ export async function resolvePrivilegedSandboxRuntime(options: {
   const executable = unwrapBunx(parsed)
   if (executable === null) return runtime
 
-  // These CLIs can print or upload arbitrary files. Supplying their reusable
-  // auth profile to a model-controlled child would therefore make the CLI a
-  // confused deputy even when the outer shell is syntactically standalone.
-  if (
-    executable.executable === 'gws' ||
-    executable.executable === 'codex' ||
-    executable.executable === 'claude' ||
-    executable.executable.startsWith('agent-')
-  ) {
-    return runtime
-  }
-
+  // Credentials are default-deny: only an explicit broker below grants a
+  // profile, and `git` is the only broker. Do not add executable-name checks
+  // here. The confused-deputy argument belongs to the default, not to a list of
+  // names — it holds for every model-controlled child that can print or upload
+  // files, including ones not yet written. A name list is also where beliefs
+  // about a tool's credential layout accumulate; one such belief was wrong and
+  // refused a working CLI family outright. See this file's history.
   if (executable.executable === 'git') {
     runtime.env.GIT_CONFIG_GLOBAL = '/dev/null'
     runtime.env.GIT_CONFIG_NOSYSTEM = '1'

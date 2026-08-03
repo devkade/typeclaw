@@ -94,6 +94,25 @@ describe('resolvePrivilegedSandboxRuntime', () => {
     }
   })
 
+  test('resolves every non-broker executable identically, whether or not the resolver has heard of it', async () => {
+    const brokered = await resolvePrivilegedSandboxRuntime({
+      agentDir,
+      homeDir: home,
+      env: {},
+      command: 'totally-unheard-of-cli --flag subcommand',
+    })
+
+    for (const command of [
+      'claude setup-token',
+      'gws auth status',
+      'agent-slack channel list',
+      'agent-browser open https://example.com',
+      'some-future-tool auth status',
+    ]) {
+      expect(await resolvePrivilegedSandboxRuntime({ agentDir, homeDir: home, env: {}, command })).toEqual(brokered)
+    }
+  })
+
   test('does not follow a symlinked Codex auth file because Codex profiles are never brokered', async () => {
     await rm(path.join(home, '.codex', 'auth.json'))
     await symlink(path.join(home, '.claude.json'), path.join(home, '.codex', 'auth.json'))
