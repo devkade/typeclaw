@@ -205,6 +205,61 @@ describe('createLoopGuard — windowed multi-signature detection', () => {
     if (last.kind === 'block') expect(last.reason).toBe('windowed')
   })
 
+  test('allows parallel grep fan-out with distinct patterns against one path', () => {
+    const guard = createLoopGuard({
+      ...noConsecutive,
+      windowSize: 16,
+      windowSoftWarn: 4,
+      windowHardBlock: 6,
+    })
+    const patterns = [
+      "const source =|source: 'tool'|source === 'tool'",
+      'async function send|const send = async|source =',
+      'live.promisedWorkOutstandingThisLogicalTurn = keepTurnAlive',
+      'sentReplyThisTurn && !live.promisedWorkOutstandingThisLogicalTurn',
+      'live.toolExecutionThisLogicalTurn && !live.promisedWorkOutstandingThisLogicalTurn',
+      "source === 'tool' && text !== undefined && !detectContinuationWillingness(text)",
+    ]
+
+    const decisions = patterns.map((pattern) =>
+      guard.check('s1', 'grep', { path: '/agent/router.ts', pattern }, { turnId: 1 }),
+    )
+
+    expect(decisions.every((decision) => decision.kind === 'ok')).toBe(true)
+    expect(decisions.every((decision) => decision.receipt.recorded)).toBe(true)
+  })
+
+  test('records one same-target grep observation per model turn', () => {
+    const guard = createLoopGuard()
+    const args = { path: '/agent/router.ts', pattern: 'source === "tool"' }
+
+    const decisions = Array.from({ length: 6 }, () => guard.check('s1', 'grep', args, { turnId: 1 }))
+
+    expect(decisions.every((decision) => decision.kind === 'ok')).toBe(true)
+    expect(decisions.map((decision) => decision.receipt.recorded)).toEqual([true, false, false, false, false, false])
+  })
+
+  test('still blocks the same grep target repeated across model turns', () => {
+    const guard = createLoopGuard({
+      ...noConsecutive,
+      windowSize: 16,
+      windowSoftWarn: 4,
+      windowHardBlock: 6,
+    })
+    const decisions = Array.from({ length: 6 }, (_, index) =>
+      guard.check(
+        's1',
+        'grep',
+        { path: '/agent/router.ts', pattern: 'source === "tool"', limit: index + 1 },
+        { turnId: index + 1 },
+      ),
+    )
+
+    expect(decisions[3]?.kind).toBe('warn')
+    expect(decisions[5]?.kind).toBe('block')
+    if (decisions[5]?.kind === 'block') expect(decisions[5].reason).toBe('windowed')
+  })
+
   test('records one same-path read observation per model turn', () => {
     const guard = createLoopGuard({
       ...noConsecutive,
@@ -484,27 +539,18 @@ describe('createLoopGuard — windowed multi-signature detection', () => {
     expect(() => createLoopGuard({ windowSize: 4, windowHardBlock: 5 })).toThrow()
   })
 
-  // grep/find/ls have an OPTIONAL path that defaults to cwd. Omitting it and
-  // varying only non-target args (pattern/limit) still hits the same directory,
-  // so those calls must coarsen to a single default-target signature.
-  for (const tool of ['grep', 'find', 'ls'] as const) {
-    test(`coarsens omitted-path ${tool} calls to the default target so non-target args cannot evade the guard`, () => {
+  // Search limits only change result presentation. They must not let a repeated
+  // query evade the detector when its optional path still resolves to cwd.
+  for (const tool of ['grep', 'find'] as const) {
+    test(`coarsens omitted-path ${tool} calls with the same query so limits cannot evade the guard`, () => {
       const guard = createLoopGuard({
         ...noConsecutive,
         windowSize: 16,
         windowSoftWarn: 4,
         windowHardBlock: 6,
       })
-      const varyingArgs = [
-        { pattern: 'a*' },
-        { pattern: 'b*', limit: 10 },
-        { pattern: 'c*' },
-        { pattern: 'd*', limit: 50 },
-        { pattern: 'e*' },
-        { pattern: 'f*', limit: 5 },
-      ]
       let last: ReturnType<typeof guard.check> | { kind: 'ok' } = { kind: 'ok' }
-      for (const args of varyingArgs) last = guard.check('s1', tool, args)
+      for (let limit = 1; limit <= 6; limit++) last = guard.check('s1', tool, { pattern: 'source*', limit })
       expect(last.kind).toBe('block')
       if (last.kind === 'block') expect(last.reason).toBe('windowed')
     })
@@ -517,7 +563,10 @@ describe('createLoopGuard — windowed multi-signature detection', () => {
         windowHardBlock: 6,
       })
       let last: ReturnType<typeof guard.check> | { kind: 'ok' } = { kind: 'ok' }
-      for (let i = 0; i < 6; i++) last = guard.check('s1', tool, { path: '', pattern: `p${i}*` })
+      for (let i = 0; i < 6; i++) {
+        const path = i % 2 === 0 ? {} : { path: '' }
+        last = guard.check('s1', tool, { ...path, pattern: 'source*', limit: i + 1 })
+      }
       expect(last.kind).toBe('block')
     })
 
@@ -534,6 +583,45 @@ describe('createLoopGuard — windowed multi-signature detection', () => {
       }
     })
   }
+
+  test('coarsens omitted-path ls calls to the default target so limits cannot evade the guard', () => {
+    const guard = createLoopGuard({
+      ...noConsecutive,
+      windowSize: 16,
+      windowSoftWarn: 4,
+      windowHardBlock: 6,
+    })
+    let last: ReturnType<typeof guard.check> | { kind: 'ok' } = { kind: 'ok' }
+    for (let limit = 1; limit <= 6; limit++) last = guard.check('s1', 'ls', { limit })
+    expect(last.kind).toBe('block')
+    if (last.kind === 'block') expect(last.reason).toBe('windowed')
+  })
+
+  test('treats an empty-string path for ls the same as an omitted path', () => {
+    const guard = createLoopGuard({
+      ...noConsecutive,
+      windowSize: 16,
+      windowSoftWarn: 4,
+      windowHardBlock: 6,
+    })
+    let last: ReturnType<typeof guard.check> | { kind: 'ok' } = { kind: 'ok' }
+    for (let i = 0; i < 6; i++) {
+      const path = i % 2 === 0 ? {} : { path: '' }
+      last = guard.check('s1', 'ls', { ...path, limit: i + 1 })
+    }
+    expect(last.kind).toBe('block')
+  })
+
+  test('does not flag ls calls against genuinely distinct explicit targets', () => {
+    const guard = createLoopGuard({
+      ...noConsecutive,
+      windowSize: 16,
+      windowSoftWarn: 4,
+      windowHardBlock: 6,
+    })
+    const dirs = ['src', 'test', 'docs', 'scripts', 'lib', 'bin']
+    for (const path of dirs) expect(guard.check('s1', 'ls', { path }).kind).toBe('ok')
+  })
 
   // read/write/edit require an explicit path, so absence is malformed input, not
   // a cwd default — they must NOT be coarsened to a shared default target.
