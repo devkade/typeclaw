@@ -7,4 +7,4 @@ export {
   type RequestReloadWithFallbackOptions,
   type RequestReloadWithFallbackResult,
 } from './recover'
-export type { Reloadable, ReloadAllResult, ReloadResult } from './types'
+export type { Reloadable, ReloadAllResult, ReloadCause, ReloadContext, ReloadResult } from './types'

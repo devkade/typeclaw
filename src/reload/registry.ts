@@ -1,4 +1,4 @@
-import type { Reloadable, ReloadAllResult, ReloadResult } from './types'
+import type { Reloadable, ReloadAllResult, ReloadContext, ReloadResult } from './types'
 
 export class ReloadRegistry {
   private items = new Map<string, Reloadable>()
@@ -26,11 +26,11 @@ export class ReloadRegistry {
   // effects of earlier ones — e.g. cron reload reads the freshly swapped
   // config when it runs after the config reloadable. Manual reload is rare,
   // so deterministic ordering wins over parallelism.
-  async reloadAll(): Promise<ReloadAllResult> {
+  async reloadAll(context?: ReloadContext): Promise<ReloadAllResult> {
     const results: ReloadResult[] = []
     for (const item of this.list()) {
       try {
-        results.push(await item.reload())
+        results.push(await item.reload(context))
       } catch (err) {
         results.push({ scope: item.scope, ok: false, reason: errorMessage(err) })
       }
@@ -38,11 +38,11 @@ export class ReloadRegistry {
     return { results }
   }
 
-  async reloadOne(scope: string): Promise<ReloadResult> {
+  async reloadOne(scope: string, context?: ReloadContext): Promise<ReloadResult> {
     const item = this.items.get(scope)
     if (!item) return { scope, ok: false, reason: `unknown scope: ${scope}` }
     try {
-      return await item.reload()
+      return await item.reload(context)
     } catch (err) {
       return { scope, ok: false, reason: errorMessage(err) }
     }
