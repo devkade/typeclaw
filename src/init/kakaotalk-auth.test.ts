@@ -3,10 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { agentMessengerConfigDir } from '@/agent-messenger/config-dir'
 import { createKeyStore } from '@/secrets/keys'
 
 import {
-  kakaotalkConfigDir,
   kakaotalkSecretsPath,
   type LoginFlowFn,
   type LoginFlowOptions,
@@ -20,13 +20,6 @@ function isolatedKeyStore(agentDir: string): { keyStore: ReturnType<typeof creat
     containerName: 'test-agent',
   }
 }
-
-describe('kakaotalkConfigDir', () => {
-  test('places credentials under the agent workspace, not the user home', () => {
-    const dir = kakaotalkConfigDir('/foo/agent')
-    expect(dir).toBe('/foo/agent/workspace/.agent-messenger')
-  })
-})
 
 const tmp = async (): Promise<string> => mkdtemp(join(tmpdir(), 'typeclaw-kakao-test-'))
 
@@ -83,7 +76,9 @@ describe('runKakaotalkBootstrap', () => {
       expect(stored.channels.kakaotalk.accounts['user-1']?.email).toBe('user@example.com')
       expect(stored.channels.kakaotalk.accounts['user-1']?.encryptedPassword?.v).toBe(1)
       expect(stored.channels.kakaotalk.accounts['user-1']?.encryptedPassword?.alg).toBe('AES-256-GCM')
-      await expect(readFile(join(kakaotalkConfigDir(agentDir), 'kakaotalk-credentials.json'), 'utf8')).rejects.toThrow()
+      await expect(
+        readFile(join(agentMessengerConfigDir(agentDir), 'kakaotalk-credentials.json'), 'utf8'),
+      ).rejects.toThrow()
     } finally {
       await rm(agentDir, { recursive: true, force: true })
     }
