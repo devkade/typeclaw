@@ -1,7 +1,19 @@
 import { defineCommand } from 'citty'
 
 import { loadConfigSync, validateConfig, type Config, type ValidateConfigResult } from '@/config'
-import { resolveController, type StartOptions, type StartResult, type StopResult } from '@/container'
+import {
+  resolveController,
+  resolveHostPort,
+  resolveTuiToken,
+  type StartOptions,
+  type StartResult,
+  type StopResult,
+} from '@/container'
+import {
+  applyCredentialRotation,
+  type CredentialRotationApplyResult,
+  type RenewableAdapter,
+} from '@/hostd/credential-rotation-apply'
 import { createCurrentHostDaemonHolder } from '@/hostd/current-host-daemon'
 import { startDaemon, type DaemonLogEvent, type RestartPreflight } from '@/hostd/daemon'
 import { createKakaoRenewalManager } from '@/hostd/kakao-renewal-manager'
@@ -11,6 +23,7 @@ import { createTeamsRenewalManager } from '@/hostd/teams-renewal-manager'
 import { computeSourceVersion, resolveSrcRoot, UNVERSIONED_SENTINEL } from '@/hostd/version'
 import { createWebexRenewalManager } from '@/hostd/webex-renewal-manager'
 import { validateRestartDeps, type RestartDepsPreflightResult } from '@/init/restart-deps-preflight'
+import { requestReloadWithFallback } from '@/reload'
 
 export const hostdCommand = defineCommand({
   meta: {
@@ -32,43 +45,43 @@ export const hostdCommand = defineCommand({
     // they must thread currentHostDaemon themselves to get the in-process
     // registration path. The daemon populates this holder once booted.
     const currentHostDaemonHolder = createCurrentHostDaemonHolder()
+    // The renewal cron writes a fresh credential to secrets.json, but the
+    // running adapter captured the old one in a client closure at start(). It
+    // has to be told to pick the new one up; bouncing that single adapter is
+    // enough, and leaves the rest of the agent's work untouched.
+    const applyRenewedCredential = async (
+      adapter: RenewableAdapter,
+      { containerName, cwd }: { containerName: string; cwd: string },
+    ): Promise<void> => {
+      const result = await applyCredentialRotation(
+        { containerName, cwd, adapter },
+        {
+          resolveHostPort,
+          resolveTuiToken,
+          requestReloadWithFallback,
+          restartContainer: async (input) => {
+            const currentHostDaemon = await currentHostDaemonHolder.ready()
+            return await hostdRestart({ ...input, currentHostDaemon })
+          },
+        },
+      )
+      writeLogLine(formatCredentialApply(adapter, containerName, result))
+      if (result.kind === 'failed') throw new Error(result.restartError)
+    }
+
     const kakaoRenewal = createKakaoRenewalManager({
       onLog: (event) => writeLogLine(formatLog(event)),
-      onRenewalOk: async ({ containerName, cwd }) => {
-        // Restart the container so the in-memory KakaoTalk LOCO client picks
-        // up the renewed tokens from secrets.json. Without this, the cron
-        // would write fresh tokens but the running adapter would keep using
-        // the old token in its closure and still 401 at the ~7-day wall.
-        const currentHostDaemon = await currentHostDaemonHolder.ready()
-        const result = await hostdRestart({ containerName, cwd, currentHostDaemon })
-        if (!result.ok) throw new Error(result.reason)
-      },
+      onRenewalOk: async (input) => await applyRenewedCredential('kakaotalk', input),
       shouldRenew: ({ cwd }) => kakaoChannelConfigured(cwd),
     })
     const webexRenewal = createWebexRenewalManager({
       onLog: (event) => writeLogLine(formatLog(event)),
-      onRenewalOk: async ({ containerName, cwd }) => {
-        // Restart so the in-memory WebexClient picks up the renewed token from
-        // secrets.json. Without this, the cron writes a fresh token but the
-        // running adapter keeps the old token in its getToken closure and still
-        // 401s on every outbound REST call + KMS key fetch.
-        const currentHostDaemon = await currentHostDaemonHolder.ready()
-        const result = await hostdRestart({ containerName, cwd, currentHostDaemon })
-        if (!result.ok) throw new Error(result.reason)
-      },
+      onRenewalOk: async (input) => await applyRenewedCredential('webex', input),
       shouldRenew: ({ cwd }) => webexChannelConfigured(cwd),
     })
     const teamsRenewal = createTeamsRenewalManager({
       onLog: (event) => writeLogLine(formatLog(event)),
-      onRenewalOk: async ({ containerName, cwd }) => {
-        // Restart so the in-memory TeamsClient picks up the renewed token from
-        // secrets.json. Without this, the cron writes a fresh token but the
-        // running adapter keeps the old token in its login closure and still
-        // cannot obtain an id_token for the realtime listener.
-        const currentHostDaemon = await currentHostDaemonHolder.ready()
-        const result = await hostdRestart({ containerName, cwd, currentHostDaemon })
-        if (!result.ok) throw new Error(result.reason)
-      },
+      onRenewalOk: async (input) => await applyRenewedCredential('teams', input),
       shouldRenew: ({ cwd }) => teamsChannelConfigured(cwd),
     })
 
@@ -196,6 +209,21 @@ async function detectSourceDrift(cliEntry: string, daemonVersion: string | undef
 
 function writeLogLine(msg: string): void {
   console.log(`${new Date().toISOString()} ${msg}`)
+}
+
+function formatCredentialApply(
+  adapter: RenewableAdapter,
+  containerName: string,
+  result: CredentialRotationApplyResult,
+): string {
+  const prefix = `[hostd] ${adapter} renewal`
+  if (result.kind === 'reloaded') {
+    return `${prefix} applied to ${containerName} via ${result.transport} reload (no container restart)`
+  }
+  if (result.kind === 'restarted') {
+    return `${prefix} fell back to a container restart for ${containerName}: ${result.reloadError}`
+  }
+  return `${prefix} could not be applied to ${containerName}: ${result.reloadError}; restart also failed: ${result.restartError}`
 }
 
 function formatLog(event: DaemonLogEvent | SupervisorLogEvent): string {

@@ -164,7 +164,7 @@ export type ChannelManager = {
   start: () => Promise<void>
   stop: () => Promise<void>
   restartAdapter: (name: AdapterId) => Promise<void>
-  reload: () => Promise<{ started: string[]; stopped: string[]; restartRequired: string[] }>
+  reload: (options?: ChannelReloadOptions) => Promise<ChannelReloadDiff>
 }
 
 type AnyAdapter =
@@ -203,6 +203,26 @@ type FailedAdapter = {
   retryQueued: boolean
   nextLogAtMs: number
 }
+
+export type AdapterRestartOutcome = 'restarted' | 'recovery-pending' | 'stop-failed' | 'skipped'
+
+// `already-current` is not a restart outcome: the live adapter is already on the
+// new credential, so there was nothing to apply. It still has to be reported,
+// because a named adapter that reports nothing reads as "not applied" and sends
+// the caller to its fallback.
+export type CredentialApplyOutcome = AdapterRestartOutcome | 'already-current'
+
+export type ChannelReloadOptions = { applyCredentialRotation?: AdapterId }
+
+export type ChannelReloadDiff = {
+  started: string[]
+  stopped: string[]
+  restarted: string[]
+  restartRequired: string[]
+  credentialApply?: { adapter: AdapterId; outcome: CredentialApplyOutcome }
+}
+
+type ReloadAdapterOutcome = 'started' | 'stopped' | 'rotated' | 'already-current' | AdapterRestartOutcome | null
 
 type StartAdapterResult =
   | { status: 'started' }
@@ -453,11 +473,11 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     } catch {}
   }
 
-  const startAdapter = async (
+  const startAdapterOnce = async (
     name: AdapterId,
     cfg: ChannelAdapterConfig,
     canCommit: () => boolean,
-  ): Promise<StartAdapterResult> => {
+  ): Promise<StartAdapterResult | { status: 'credential-changed' }> => {
     if (!canCommit()) return { status: 'aborted' }
     if (cfg.enabled === false) {
       logger.info(`[channels] adapter "${name}" is disabled; skipping`)
@@ -484,6 +504,10 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         await cleanupPartialStart(adapter)
         return { status: 'aborted' }
       }
+      if (buildCredentialSignature(name).signature !== signature) {
+        await cleanupPartialStart(adapter)
+        return { status: 'credential-changed' }
+      }
       live.set(name, {
         adapter,
         credentialSignature: signature,
@@ -499,6 +523,32 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         kind: 'start-failed',
         detail: `failed to start: ${describeError(err)}`,
         inputSignature: buildFailedInputSignature(name, cfg, credentials),
+      }
+    }
+  }
+
+  // The adapter reads the credential file itself inside start(), so a write
+  // landing mid-start would leave `live` holding a signature that describes a
+  // different token than the one now in memory: the entry looks current while
+  // running a superseded credential, and the next reload sees no rotation to
+  // apply. Retry once, which covers a renewal write racing a start; a second
+  // change means a persistent concurrent writer, and spinning on it is worse
+  // than handing the adapter to supervision's backoff.
+  const startAdapter = async (
+    name: AdapterId,
+    cfg: ChannelAdapterConfig,
+    canCommit: () => boolean,
+  ): Promise<StartAdapterResult> => {
+    for (let attempt = 0; ; attempt += 1) {
+      const result = await startAdapterOnce(name, cfg, canCommit)
+      if (result.status !== 'credential-changed') return result
+      if (attempt >= 1) {
+        return {
+          status: 'failed',
+          kind: 'start-failed',
+          detail: 'credentials changed twice during start',
+          inputSignature: buildFailedInputSignature(name, cfg, buildCredentialSignature(name)),
+        }
       }
     }
   }
@@ -649,6 +699,21 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       logger.error(`[channels] adapter "${name}" failed to stop: ${describeError(err)}`)
       return false
     }
+  }
+
+  // Callers must already hold this adapter's `runSerially` barrier. Re-entering
+  // it here would queue behind the caller's own still-open turn and deadlock,
+  // which is exactly what happens if `reload` calls the public `restartAdapter`
+  // from inside its per-adapter block.
+  const restartAdapterLocked = async (name: AdapterId): Promise<AdapterRestartOutcome> => {
+    const currentCfg = options.channelsConfigRef()[name]
+    if (currentCfg === undefined || currentCfg.enabled === false) return 'skipped'
+    const previousFailure = failed.get(name)
+    failed.delete(name)
+    if (!(await stopAdapter(name))) return 'stop-failed'
+    const queuedEpoch = lifecycleEpoch
+    const result = await startAdapter(name, currentCfg, () => running && queuedEpoch === lifecycleEpoch)
+    return applyStartResult(name, currentCfg, result, previousFailure) ? 'restarted' : 'recovery-pending'
   }
 
   const superviseAdapters = (): void => {
@@ -829,21 +894,17 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         // Deliberately not gated on `live.has(name)`: the whole point is to let
         // an operator revive an adapter that failed to start and is therefore
         // absent from `live`.
-        const previousFailure = failed.get(name)
-        failed.delete(name)
-        const stopped = await stopAdapter(name)
-        if (!stopped) return
-        const queuedEpoch = lifecycleEpoch
-        const result = await startAdapter(name, currentCfg, () => running && queuedEpoch === lifecycleEpoch)
-        applyStartResult(name, currentCfg, result, previousFailure)
+        await restartAdapterLocked(name)
       })
     },
 
-    async reload(): Promise<{ started: string[]; stopped: string[]; restartRequired: string[] }> {
+    async reload(reloadOptions: ChannelReloadOptions = {}): Promise<ChannelReloadDiff> {
       const cfg = options.channelsConfigRef()
       const started: string[] = []
       const stopped: string[] = []
+      const restarted: string[] = []
       const restartRequired: string[] = []
+      let credentialApply: ChannelReloadDiff['credentialApply']
 
       for (const name of ADAPTER_IDS) {
         const desired = cfg[name]
@@ -862,7 +923,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         // die) before the barrier admits us, and the branch we picked would
         // then either start a second instance or skip credential
         // reconciliation on an adapter that is now live with a stale token.
-        const outcome = await runSerially(name, async (): Promise<'started' | 'stopped' | 'rotated' | null> => {
+        const outcome = await runSerially(name, async (): Promise<ReloadAdapterOutcome> => {
           const latest = options.channelsConfigRef()[name]
           if (latest === undefined || latest.enabled === false) return null
           const credentials = buildCredentialSignature(name)
@@ -890,8 +951,16 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
             return 'stopped'
           }
 
+          const named = reloadOptions.applyCredentialRotation === name
+
           if (current !== undefined) {
-            return signature === current.credentialSignature ? null : 'rotated'
+            if (signature === current.credentialSignature) return named ? 'already-current' : null
+            // Bouncing a live adapter drops the channel turns it is currently
+            // serving, so a plain operator reload only reports the rotation.
+            // Only a caller that names this exact adapter — hostd, right after
+            // it rewrote that credential on disk — gets the destructive path.
+            if (!named) return 'rotated'
+            return await restartAdapterLocked(name)
           }
 
           // A reload is the operator's signal that inputs changed, so a
@@ -902,31 +971,38 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
             const changed =
               failedInputSignatures.get(previousFailure) !== buildFailedInputSignature(name, latest, credentials)
             if (changed) failed.delete(name)
-            else if (previousFailure.retryQueued) return null
+            // A queued retry will read the new credential when it fires, so the
+            // rotation is on its way even though nothing happened right here.
+            else if (previousFailure.retryQueued) return named ? 'recovery-pending' : null
           }
           const queuedEpoch = lifecycleEpoch
           const result = await startAdapter(name, latest, () => running && queuedEpoch === lifecycleEpoch)
-          return applyStartResult(name, latest, result, previousFailure) ? 'started' : null
+          if (applyStartResult(name, latest, result, previousFailure)) return 'started'
+          return named ? 'recovery-pending' : null
         })
 
-        if (outcome === 'started') started.push(name)
-        else if (outcome === 'stopped') stopped.push(name)
-        else if (outcome === 'rotated') {
-          const reason =
-            name === 'kakaotalk' ||
-            name === 'line' ||
-            name === 'instagram' ||
-            name === 'webex' ||
-            name === 'teams' ||
-            name === 'slack' ||
-            name === 'discord'
-              ? 'credential rotation'
-              : 'token rotation'
-          restartRequired.push(`${name} (${reason})`)
+        if (outcome === 'started') {
+          started.push(name)
+          // Starting a down adapter applies the rotation just as much as
+          // bouncing a live one; reporting nothing here would read as a failure
+          // and send the caller to a container restart it does not need.
+          if (reloadOptions.applyCredentialRotation === name) {
+            credentialApply = { adapter: name, outcome: 'restarted' }
+          }
+        } else if (outcome === 'stopped') stopped.push(name)
+        else if (outcome === 'rotated') restartRequired.push(`${name} (${rotationReason(name)})`)
+        else if (outcome !== null) {
+          credentialApply = { adapter: name, outcome }
+          if (outcome === 'restarted') restarted.push(name)
+          // A stop that failed leaves the OLD credential live, so the rotation
+          // has not been applied and still owes a restart. `recovery-pending`
+          // does not: the adapter is already down and supervision is retrying
+          // it with the new credential on backoff.
+          else if (outcome === 'stop-failed') restartRequired.push(`${name} (${rotationReason(name)})`)
         }
       }
 
-      return { started, stopped, restartRequired }
+      return { started, stopped, restarted, restartRequired, ...(credentialApply ? { credentialApply } : {}) }
     },
   }
 }
@@ -1038,6 +1114,20 @@ function createContainerTeamsCredentialStore(
     secretsPath: join(agentDir, 'secrets.json'),
     hostProvider: secretsProvider,
   })
+}
+
+// Personal-account adapters authenticate as a user, so their whole credential
+// block rotates; token-based bot adapters only swap an env token.
+function rotationReason(name: AdapterId): string {
+  return name === 'kakaotalk' ||
+    name === 'line' ||
+    name === 'instagram' ||
+    name === 'webex' ||
+    name === 'teams' ||
+    name === 'slack' ||
+    name === 'discord'
+    ? 'credential rotation'
+    : 'token rotation'
 }
 
 function buildTeamsSignature(agentDir: string): { signature: string; missing: string[] } {
