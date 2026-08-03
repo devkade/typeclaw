@@ -15,7 +15,6 @@ const AGENT_ROOT_WRITE_ALLOWLIST = new Set([
   'SOUL.md',
   'USER.md',
   'cron.json',
-  'package.json',
   'typeclaw.json',
 ])
 
@@ -48,6 +47,12 @@ export async function checkNonWorkspaceWriteGuard(options: {
     resolveRealIntendedPath(path.resolve(agentDir)),
     resolveRealIntendedPath('/tmp'),
   ])
+  if (await isOperatorOwnedPackageManifest(agentDir, targetPath, realTargetPath)) {
+    return {
+      block: true,
+      reason: `Guard \`${GUARD_NON_WORKSPACE_WRITE}\` blocked a model write to operator-owned package manifest ${targetPath}.`,
+    }
+  }
   if (await isSkillAuthoringAllowed({ tool, args, agentDir })) return undefined
   if (await isMemoryTopicsWriteAllowed({ tool, args, agentDir, origin })) return undefined
   if (await isAllowedAgentRootWrite(agentDir, targetPath, realTargetPath)) return undefined
@@ -72,6 +77,16 @@ export async function checkNonWorkspaceWriteGuard(options: {
       `Retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_WORKSPACE_WRITE}: true\` only if this write is intentional.`,
     ].join(' '),
   }
+}
+
+async function isOperatorOwnedPackageManifest(
+  agentDir: string,
+  targetPath: string,
+  realTargetPath: string,
+): Promise<boolean> {
+  const rootManifest = path.join(path.resolve(agentDir), 'package.json')
+  const realRootManifest = await resolveRealIntendedPath(rootManifest)
+  return targetPath === rootManifest || realTargetPath === realRootManifest
 }
 
 async function isAllowedAgentRootWrite(agentDir: string, targetPath: string, realTargetPath: string): Promise<boolean> {

@@ -75,7 +75,6 @@ describe('guard plugin', () => {
       ['IDENTITY.md', 'x'],
       ['SOUL.md', 'x'],
       ['USER.md', 'x'],
-      ['package.json', 'x'],
       ['cron.json', JSON.stringify({ jobs: [] })],
       ['typeclaw.json', JSON.stringify({})],
     ]
@@ -83,6 +82,22 @@ describe('guard plugin', () => {
       const result = await hook(toolEvent('write', { path: file, content }), hookContext('/agent'))
       expect(result).toBeUndefined()
     }
+  })
+
+  test('blocks the operator-owned package.json at the agent root', async () => {
+    const hook = await toolBeforeHook()
+
+    const result = await hook(
+      toolEvent('write', {
+        path: 'package.json',
+        content: '{}',
+        acknowledgeGuards: { nonWorkspaceWrite: true },
+      }),
+      hookContext('/agent'),
+    )
+
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('operator-owned package manifest')
   })
 
   test('blocks MEMORY.md for tui origin now that it is off the root allowlist', async () => {

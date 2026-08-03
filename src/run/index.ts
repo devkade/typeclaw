@@ -55,6 +55,7 @@ import {
   type ParseCronMode,
   type Scheduler,
 } from '@/cron'
+import { logDependencyBinProblems, registerDependencyBinDoctorCheck, validateDependencyBins } from '@/dependencies'
 import { CLI_VERSION } from '@/init/cli-version'
 import { createMcpManager, resolveContainerMcpOAuthStore, TypeClawMcpOAuthProvider } from '@/mcp'
 import { runStartupMigrations } from '@/migrations'
@@ -330,6 +331,10 @@ async function startAgentRuntime(
   )
   const pluginRegistry = pluginsLoaded.registry
   const pluginHooks = pluginsLoaded.hooks
+  const dependencyBinLogger = createPluginLogger('typeclaw')
+  const bootDependencyBins = await validateDependencyBins(cwd)
+  logDependencyBinProblems(bootDependencyBins, dependencyBinLogger)
+  registerDependencyBinDoctorCheck(pluginRegistry, cwd, dependencyBinLogger)
 
   const { registry: subagents, pluginSubagentByShim, pluginSubagentByName } = mergeSubagents(pluginRegistry)
 

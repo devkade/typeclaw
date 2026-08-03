@@ -4,6 +4,7 @@
   "pages": [
     "index",
     "skills",
+    "dependency-bins",
     "memory",
     "secrets",
     "permissions",

@@ -153,7 +153,7 @@ export type SandboxPolicy = {
 // these, every sandboxed bun invocation — the core subagent install path —
 // fails before it starts.
 export const DEFAULT_SANDBOX_ENV: Record<string, string> = {
-  PATH: '/usr/local/bin:/usr/bin:/bin',
+  PATH: '/tmp/typeclaw-dependency-bin:/usr/local/bin:/usr/bin:/bin',
   HOME: '/tmp',
   LANG: 'C.UTF-8',
   BUN_TMPDIR: '/tmp',
