@@ -7,6 +7,7 @@ import type { PermissionService } from '@/permissions/permissions'
 
 import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from './canonical-secrets'
 import { SandboxMaskTargetError } from './errors'
+import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 
 export type HiddenPaths = {
   dirs: string[]
@@ -38,7 +39,9 @@ export function resolveHiddenPaths(
     ...CANONICAL_AGENT_SECRET_DIRS.map((dir) => join(agentDir, dir)),
     ...(seesPrivate ? [] : PRIVATE_DIRS.map((dir) => join(agentDir, dir))),
   ]
-  const files = CANONICAL_AGENT_SECRET_FILES.map((f) => join(agentDir, f))
+  const files = [...CANONICAL_AGENT_SECRET_FILES, ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES].map((f) =>
+    join(agentDir, f),
+  )
   return { dirs, files }
 }
 

@@ -50,7 +50,7 @@ export async function loadMemoryInjectionPlan(
   if (rootMemory.content !== null && !hasTopicsDir) {
     return buildInjectionPlan([rootFallbackEntry(rootMemory)], { budgetBytes: options.injectionBudgetBytes })
   }
-  const shards = await loadAllShards(agentDir)
+  const shards = (await loadAllShards(agentDir)).filter((shard) => shard.frontmatter.kind !== 'environmental-incident')
   return buildInjectionPlan(shards, { budgetBytes: options.injectionBudgetBytes })
 }
 

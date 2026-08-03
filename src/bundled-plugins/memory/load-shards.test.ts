@@ -102,6 +102,7 @@ describe('loadShard', () => {
       slug: 'design-tokens',
       frontmatter: {
         heading: 'Design tokens',
+        kind: 'belief',
         cites: 2,
         days: 1,
         lastReinforced: '2026-05-20',

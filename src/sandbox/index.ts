@@ -6,6 +6,7 @@ export {
   CANONICAL_HOME_SECRET_FILES,
   CONTAINER_RUNTIME_HOME,
 } from './canonical-secrets'
+export { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 export {
   buildProcBindProbeScript,
   canBindProcSafely,

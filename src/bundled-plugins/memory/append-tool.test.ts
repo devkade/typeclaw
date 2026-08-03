@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -51,6 +51,41 @@ async function callExpectingThrow(root: string, input: Partial<AppendInput>): Pr
 }
 
 describe('appendTool', () => {
+  test('mechanically rejects every evaluated interval that belongs to an operational incident', async () => {
+    const root = tmpRoot()
+    const transcript = join(root, 'sessions', 'session.jsonl')
+    mkdirSync(join(root, 'sessions'), { recursive: true })
+    writeFileSync(
+      transcript,
+      [
+        { type: 'message', id: 'user-request', message: { role: 'user', content: 'Book a room' } },
+        {
+          type: 'message',
+          id: 'tool-failure',
+          message: {
+            role: 'toolResult',
+            content: [
+              { type: 'text', text: 'TYPECLAW_OPERATIONAL_INCIDENT {"fingerprint":"bash:command-not-found:opensoma"}' },
+            ],
+          },
+        },
+        { type: 'message', id: 'assistant-gave-up', message: { role: 'assistant', content: 'Please do it manually.' } },
+        { type: 'message', id: 'user-correction', message: { role: 'user', content: 'Use bunx opensoma.' } },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join('\n'),
+    )
+    const fenced = createAppendTool({ transcriptPathProvider: () => transcript })
+
+    await expect(
+      fenced.execute({ ...baseInput, entry: 'user-correction', latestEntryId: 'user-correction' }, ctx(root)),
+    ).rejects.toThrow('operational incident')
+    await expect(
+      fenced.execute({ ...baseInput, entry: 'user-request', latestEntryId: 'user-correction' }, ctx(root)),
+    ).rejects.toThrow('operational incident')
+    expect(existsSync(streamPath(root))).toBe(false)
+  })
+
   test('preserves thread parent coordinates in runtime-stamped provenance', () => {
     const origin: SessionOrigin = {
       kind: 'channel',
