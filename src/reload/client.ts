@@ -1,10 +1,11 @@
 import type { ClientMessage, ServerMessage } from '@/shared'
 
-import type { ReloadResult } from './types'
+import type { ReloadCause, ReloadResult } from './types'
 
 export type RequestReloadOptions = {
   url: string
   scope?: string
+  cause?: ReloadCause
   timeoutMs?: number
 }
 
@@ -20,6 +21,7 @@ export class ReloadConnectionError extends Error {
 export async function requestReload({
   url,
   scope,
+  cause,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }: RequestReloadOptions): Promise<ReloadResult[]> {
   const ws = new WebSocket(url)
@@ -60,7 +62,11 @@ export async function requestReload({
   })
 
   try {
-    const request: ClientMessage = scope ? { type: 'reload', scope } : { type: 'reload' }
+    const request: ClientMessage = {
+      type: 'reload',
+      ...(scope ? { scope } : {}),
+      ...(cause ? { cause } : {}),
+    }
     ws.send(JSON.stringify(request))
 
     return await new Promise<ReloadResult[]>((resolve, reject) => {

@@ -7,12 +7,13 @@ import {
   type DockerExecResult,
 } from '@/container'
 
-import type { ReloadResult } from './types'
+import type { ReloadCause, ReloadResult } from './types'
 
 export type RequestReloadViaDockerExecOptions = {
   cwd: string
   token: string | null
   scope?: string
+  cause?: ReloadCause
   timeoutMs?: number
   exec?: DockerExec
 }
@@ -37,7 +38,12 @@ const finish = (payload, code) => {
 const timer = setTimeout(() => finish({ ok: false, reason: 'timed out waiting for container-local reload_result after ' + timeoutMs + 'ms' }, 1), timeoutMs)
 ws.addEventListener('open', () => {
   const scope = process.env.TYPECLAW_RELOAD_SCOPE
-  ws.send(JSON.stringify(scope ? { type: 'reload', scope } : { type: 'reload' }))
+  const rawCause = process.env.TYPECLAW_RELOAD_CAUSE
+  ws.send(JSON.stringify({
+    type: 'reload',
+    ...(scope ? { scope } : {}),
+    ...(rawCause ? { cause: JSON.parse(rawCause) } : {}),
+  }))
 })
 ws.addEventListener('message', (event) => {
   const msg = JSON.parse(String(event.data))
@@ -53,12 +59,14 @@ export async function requestReloadViaDockerExec({
   cwd,
   token,
   scope,
+  cause,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   exec = defaultDockerExec,
 }: RequestReloadViaDockerExecOptions): Promise<ReloadResult[]> {
   const envArgs = ['-e', `TYPECLAW_CONTAINER_PORT=${CONTAINER_PORT}`, '-e', `TYPECLAW_RELOAD_TIMEOUT_MS=${timeoutMs}`]
   if (token !== null) envArgs.push('-e', `TYPECLAW_TUI_TOKEN=${token}`)
   if (scope !== undefined) envArgs.push('-e', `TYPECLAW_RELOAD_SCOPE=${scope}`)
+  if (cause !== undefined) envArgs.push('-e', `TYPECLAW_RELOAD_CAUSE=${JSON.stringify(cause)}`)
 
   const signal = AbortSignal.timeout(timeoutMs)
   let result: DockerExecResult

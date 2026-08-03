@@ -2,6 +2,11 @@ export type ReloadResultPayload =
   | { scope: string; ok: true; summary: string; details?: unknown }
   | { scope: string; ok: false; reason: string }
 
+// Structurally mirrors ReloadCause in src/reload/types.ts. Kept as its own
+// declaration so the wire protocol stays free of subsystem imports, the same
+// way ReloadResultPayload mirrors ReloadResult.
+export type ReloadCausePayload = { kind: 'credential-rotation'; adapter: string }
+
 export type PromptDelivery = 'queue' | 'steer' | 'interrupt'
 
 export type DoctorRequestId = string
@@ -171,7 +176,7 @@ export type InspectServerMessage =
 
 export type ClientMessage =
   | { type: 'prompt'; text: string; delivery?: PromptDelivery }
-  | { type: 'reload'; scope?: string }
+  | { type: 'reload'; scope?: string; cause?: ReloadCausePayload }
   | { type: 'restart' }
   | { type: 'abort' }
   | { type: 'queue_cancel'; messageId: string }
