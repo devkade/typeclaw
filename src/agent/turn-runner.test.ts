@@ -166,6 +166,53 @@ describe('promptPersistentTurnWithFallback', () => {
     expect(fake.setModels).toEqual([])
   })
 
+  test('reports tool execution to the caller on the turn that then fails', async () => {
+    // given: the same non-advancing shape as above. Callers need the signal on
+    // exactly this path — the turn is unrecoverable AND may have already
+    // committed a side effect — so it is delivered by callback rather than on
+    // the result, which the hard-throw path never returns.
+    const fake = fakeSession(['tool-then-throttle'])
+    let toolStarts = 0
+    const result = await promptPersistentTurnWithFallback({
+      refs: [REF_A],
+      currentModelRef: REF_A,
+      session: fake.session,
+      text: 'hello',
+      circuit: new ThrottleCircuit(),
+      shouldFailover: (err) => /overloaded/i.test(err.message),
+      setModelForRef: async (ref) => {
+        fake.setModels.push(ref)
+      },
+      onToolExecutionStarted: () => {
+        toolStarts++
+      },
+    })
+
+    expect(result.success).toBe(false)
+    expect(toolStarts).toBe(1)
+  })
+
+  test('leaves the caller unaware of tool execution when no tool ran', async () => {
+    const fake = fakeSession(['soft-throttle'])
+    let toolStarts = 0
+    await promptPersistentTurnWithFallback({
+      refs: [REF_A],
+      currentModelRef: REF_A,
+      session: fake.session,
+      text: 'hello',
+      circuit: new ThrottleCircuit(),
+      shouldFailover: (err) => /overloaded/i.test(err.message),
+      setModelForRef: async (ref) => {
+        fake.setModels.push(ref)
+      },
+      onToolExecutionStarted: () => {
+        toolStarts++
+      },
+    })
+
+    expect(toolStarts).toBe(0)
+  })
+
   test('does not advance for non-throttle soft errors', async () => {
     const fake = fakeSession(['soft-billing'])
     const result = await promptPersistentTurnWithFallback({

@@ -13927,6 +13927,25 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
     }
   }
 
+  function channelSendContext(text: string): AfterToolCallContext {
+    return {
+      assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
+      toolCall: {
+        type: 'toolCall',
+        id: 'tc-status',
+        name: 'channel_send',
+        arguments: { text },
+      } as AfterToolCallContext['toolCall'],
+      args: { text },
+      result: {
+        content: [{ type: 'text' as const, text: 'ignored' }],
+        details: { ok: true },
+      } as AfterToolCallContext['result'],
+      isError: false,
+      context: { systemPrompt: '', messages: [], tools: [] },
+    }
+  }
+
   // Reproduce the production order for a channel_reply({ more_work_this_turn: true }): the tool's
   // execute() calls router.send() (which bumps successfulChannelSends) BEFORE the
   // runtime fires afterToolCall (which stamps continueReplyTurn with that post-send
@@ -14418,6 +14437,240 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
     expect(sent[1]).toMatch(/connection to the upstream LLM provider dropped/i)
     expect(sent[1]).not.toContain('raw-detail')
     expect(sent[1]).not.toContain('second-raw-detail')
+  })
+
+  test('surfaces one redacted warning when a promised continuation fails in a reminder-only iteration', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '지난 기록 찾아줘' }))
+    let promptAttempt = 0
+    sessions[0]!.onPrompt = async (text) => {
+      promptAttempt++
+      if (promptAttempt === 1) {
+        await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '찾아볼게.' })
+        await sessions[0]!.agent.afterToolCall!(continueReplyContext('찾아볼게.'))
+        sessions[0]!.emit({ type: 'tool_execution_start' })
+        emptyStopAfterToolWork(sessions[0]!, 'promised-reminder')
+        return
+      }
+
+      expect(text).toContain(SEND_WILLINGNESS_NUDGE)
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket closed 1000 reminder-raw-detail' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent[0]).toBe('찾아볼게.')
+    expect(sent.filter((text) => text.startsWith('⚠️'))).toHaveLength(1)
+    expect(sent[1]).toMatch(/connection to the upstream LLM provider dropped/i)
+    expect(sent[1]).not.toContain('reminder-raw-detail')
+  })
+
+  test('surfaces one redacted warning when a channel_send status follows a promised reply before failure', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '지난 기록 찾아줘' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '찾아볼게.' })
+      await sessions[0]!.agent.afterToolCall!(continueReplyContext('찾아볼게.'))
+      const status = "Still checking… I'll keep checking."
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: status })
+      await sessions[0]!.agent.afterToolCall!(channelSendContext(status))
+      sessions[0]!.emit({ type: 'tool_execution_start' })
+      sessions[0]!.agent.state.messages = [{ role: 'toolResult' }, { role: 'assistant', stopReason: 'error' }]
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket closed 1000 status-raw-detail' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent.slice(0, 2)).toEqual(['찾아볼게.', "Still checking… I'll keep checking."])
+    expect(sent.filter((text) => text.startsWith('⚠️'))).toHaveLength(1)
+    expect(sent[2]).toMatch(/connection to the upstream LLM provider dropped/i)
+    expect(sent[2]).not.toContain('status-raw-detail')
+  })
+
+  test('suppresses the warning when system recovery fulfills a promised reply', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '지난 기록 찾아줘' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '찾아볼게.' })
+      await sessions[0]!.agent.afterToolCall!(continueReplyContext('찾아볼게.'))
+      sessions[0]!.emit({ type: 'tool_execution_start' })
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'transient server_is_overloaded' },
+      })
+      sessions[0]!.setAssistantText('Recovered answer from the existing tool results.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent).toContain('Recovered answer from the existing tool results.')
+    expect(sent.filter((text) => text.startsWith('⚠️'))).toHaveLength(0)
+  })
+
+  test('provider notices preserve an outstanding promise across a reminder-only iteration', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    let continuationDelivered = false
+    const runIdleContinuationSeam: NonNullable<CreateChannelRouterOptions['runIdleContinuation']> = async ({
+      deliver,
+    }) => {
+      if (continuationDelivered) return false
+      continuationDelivered = true
+      deliver('continue after the provider notice')
+      return true
+    }
+    const { router, sessions } = makeRouter(dir, { runIdleContinuation: runIdleContinuationSeam })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '지난 기록 찾아줘' }))
+    let promptAttempt = 0
+    sessions[0]!.onPrompt = async () => {
+      promptAttempt++
+      if (promptAttempt === 1) {
+        await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '찾아볼게.' })
+        await sessions[0]!.agent.afterToolCall!(continueReplyContext('찾아볼게.'))
+        sessions[0]!.emit({ type: 'tool_execution_start' })
+      }
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'transient server_is_overloaded' },
+      })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent.filter((text) => text.startsWith('⚠️'))).toHaveLength(2)
+  })
+
+  test('stays quiet when the dropped turn already ran tools and promised nothing further', async () => {
+    // given: the production shape — a github PR turn published a review-thread
+    // reply through the GitHub API (a tool, never a channel send, so
+    // `successfulChannelSends` stays 0) and only then lost its websocket. The
+    // notice exists so a dead turn doesn't leave the human with silence; this
+    // turn was not silent, so posting it would strand a "connection dropped"
+    // warning above the agent's own successful review.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '이 PR 다시 봐줘' }))
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.emit({ type: 'tool_execution_start' })
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket closed 1006 Connection ended' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: nothing public, but the operator keeps both the raw cause and an
+    // explicit record that a notice was withheld.
+    expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(0)
+    expect(logs.some((m) => /LLM call failed: WebSocket closed 1006/.test(m))).toBe(true)
+    expect(logs.some((m) => /provider_error_notice_suppressed reason=tool_activity_this_turn/.test(m))).toBe(true)
+  })
+
+  test('still warns when the dropped turn was genuinely silent', async () => {
+    // given: the same provider drop, but the turn never executed a tool, so
+    // nothing reached the user by any route. This is the case the notice was
+    // written for and must keep firing.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '이 PR 다시 봐줘' }))
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket closed 1006 Connection ended' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(1)
+    expect(sent.some((t) => /connection to the upstream LLM provider dropped/i.test(t))).toBe(true)
+    expect(logs.some((m) => /provider_error_notice_suppressed reason=tool_activity_this_turn/.test(m))).toBe(false)
+  })
+
+  test('does not carry tool activity across into the next user turn', async () => {
+    // given: a first turn that ran tools (suppressed), then a fresh user batch
+    // whose turn dies without touching a tool. The suppression must not leak
+    // across the logical-turn boundary and silence the second failure.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '이 PR 다시 봐줘', externalMessageId: 'm-first' }))
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.emit({ type: 'tool_execution_start' })
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket closed 1006 Connection ended' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(0)
+
+    await router.route(inbound({ text: '다시 시도해줘', externalMessageId: 'm-second' }))
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket closed 1006 Connection ended' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(1)
   })
 
   test('keeps the deferred warning latched when recovery queues an empty-continuation nudge', async () => {

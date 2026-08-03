@@ -61,6 +61,10 @@ export async function promptPersistentTurnWithFallback(opts: {
   onRetryBackoffStart?: () => void
   beforeAttempt?: (ref: ModelRef) => void
   onAttemptFailed?: (attempt: PersistentTurnAttempt) => void
+  // Fired the first time an attempt starts executing a tool. Callers use it to
+  // learn that the turn stopped being silent even when the turn ultimately
+  // fails — including the hard-throw path, where no result is ever returned.
+  onToolExecutionStarted?: () => void
   now?: () => number
 }): Promise<PersistentTurnResult> {
   if (opts.refs.length === 0) throw new Error('promptPersistentTurnWithFallback: refs[] must be non-empty')
@@ -106,7 +110,7 @@ export async function promptPersistentTurnWithFallback(opts: {
     // subagents. `skipProviderErrorSubscription` only suppresses the soft-error
     // listener (subagents capture their final message off the leaf instead, via
     // detectSoftErrorFromLeaf, so a second listener would race that capture).
-    const unsubActivity = subscribeAttemptActivity(opts.session, activity)
+    const unsubActivity = subscribeAttemptActivity(opts.session, activity, opts.onToolExecutionStarted)
     const unsubProvider = opts.skipProviderErrorSubscription
       ? () => {}
       : subscribeProviderErrorsIfAvailable(opts.session, (err) => {
@@ -291,13 +295,19 @@ function isRefUsable(
   return !circuit.isProviderOpen({ profile, ref })
 }
 
-function subscribeAttemptActivity(session: AgentSession, activity: AttemptActivity): () => void {
+function subscribeAttemptActivity(
+  session: AgentSession,
+  activity: AttemptActivity,
+  onToolExecutionStarted?: () => void,
+): () => void {
   const subscribe = (session as { subscribe?: unknown }).subscribe
   if (typeof subscribe !== 'function') return () => {}
   return session.subscribe((event: unknown) => {
     if (!isRecord(event)) return
     if (event.type === 'tool_execution_start' || event.type === 'tool_execution_end') {
+      const alreadyStarted = activity.startedToolExecution
       activity.startedToolExecution = true
+      if (!alreadyStarted) onToolExecutionStarted?.()
       return
     }
     if (event.type !== 'message_update') return
