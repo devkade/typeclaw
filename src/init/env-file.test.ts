@@ -39,6 +39,52 @@ describe('readEnvFile', () => {
     expect(env.size).toBe(1)
     expect(env.get('OK')).toBe('yes')
   })
+
+  test('strips a UTF-8 BOM from the first line, as docker --env-file does', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), '\uFEFFFIRST=one\nSECOND=two\n', 'utf8')
+    const env = readEnvFile(cwd)
+    expect(env.get('FIRST')).toBe('one')
+    expect(env.get('SECOND')).toBe('two')
+  })
+
+  test('keeps a BOM appearing on a later line as part of that key', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), 'FIRST=one\n\uFEFFSECOND=two\n', 'utf8')
+    const env = readEnvFile(cwd)
+    expect(env.get('SECOND')).toBeUndefined()
+    expect(env.get('\uFEFFSECOND')).toBe('two')
+  })
+
+  test('left-trims indented keys so an indented declaration is not reported as absent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), '   SPACED=yes\n\t\tTABBED=also\n', 'utf8')
+    const env = readEnvFile(cwd)
+    expect(env.get('SPACED')).toBe('yes')
+    expect(env.get('TABBED')).toBe('also')
+  })
+
+  test('treats an indented `#` line as a comment rather than a key', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), '   # indented comment=notakey\nREAL=value\n', 'utf8')
+    const env = readEnvFile(cwd)
+    expect(env.size).toBe(1)
+    expect(env.get('REAL')).toBe('value')
+  })
+
+  test('does not trim the value, only the leading indentation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), '  PADDED=  spaced value  \n', 'utf8')
+    expect(readEnvFile(cwd).get('PADDED')).toBe('  spaced value  ')
+  })
+
+  test('skips a key containing whitespace, which docker rejects outright', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), 'BAD KEY=value\nGOOD=value\n', 'utf8')
+    const env = readEnvFile(cwd)
+    expect(env.size).toBe(1)
+    expect(env.get('GOOD')).toBe('value')
+  })
 })
 
 describe('hasEnvKey', () => {
