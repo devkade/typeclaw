@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, relative, sep } from 'node:path'
 
 import {
   createBashToolDefinition as piCreateBashToolDefinition,
@@ -633,7 +633,11 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             args: attemptArgs,
             agentDir: opts.agentDir,
             ...(opts.permissions !== undefined
-              ? { hidden: resolveHiddenPaths(opts.permissions, liveOrigin, opts.agentDir) }
+              ? {
+                  hidden:
+                    preparedSandboxRuntime?.withheld.paths ??
+                    resolveHiddenPaths(opts.permissions, liveOrigin, opts.agentDir),
+                }
               : {}),
             signal,
           })
@@ -717,8 +721,18 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
           }
         }
       }
-      const finalError = executionError ?? cleanupError
+      let finalError = executionError ?? cleanupError
       if (finalError !== undefined) {
+        // The builtin reports command failures as execution errors rather than
+        // result details. Once the sandbox was prepared, annotate every such
+        // error without parsing its arbitrary or localized text. Cleanup-only
+        // failures are not command failures and remain unchanged.
+        if (executionError !== undefined && preparedSandboxRuntime !== undefined) {
+          finalError = appendErrorText(
+            finalError,
+            renderSandboxPolicyNote(preparedSandboxRuntime.withheld, opts.agentDir),
+          )
+        }
         await runToolAfterSafely(opts, tool.name, toolCallId, toErrorResult(finalError))
         throw finalError
       }
@@ -733,6 +747,9 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       ) {
         const hint = dependencyBinUnavailableHint(originalBashCommand, preparedSandboxRuntime.dependencyBins)
         if (hint !== undefined) result = appendTextResult(result, hint)
+      }
+      if (preparedSandboxRuntime !== undefined && bashResultHasNonzeroExit(result)) {
+        result = appendTextResult(result, renderSandboxPolicyNote(preparedSandboxRuntime.withheld, opts.agentDir))
       }
       const resolved = loopGate.resolve({ content: result.content as ContentPart[], details: result.details })
       if ('deferredBlock' in resolved) {
@@ -801,6 +818,10 @@ type PreparedBashSandbox = {
   cleanup: () => Promise<void>
   spawnEnv?: Record<string, string>
   dependencyBins?: DependencyBinReconciliation
+  withheld: {
+    paths: { dirs: string[]; files: string[] }
+    envNames: string[]
+  }
 }
 
 export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) {
@@ -826,9 +847,16 @@ async function applyBashSandbox(
   boundary: BashSandboxBoundary,
 ): Promise<PreparedBashSandbox> {
   const command = mutableArgs.command
-  if (typeof command !== 'string') return { verify: async () => {}, cleanup: async () => {} }
+  if (typeof command !== 'string') {
+    return {
+      verify: async () => {},
+      cleanup: async () => {},
+      withheld: { paths: { dirs: [], files: [] }, envNames: [] },
+    }
+  }
 
   const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
+  const envNames = resolveExposableBashEnvNames(agentDir)
   const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, envOverlay)
   const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
   await boundary.ensureAvailable()
@@ -883,9 +911,7 @@ async function applyBashSandbox(
       cwd: agentDir,
       proc,
       procSelfExe: resolveProcSelfExe(),
-      ...spreadSandboxEnv(
-        buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, resolveExposableBashEnvNames(agentDir)),
-      ),
+      ...spreadSandboxEnv(buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable)),
     })
     mutableArgs.command = commandString
     // The overlay carries command-scoped secret VALUES (e.g. a per-repo GH_TOKEN)
@@ -899,6 +925,7 @@ async function applyBashSandbox(
       cleanup,
       spawnEnv: mergedSpawnEnv,
       dependencyBins,
+      withheld: { paths: maskTargets, envNames: envNames.withheld },
     }
   } catch (error) {
     await cleanup()
@@ -911,6 +938,32 @@ function bashResultIsCommandNotFound(result: ToolResult): boolean {
   return (result.content as ContentPart[]).some(
     (part) => part.type === 'text' && /command not found(?:\s|$)/i.test(part.text),
   )
+}
+
+function bashResultHasNonzeroExit(result: ToolResult): boolean {
+  // A numeric nonzero exit is the command's tool-agnostic failure signal. Do
+  // not infer failure from arbitrary or localized output text.
+  return isRecord(result.details) && typeof result.details.exitCode === 'number' && result.details.exitCode !== 0
+}
+
+function renderSandboxPolicyNote(withheld: PreparedBashSandbox['withheld'], agentDir: string): string {
+  const maskedPaths = [...withheld.paths.dirs, ...withheld.paths.files].map(
+    (target) => `agent/${relative(agentDir, target).split(sep).join('/')}`,
+  )
+  return (
+    `[TypeClaw sandbox policy (LOCAL): masked credential/private paths: ${maskedPaths.join(', ') || 'none'}; ` +
+    `withheld env names: ${withheld.envNames.join(', ') || 'none'}. This may be unrelated to this failure; ` +
+    'it is NOT evidence about authentication of any account, workspace, or upstream service and must not be ' +
+    'reported as such.]'
+  )
+}
+
+function appendErrorText(error: unknown, text: string): Error {
+  if (error instanceof Error) {
+    error.message = `${error.message}\n\n${text}`
+    return error
+  }
+  return new Error(`${String(error)}\n\n${text}`)
 }
 
 function appendTextResult(result: ToolResult, text: string): ToolResult {
@@ -962,8 +1015,14 @@ function spreadSandboxEnv(policy: ReturnType<typeof buildSandboxEnvPolicy>): {
   return Object.keys(policy).length > 0 ? { env: policy } : {}
 }
 
-function resolveExposableBashEnvNames(agentDir: string): string[] {
-  return resolveExposableEnvNames(readEnvFile(agentDir))
+function resolveExposableBashEnvNames(agentDir: string): { exposable: string[]; withheld: string[] } {
+  const declaredEnv = readEnvFile(agentDir)
+  const exposable = resolveExposableEnvNames(declaredEnv)
+  const exposableSet = new Set(exposable)
+  const withheld = [...declaredEnv]
+    .filter(([name, value]) => value.length > 0 && !exposableSet.has(name))
+    .map(([name]) => name)
+  return { exposable, withheld }
 }
 
 function buildRoleScopedConfigEnv(
