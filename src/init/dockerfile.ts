@@ -1,3 +1,4 @@
+import { CONTAINER_AGENT_MESSENGER_CONFIG_DIR } from '@/agent-messenger/config-dir'
 import { ASKPASS_SCRIPT, TYPECLAW_GIT_ASKPASS_PATH } from '@/bundled-plugins/github-cli-auth/git-askpass'
 import { validateDockerfileAppendLine } from '@/config/config'
 import type { DockerfileConfig, DockerfileFeatureToggle } from '@/config/config'
@@ -1380,11 +1381,11 @@ ENV NODE_ENV=production
 # Persist first-party GWS config without changing global XDG/git config lookup.
 ENV GWS_CONFIG_HOME=/agent/workspace/.config/gws
 
-# Keep agent-messenger's fallback config dir inside workspace/ for any future
-# SDK fallback paths. TypeClaw's KakaoTalk adapter does not write there:
-# credentials live in secrets.json#channels.kakaotalk and container writes go
-# through hostd's secrets-patch RPC.
-ENV AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.agent-messenger
+# Keep agent-messenger runtime storage inside workspace/. LINE writes E2EE key
+# material under line-storage/ here; Instagram stores its live session here.
+# KakaoTalk credentials instead live in secrets.json#channels.kakaotalk and
+# container writes go through hostd's secrets-patch RPC.
+ENV AGENT_MESSENGER_CONFIG_DIR=${CONTAINER_AGENT_MESSENGER_CONFIG_DIR}
 
 ${customLines}ENTRYPOINT ["${TYPECLAW_ENTRYPOINT_PATH}"]
 CMD ["run"]

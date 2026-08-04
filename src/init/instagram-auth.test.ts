@@ -1,18 +1,26 @@
 import { describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { InstagramAccount } from 'agent-messenger/instagram'
 
+import { prepareAgentMessengerHostConfigDir } from '@/agent-messenger/host-config-dir'
+
 import {
-  instagramConfigDir,
   runInstagramBootstrap,
   type InstagramAuthenticateResult,
   type InstagramLoginClient,
   type InstagramLoginCredentialManager,
 } from './instagram-auth'
+
+const managedConfigDeps = {
+  prepareConfigDir: async (agentDir: string) => ({
+    ok: true as const,
+    hostDir: join(agentDir, 'workspace', '.config', 'agent-messenger'),
+  }),
+}
 
 async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'typeclaw-instagram-auth-'))
@@ -100,6 +108,50 @@ function observingClient(result: InstagramAuthenticateResult, onAuthenticate: ()
 }
 
 describe('runInstagramBootstrap', () => {
+  test('uses a stale running container legacy path without creating the managed tree', async () => {
+    await withDir(async (dir) => {
+      const legacy = join(dir, 'workspace', '.agent-messenger')
+      const current = join(dir, 'workspace', '.config', 'agent-messenger')
+      await mkdir(legacy, { recursive: true })
+      await writeFile(join(legacy, 'session.json'), 'live-session')
+      const { manager } = fakeManager()
+      const events: string[] = []
+      let observedConfigDir: string | undefined
+
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: observingClient({ userId: '12345' }, () => {
+            events.push('login')
+            observedConfigDir = process.env.AGENT_MESSENGER_CONFIG_DIR
+          }),
+        },
+        {
+          prepareConfigDir: async (agentDir) => {
+            const result = await prepareAgentMessengerHostConfigDir(agentDir, {
+              exec: async () => ({
+                exitCode: 0,
+                stdout: 'true\n["AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.agent-messenger"]\n',
+                stderr: '',
+              }),
+            })
+            events.push('prepared')
+            return result
+          },
+        },
+      )
+
+      expect(status).toEqual({ ok: true })
+      expect(events).toEqual(['prepared', 'login'])
+      expect(observedConfigDir).toBe(legacy)
+      expect(await readFile(join(legacy, 'session.json'), 'utf8')).toBe('live-session')
+      expect(existsSync(current)).toBe(false)
+    })
+  })
+
   test('points the SDK storage at the agent workspace during login, then restores the env', async () => {
     await withDir(async (dir) => {
       const savedEnv = process.env.AGENT_MESSENGER_CONFIG_DIR
@@ -107,16 +159,19 @@ describe('runInstagramBootstrap', () => {
       try {
         const { manager } = fakeManager()
         let duringLogin: string | undefined
-        await runInstagramBootstrap({
-          username: 'alice',
-          password: 'secret',
-          agentDir: dir,
-          credentialManager: manager,
-          client: observingClient({ userId: '12345' }, () => {
-            duringLogin = process.env.AGENT_MESSENGER_CONFIG_DIR
-          }),
-        })
-        expect(duringLogin ?? '').toBe(instagramConfigDir(dir))
+        await runInstagramBootstrap(
+          {
+            username: 'alice',
+            password: 'secret',
+            agentDir: dir,
+            credentialManager: manager,
+            client: observingClient({ userId: '12345' }, () => {
+              duringLogin = process.env.AGENT_MESSENGER_CONFIG_DIR
+            }),
+          },
+          managedConfigDeps,
+        )
+        expect(duringLogin ?? '').toBe(join(dir, 'workspace', '.config', 'agent-messenger'))
         expect(process.env.AGENT_MESSENGER_CONFIG_DIR).toBeUndefined()
       } finally {
         if (savedEnv === undefined) delete process.env.AGENT_MESSENGER_CONFIG_DIR
@@ -128,13 +183,16 @@ describe('runInstagramBootstrap', () => {
   test('mirrors SDK account metadata into secrets after clean authentication', async () => {
     await withDir(async (dir) => {
       const { manager, saved } = fakeManager()
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: fakeClient({ userId: '12345' }),
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: fakeClient({ userId: '12345' }),
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: true })
       expect(saved).toHaveLength(1)
       expect(saved[0]).toMatchObject({ account_id: 'alice', username: 'alice', pk: '12345' })
@@ -166,13 +224,16 @@ describe('runInstagramBootstrap', () => {
         },
         getUserId: () => null,
       }
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client,
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client,
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: false, reason: 'login exploded' })
     })
   })
@@ -188,14 +249,17 @@ describe('runInstagramBootstrap', () => {
           return { userId: '99999' }
         },
       }
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client,
-        callbacks: { onTwoFactorCode: async () => '123456' },
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client,
+          callbacks: { onTwoFactorCode: async () => '123456' },
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: true })
       expect(calls).toEqual([{ username: 'alice', code: '123456', identifier: 'tfi-abc' }])
       expect(saved[0]).toMatchObject({ pk: '99999' })
@@ -219,19 +283,22 @@ describe('runInstagramBootstrap', () => {
         },
       }
       let promptedContact = ''
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client,
-        callbacks: {
-          onChallengeCode: async ({ contactPoint }) => {
-            promptedContact = contactPoint
-            return { code: '654321' }
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client,
+          callbacks: {
+            onChallengeCode: async ({ contactPoint }) => {
+              promptedContact = contactPoint
+              return { code: '654321' }
+            },
           },
         },
-      })
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: true })
       expect(sent).toEqual(['/challenge/xyz/'])
       expect(submitted).toEqual([{ path: '/challenge/xyz/', code: '654321' }])
@@ -249,14 +316,17 @@ describe('runInstagramBootstrap', () => {
         ...fakeClient({ userId: '', requiresTwoFactor: true, twoFactorInfo: { two_factor_identifier: 'tfi-korean' } }),
         twoFactorLogin: async () => ({ userId: '55555' }),
       }
-      const status = await runInstagramBootstrap({
-        username: '앨리스',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client,
-        callbacks: { onTwoFactorCode: async () => '246810' },
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: '앨리스',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client,
+          callbacks: { onTwoFactorCode: async () => '246810' },
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: true })
       expect(saved[0]).toMatchObject({ username: '앨리스', pk: '55555' })
     })
@@ -265,13 +335,16 @@ describe('runInstagramBootstrap', () => {
   test('fails clearly when 2FA is required but no interactive prompt is available', async () => {
     await withDir(async (dir) => {
       const { manager } = fakeManager()
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: fakeClient({ userId: '', requiresTwoFactor: true, twoFactorInfo: { two_factor_identifier: 'x' } }),
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: fakeClient({ userId: '', requiresTwoFactor: true, twoFactorInfo: { two_factor_identifier: 'x' } }),
+        },
+        managedConfigDeps,
+      )
       expect(status.ok).toBe(false)
       if (status.ok) throw new Error('expected failure')
       expect(status.reason).toContain('2FA')
@@ -282,13 +355,16 @@ describe('runInstagramBootstrap', () => {
   test('fails clearly when a checkpoint is required but no interactive prompt is available', async () => {
     await withDir(async (dir) => {
       const { manager } = fakeManager()
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: fakeClient({ userId: '', challengeRequired: true, challengePath: '/challenge/' }),
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: fakeClient({ userId: '', challengeRequired: true, challengePath: '/challenge/' }),
+        },
+        managedConfigDeps,
+      )
       expect(status.ok).toBe(false)
       if (status.ok) throw new Error('expected failure')
       expect(status.reason).toContain('checkpoint')
@@ -299,14 +375,17 @@ describe('runInstagramBootstrap', () => {
   test('fails when the operator cancels the 2FA prompt', async () => {
     await withDir(async (dir) => {
       const { manager } = fakeManager()
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: fakeClient({ userId: '', requiresTwoFactor: true, twoFactorInfo: { two_factor_identifier: 'x' } }),
-        callbacks: { onTwoFactorCode: async () => null },
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: fakeClient({ userId: '', requiresTwoFactor: true, twoFactorInfo: { two_factor_identifier: 'x' } }),
+          callbacks: { onTwoFactorCode: async () => null },
+        },
+        managedConfigDeps,
+      )
       expect(status.ok).toBe(false)
       if (status.ok) throw new Error('expected failure')
       expect(status.reason).toContain('cancelled')
@@ -317,13 +396,16 @@ describe('runInstagramBootstrap', () => {
     await withDir(async (dir) => {
       const sessionPath = join(dir, 'session.json')
       const { manager } = fakeManagerWithSession(sessionPath)
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: checkpointWritingClient(),
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: checkpointWritingClient(),
+        },
+        managedConfigDeps,
+      )
       expect(status.ok).toBe(false)
       expect(existsSync(sessionPath)).toBe(false)
     })
@@ -333,14 +415,17 @@ describe('runInstagramBootstrap', () => {
     await withDir(async (dir) => {
       const sessionPath = join(dir, 'session.json')
       const { manager } = fakeManagerWithSession(sessionPath)
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: checkpointWritingClient(),
-        callbacks: { onChallengeCode: async () => null },
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: checkpointWritingClient(),
+          callbacks: { onChallengeCode: async () => null },
+        },
+        managedConfigDeps,
+      )
       expect(status.ok).toBe(false)
       expect(existsSync(sessionPath)).toBe(false)
     })
@@ -351,14 +436,17 @@ describe('runInstagramBootstrap', () => {
       const sessionPath = join(dir, 'session.json')
       await writeFile(sessionPath, JSON.stringify({ user_id: 'existing', cookies: 'valid' }))
       const { manager } = fakeManagerWithSession(sessionPath)
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: checkpointWritingClient(),
-        callbacks: { onChallengeCode: async () => null },
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: checkpointWritingClient(),
+          callbacks: { onChallengeCode: async () => null },
+        },
+        managedConfigDeps,
+      )
       expect(status.ok).toBe(false)
       const restored = JSON.parse(await readFile(sessionPath, 'utf8')) as { user_id: string }
       expect(restored.user_id).toBe('existing')
@@ -369,18 +457,21 @@ describe('runInstagramBootstrap', () => {
     await withDir(async (dir) => {
       const sessionPath = join(dir, 'session.json')
       const { manager } = fakeManagerWithSession(sessionPath)
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: checkpointWritingClient({
-          challengeSubmitCode: async () => {
-            throw new Error('invalid verification code')
-          },
-        }),
-        callbacks: { onChallengeCode: async () => ({ code: '000000' }) },
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: checkpointWritingClient({
+            challengeSubmitCode: async () => {
+              throw new Error('invalid verification code')
+            },
+          }),
+          callbacks: { onChallengeCode: async () => ({ code: '000000' }) },
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: false, reason: 'invalid verification code' })
       expect(existsSync(sessionPath)).toBe(false)
     })
@@ -391,18 +482,21 @@ describe('runInstagramBootstrap', () => {
       const sessionPath = join(dir, 'session.json')
       await writeFile(sessionPath, JSON.stringify({ user_id: 'existing', cookies: 'valid' }))
       const { manager } = fakeManagerWithSession(sessionPath)
-      const status = await runInstagramBootstrap({
-        username: 'alice',
-        password: 'secret',
-        agentDir: dir,
-        credentialManager: manager,
-        client: checkpointWritingClient({
-          challengeSubmitCode: async () => {
-            throw new Error('network error')
-          },
-        }),
-        callbacks: { onChallengeCode: async () => ({ code: '000000' }) },
-      })
+      const status = await runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'secret',
+          agentDir: dir,
+          credentialManager: manager,
+          client: checkpointWritingClient({
+            challengeSubmitCode: async () => {
+              throw new Error('network error')
+            },
+          }),
+          callbacks: { onChallengeCode: async () => ({ code: '000000' }) },
+        },
+        managedConfigDeps,
+      )
       expect(status.ok).toBe(false)
       const restored = JSON.parse(await readFile(sessionPath, 'utf8')) as { user_id: string }
       expect(restored.user_id).toBe('existing')

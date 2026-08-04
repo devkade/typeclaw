@@ -379,6 +379,11 @@ export function classifyRmStderr(stderr: string): BenignRmKind {
   return null
 }
 
+export function isGenuineMissingContainer(stderr: string): boolean {
+  const normalized = stderr.toLowerCase()
+  return normalized.includes('no such container') || normalized.includes('no such object')
+}
+
 // Detects Docker's name-conflict response from `docker run --name <X>`:
 //   docker: Error response from daemon: Conflict. The container name
 //   "/<X>" is already in use by container "<id>". You have to remove

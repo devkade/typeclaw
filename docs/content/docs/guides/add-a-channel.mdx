@@ -244,7 +244,7 @@ LINE logs in as a real user account by QR or email/PIN and stores the resulting 
 
 <Accordion title="Instagram — a personal account, no 2FA">
 
-`typeclaw channel add instagram` signs in as your own Instagram user with **username + password**. Accounts protected by 2FA or a pending checkpoint challenge are rejected at login — disable 2FA on a dedicated agent account (or clear the checkpoint in a browser first). Only account metadata lands in `secrets.json`; the live session is held by the SDK under `workspace/.agent-messenger/`, so rotating credentials means replaying the login (`typeclaw channel reauth instagram`), not editing `secrets.json`. Outbound is plain text only — no attachments — and group threads engage on the agent's alias since Instagram surfaces no native @-mention. See the [Instagram adapter reference](/docs/reference/instagram).
+`typeclaw channel add instagram` signs in as your own Instagram user with **username + password**. Accounts protected by 2FA or a pending checkpoint challenge are rejected at login — disable 2FA on a dedicated agent account (or clear the checkpoint in a browser first). Only account metadata lands in `secrets.json`; the live session is held by the SDK under `workspace/.config/agent-messenger/`, so rotating credentials means replaying the login (`typeclaw channel reauth instagram`), not editing `secrets.json`. The former `workspace/.agent-messenger/` location remains security-masked for legacy data but is not active configuration. Outbound is plain text only — no attachments — and group threads engage on the agent's alias since Instagram surfaces no native @-mention. See the [Instagram adapter reference](/docs/reference/instagram).
 
 </Accordion>
 

@@ -19,6 +19,7 @@ import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 const AGENT = '/agent'
 const hiddenDirs = (agentDir: string) => [
   join(agentDir, 'workspace', '.config', 'gws'),
+  join(agentDir, 'workspace', '.config', 'agent-messenger'),
   join(agentDir, 'workspace', '.agent-messenger'),
   join(agentDir, '.typeclaw', 'home'),
   join(agentDir, '.typeclaw', 'logs'),
@@ -28,6 +29,7 @@ const hiddenDirs = (agentDir: string) => [
 ]
 const canonicalSecretDirs = (agentDir: string) => [
   join(agentDir, 'workspace', '.config', 'gws'),
+  join(agentDir, 'workspace', '.config', 'agent-messenger'),
   join(agentDir, 'workspace', '.agent-messenger'),
   join(agentDir, '.typeclaw', 'home'),
   join(agentDir, '.typeclaw', 'logs'),

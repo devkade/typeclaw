@@ -8,9 +8,17 @@ import {
   type InstagramAccount,
 } from 'agent-messenger/instagram'
 
+import {
+  prepareAgentMessengerHostConfigDir,
+  type HostAgentMessengerConfigResult,
+} from '@/agent-messenger/host-config-dir'
 import { SecretsInstagramCredentialStore } from '@/secrets/instagram-store'
 
 export type InstagramBootstrapStatus = { ok: true } | { ok: false; reason: string }
+
+export type AgentMessengerHostConfigDeps = {
+  prepareConfigDir?: (agentDir: string) => Promise<HostAgentMessengerConfigResult>
+}
 
 // Instagram gates a fresh login behind one of two interactive second factors:
 // a 2FA code (authenticator app / SMS the account already has enabled) or a
@@ -78,44 +86,43 @@ export function instagramSecretsPath(agentDir: string): string {
   return join(agentDir, 'secrets.json')
 }
 
-export function instagramConfigDir(agentDir: string): string {
-  return join(agentDir, 'workspace', '.agent-messenger')
-}
-
-export async function runInstagramBootstrap(input: InstagramLoginInput): Promise<InstagramBootstrapStatus> {
+export async function runInstagramBootstrap(
+  input: InstagramLoginInput,
+  deps: AgentMessengerHostConfigDeps = {},
+): Promise<InstagramBootstrapStatus> {
   try {
+    const prepared = await (deps.prepareConfigDir ?? prepareAgentMessengerHostConfigDir)(input.agentDir)
+    if (!prepared.ok) return prepared
+
     const store = new SecretsInstagramCredentialStore({
       mode: 'host',
       secretsPath: instagramSecretsPath(input.agentDir),
     })
-    const result = await withInstagramConfigDir(
-      instagramConfigDir(input.agentDir),
-      async (): Promise<InstagramBootstrapStatus> => {
-        const sdkManager = new InstagramCredentialManager()
-        const manager = input.credentialManager ?? sdkManager
-        const accountId = createAccountId(input.username)
-        const paths = await manager.ensureAccountPaths(accountId)
-        const client = input.client ?? buildInstagramClient(sdkManager)
-        client.setSessionPath(paths.session_path)
+    const result = await withInstagramConfigDir(prepared.hostDir, async (): Promise<InstagramBootstrapStatus> => {
+      const sdkManager = new InstagramCredentialManager()
+      const manager = input.credentialManager ?? sdkManager
+      const accountId = createAccountId(input.username)
+      const paths = await manager.ensureAccountPaths(accountId)
+      const client = input.client ?? buildInstagramClient(sdkManager)
+      client.setSessionPath(paths.session_path)
 
-        // A checkpoint login persists a partial SDK session (challenge_path +
-        // cookies) inside authenticate(), before we know whether the operator
-        // can finish it. Snapshot the file up front and restore it on any
-        // failure — whether completeLogin returns a non-ok status (fail-closed
-        // / cancelled) or throws (e.g. challengeSubmitCode rejecting a wrong
-        // code) — so a half-written session is never left behind. Rethrow so
-        // the outer catch reports the error.
-        const sessionSnapshot = await snapshotSessionFile(paths.session_path)
-        try {
-          const result = await completeLogin({ store, manager, client, accountId, input })
-          if (!result.ok) await restoreSessionFile(paths.session_path, sessionSnapshot)
-          return result
-        } catch (err) {
-          await restoreSessionFile(paths.session_path, sessionSnapshot)
-          throw err
-        }
-      },
-    )
+      // A checkpoint login persists a partial SDK session (challenge_path +
+      // cookies) inside authenticate(), before we know whether the operator
+      // can finish it. Snapshot the file up front and restore it on any
+      // failure — whether completeLogin returns a non-ok status (fail-closed
+      // / cancelled) or throws (e.g. challengeSubmitCode rejecting a wrong
+      // code) — so a half-written session is never left behind. Rethrow so
+      // the outer catch reports the error.
+      const sessionSnapshot = await snapshotSessionFile(paths.session_path)
+      try {
+        const result = await completeLogin({ store, manager, client, accountId, input })
+        if (!result.ok) await restoreSessionFile(paths.session_path, sessionSnapshot)
+        return result
+      } catch (err) {
+        await restoreSessionFile(paths.session_path, sessionSnapshot)
+        throw err
+      }
+    })
     return result
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) }

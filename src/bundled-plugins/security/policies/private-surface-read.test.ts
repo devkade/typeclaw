@@ -317,9 +317,17 @@ describe('private-surface-read guard — traversal + scope', () => {
     expect(check('ls', { path: '/agent/.env' }, privilegedHidden)?.block).toBe(true)
     expect(check('read', { path: '/agent/auth.json' }, privilegedHidden)?.block).toBe(true)
     expect(
+      check('read', { path: '/agent/workspace/.config/agent-messenger/instagram/session.json' }, privilegedHidden)
+        ?.block,
+    ).toBe(true)
+    expect(
       check('read', { path: '/agent/workspace/.agent-messenger/slack-credentials.json' }, privilegedHidden)?.block,
     ).toBe(true)
     expect(check('read', { path: '/agent/workspace/.config/gws/credentials.json' }, privilegedHidden)?.block).toBe(true)
+    expect(check('read', { path: '/agent/workspace/.config' }, privilegedHidden)).toBeUndefined()
+    expect(
+      check('read', { path: '/agent/workspace/.config/agent-messenger-backup/session.json' }, privilegedHidden),
+    ).toBeUndefined()
     // Upgraded agents may retain the old bind-mounted credential overlay. It
     // remains canonical-secret territory even though new boots no longer use it.
     expect(check('read', { path: '/agent/.typeclaw/home/.codex/auth.json' }, privilegedHidden)?.block).toBe(true)
@@ -333,6 +341,17 @@ describe('private-surface-read guard — traversal + scope', () => {
     )
     expect(check('read', { path: '/home/agent/.codex/auth.json' }, privilegedHidden)?.block).toBe(true)
     expect(check('read', { path: '/home/agent/.claude/.credentials.json' }, privilegedHidden)?.block).toBe(true)
+    expect(
+      check('read', { path: path.join(homedir(), '.config', 'agent-messenger', 'credentials.json') }, privilegedHidden)
+        ?.block,
+    ).toBe(true)
+    expect(
+      check(
+        'read',
+        { path: path.join(homedir(), '.config', 'agent-messenger-backup', 'credentials.json') },
+        privilegedHidden,
+      ),
+    ).toBeUndefined()
   })
 
   test('bash is never blocked here (its access is contained by the bwrap sandbox)', () => {

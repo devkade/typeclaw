@@ -1395,7 +1395,7 @@ describe('versioned per-agent Dockerfile (base-image-pinning)', () => {
 
     // then: every per-agent tail directive is present, in order
     expect(out).toContain('ENV NODE_ENV=production')
-    expect(out).toContain('ENV AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.agent-messenger')
+    expect(out).toContain('ENV AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.config/agent-messenger')
     expect(out).toContain('ENV CUSTOM_TOOL=1')
     expect(out).toContain(`ENTRYPOINT ["${TYPECLAW_ENTRYPOINT_PATH}"]`)
     expect(out).toContain('CMD ["run"]')

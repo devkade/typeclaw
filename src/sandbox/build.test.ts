@@ -292,18 +292,24 @@ describe('buildSandboxedCommand writable overlays', () => {
   test('renders writable overlays after the root but before nested masks', () => {
     const argv = argvOf('true', {
       mounts: [{ type: 'ro-bind', source: '/agent', dest: '/agent' }],
-      masks: { dirs: ['/agent/workspace/.agent-messenger'], files: ['/agent/workspace/.env'] },
+      masks: {
+        dirs: ['/agent/workspace/.config/agent-messenger', '/agent/workspace/.agent-messenger'],
+        files: ['/agent/workspace/.env'],
+      },
       writable: { dirs: ['/agent/workspace'], files: ['/agent/AGENTS.md'] },
     })
     const roRootDest = argv.indexOf('/agent')
-    const messengerMask = argv.indexOf('/agent/workspace/.agent-messenger')
+    const messengerMask = argv.indexOf('/agent/workspace/.config/agent-messenger')
+    const legacyMessengerMask = argv.indexOf('/agent/workspace/.agent-messenger')
     const envMask = argv.indexOf('/agent/workspace/.env')
     const writableDir = argv.indexOf('/agent/workspace')
     const writableFile = argv.indexOf('/agent/AGENTS.md')
     expect(roRootDest).toBeLessThan(writableDir)
     expect(writableDir).toBeLessThan(messengerMask)
+    expect(writableDir).toBeLessThan(legacyMessengerMask)
     expect(writableDir).toBeLessThan(envMask)
     expect(writableFile).toBeLessThan(messengerMask)
+    expect(writableFile).toBeLessThan(legacyMessengerMask)
   })
 
   test('emits no writable binds when the policy omits them', () => {

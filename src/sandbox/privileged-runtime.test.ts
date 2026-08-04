@@ -35,7 +35,7 @@ describe('resolvePrivilegedSandboxRuntime', () => {
 
   test('ordinary privileged bash receives no credential-bearing config mounts or env', async () => {
     const gws = path.join(agentDir, 'workspace', '.config', 'gws')
-    const messenger = path.join(agentDir, 'workspace', '.agent-messenger')
+    const messenger = path.join(agentDir, 'workspace', '.config', 'agent-messenger')
     const runtime = await resolvePrivilegedSandboxRuntime({
       agentDir,
       homeDir: home,
@@ -138,7 +138,7 @@ describe('resolvePrivilegedSandboxRuntime', () => {
 
   test('never brokers GWS or agent-messenger credentials to upload-capable CLIs', async () => {
     const gws = path.join(agentDir, 'workspace', '.config', 'gws')
-    const messenger = path.join(agentDir, 'workspace', '.agent-messenger')
+    const messenger = path.join(agentDir, 'workspace', '.config', 'agent-messenger')
     await mkdir(gws, { recursive: true })
     await mkdir(messenger, { recursive: true })
     await writeFile(path.join(gws, 'credentials.json'), '{}')

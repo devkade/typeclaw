@@ -1,13 +1,22 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { LineLoginResult } from 'agent-messenger/line'
 
+import { prepareAgentMessengerHostConfigDir } from '@/agent-messenger/host-config-dir'
 import { SecretsLineCredentialStore } from '@/secrets/line-store'
 
-import { lineConfigDir, runLineBootstrap, type LineLoginClient } from './line-auth'
+import { runLineBootstrap, type LineLoginClient } from './line-auth'
+
+const managedConfigDeps = {
+  prepareConfigDir: async (agentDir: string) => ({
+    ok: true as const,
+    hostDir: join(agentDir, 'workspace', '.config', 'agent-messenger'),
+  }),
+}
 
 async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'typeclaw-line-auth-'))
@@ -138,22 +147,63 @@ function throwingLoggingClient(): LineLoginClient {
 }
 
 describe('runLineBootstrap', () => {
+  test('prepares a stopped legacy install before login and exposes the migrated host path to the client', async () => {
+    await withDir(async (dir) => {
+      const legacy = join(dir, 'workspace', '.agent-messenger')
+      const expected = join(dir, 'workspace', '.config', 'agent-messenger')
+      await mkdir(legacy, { recursive: true })
+      await writeFile(join(legacy, 'e2ee.key'), 'legacy-key')
+      const events: string[] = []
+      let observedConfigDir: string | undefined
+
+      const status = await runLineBootstrap(
+        {
+          method: 'qr',
+          agentDir: dir,
+          callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+          client: observingClient(dir, { authenticated: true, account_id: 'mid-upgrade' }, () => {
+            events.push('login')
+            observedConfigDir = process.env.AGENT_MESSENGER_CONFIG_DIR
+          }),
+        },
+        {
+          prepareConfigDir: async (agentDir) => {
+            const result = await prepareAgentMessengerHostConfigDir(agentDir, {
+              exec: async () => ({ exitCode: 0, stdout: 'false\n[]\n', stderr: '' }),
+            })
+            events.push('prepared')
+            return result
+          },
+        },
+      )
+
+      expect(status).toEqual({ ok: true })
+      expect(events).toEqual(['prepared', 'login'])
+      expect(observedConfigDir).toBe(expected)
+      expect(await readFile(join(expected, 'e2ee.key'), 'utf8')).toBe('legacy-key')
+      expect(existsSync(legacy)).toBe(false)
+    })
+  })
+
   test('points the SDK E2EE storage at the agent workspace during login, then restores the env', async () => {
     await withDir(async (dir) => {
       const saved = process.env.AGENT_MESSENGER_CONFIG_DIR
       delete process.env.AGENT_MESSENGER_CONFIG_DIR
       try {
         let duringLogin: string | undefined
-        await runLineBootstrap({
-          method: 'qr',
-          agentDir: dir,
-          callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-          client: observingClient(dir, { authenticated: true, account_id: 'mid-cfg' }, () => {
-            duringLogin = process.env.AGENT_MESSENGER_CONFIG_DIR
-          }),
-        })
+        await runLineBootstrap(
+          {
+            method: 'qr',
+            agentDir: dir,
+            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+            client: observingClient(dir, { authenticated: true, account_id: 'mid-cfg' }, () => {
+              duringLogin = process.env.AGENT_MESSENGER_CONFIG_DIR
+            }),
+          },
+          managedConfigDeps,
+        )
         // set for the SDK during login...
-        expect(duringLogin ?? '').toBe(lineConfigDir(dir))
+        expect(duringLogin ?? '').toBe(join(dir, 'workspace', '.config', 'agent-messenger'))
         // ...and restored afterward so it cannot leak into a later bootstrap
         expect(process.env.AGENT_MESSENGER_CONFIG_DIR).toBeUndefined()
       } finally {
@@ -169,24 +219,30 @@ describe('runLineBootstrap', () => {
         const saved = process.env.AGENT_MESSENGER_CONFIG_DIR
         delete process.env.AGENT_MESSENGER_CONFIG_DIR
         try {
-          await runLineBootstrap({
-            method: 'qr',
-            agentDir: dirA,
-            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-            client: fakeClient(dirA, { authenticated: true, account_id: 'mid-a' }),
-          })
+          await runLineBootstrap(
+            {
+              method: 'qr',
+              agentDir: dirA,
+              callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+              client: fakeClient(dirA, { authenticated: true, account_id: 'mid-a' }),
+            },
+            managedConfigDeps,
+          )
 
           let duringSecond: string | undefined
-          await runLineBootstrap({
-            method: 'qr',
-            agentDir: dirB,
-            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-            client: observingClient(dirB, { authenticated: true, account_id: 'mid-b' }, () => {
-              duringSecond = process.env.AGENT_MESSENGER_CONFIG_DIR
-            }),
-          })
+          await runLineBootstrap(
+            {
+              method: 'qr',
+              agentDir: dirB,
+              callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+              client: observingClient(dirB, { authenticated: true, account_id: 'mid-b' }, () => {
+                duringSecond = process.env.AGENT_MESSENGER_CONFIG_DIR
+              }),
+            },
+            managedConfigDeps,
+          )
           // the second bootstrap uses its OWN agent dir, not the first's
-          expect(duringSecond ?? '').toBe(lineConfigDir(dirB))
+          expect(duringSecond ?? '').toBe(join(dirB, 'workspace', '.config', 'agent-messenger'))
         } finally {
           if (saved === undefined) delete process.env.AGENT_MESSENGER_CONFIG_DIR
           else process.env.AGENT_MESSENGER_CONFIG_DIR = saved
@@ -195,22 +251,25 @@ describe('runLineBootstrap', () => {
     })
   })
 
-  test('does not override an already-set config dir (container stage owns it)', async () => {
+  test('replaces an ambient config dir during host login and restores it afterward', async () => {
     await withDir(async (dir) => {
       const saved = process.env.AGENT_MESSENGER_CONFIG_DIR
-      process.env.AGENT_MESSENGER_CONFIG_DIR = '/agent/workspace/.agent-messenger'
+      process.env.AGENT_MESSENGER_CONFIG_DIR = '/agent/workspace/.config/agent-messenger'
       try {
         let duringLogin: string | undefined
-        await runLineBootstrap({
-          method: 'qr',
-          agentDir: dir,
-          callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-          client: observingClient(dir, { authenticated: true, account_id: 'mid-cfg2' }, () => {
-            duringLogin = process.env.AGENT_MESSENGER_CONFIG_DIR
-          }),
-        })
-        expect(duringLogin ?? '').toBe('/agent/workspace/.agent-messenger')
-        expect(process.env.AGENT_MESSENGER_CONFIG_DIR ?? '').toBe('/agent/workspace/.agent-messenger')
+        await runLineBootstrap(
+          {
+            method: 'qr',
+            agentDir: dir,
+            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+            client: observingClient(dir, { authenticated: true, account_id: 'mid-cfg2' }, () => {
+              duringLogin = process.env.AGENT_MESSENGER_CONFIG_DIR
+            }),
+          },
+          managedConfigDeps,
+        )
+        expect(duringLogin ?? '').toBe(join(dir, 'workspace', '.config', 'agent-messenger'))
+        expect(process.env.AGENT_MESSENGER_CONFIG_DIR ?? '').toBe('/agent/workspace/.config/agent-messenger')
       } finally {
         if (saved === undefined) delete process.env.AGENT_MESSENGER_CONFIG_DIR
         else process.env.AGENT_MESSENGER_CONFIG_DIR = saved
@@ -220,12 +279,15 @@ describe('runLineBootstrap', () => {
 
   test('persists the account and sets it current on a successful QR login', async () => {
     await withDir(async (dir) => {
-      const status = await runLineBootstrap({
-        method: 'qr',
-        agentDir: dir,
-        callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-        client: fakeClient(dir, { authenticated: true, account_id: 'mid-1', display_name: 'Alice' }),
-      })
+      const status = await runLineBootstrap(
+        {
+          method: 'qr',
+          agentDir: dir,
+          callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+          client: fakeClient(dir, { authenticated: true, account_id: 'mid-1', display_name: 'Alice' }),
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: true })
 
       const raw = JSON.parse(await readFile(join(dir, 'secrets.json'), 'utf8')) as {
@@ -237,38 +299,47 @@ describe('runLineBootstrap', () => {
 
   test('persists the account on a successful email login', async () => {
     await withDir(async (dir) => {
-      const status = await runLineBootstrap({
-        method: 'email',
-        email: 'a@example.com',
-        password: 'secret',
-        agentDir: dir,
-        callbacks: { onPincode: () => {} },
-        client: fakeClient(dir, { authenticated: true, account_id: 'mid-2' }),
-      })
+      const status = await runLineBootstrap(
+        {
+          method: 'email',
+          email: 'a@example.com',
+          password: 'secret',
+          agentDir: dir,
+          callbacks: { onPincode: () => {} },
+          client: fakeClient(dir, { authenticated: true, account_id: 'mid-2' }),
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: true })
     })
   })
 
   test('reports a failure reason when login does not authenticate', async () => {
     await withDir(async (dir) => {
-      const status = await runLineBootstrap({
-        method: 'qr',
-        agentDir: dir,
-        callbacks: { onPincode: () => {} },
-        client: fakeClient(dir, { authenticated: false, error: 'pin rejected' }),
-      })
+      const status = await runLineBootstrap(
+        {
+          method: 'qr',
+          agentDir: dir,
+          callbacks: { onPincode: () => {} },
+          client: fakeClient(dir, { authenticated: false, error: 'pin rejected' }),
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: false, reason: 'pin rejected' })
     })
   })
 
   test('fails when login authenticates but no credentials were persisted', async () => {
     await withDir(async (dir) => {
-      const status = await runLineBootstrap({
-        method: 'qr',
-        agentDir: dir,
-        callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-        client: nonPersistingClient({ authenticated: true, account_id: 'mid-1' }),
-      })
+      const status = await runLineBootstrap(
+        {
+          method: 'qr',
+          agentDir: dir,
+          callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+          client: nonPersistingClient({ authenticated: true, account_id: 'mid-1' }),
+        },
+        managedConfigDeps,
+      )
       expect(status).toEqual({ ok: false, reason: 'LINE login authenticated but did not persist credentials' })
     })
   })
@@ -282,12 +353,15 @@ describe('runLineBootstrap', () => {
       }
       console.log = captureLog
       try {
-        const status = await runLineBootstrap({
-          method: 'qr',
-          agentDir: dir,
-          callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-          client: loggingClient(dir),
-        })
+        const status = await runLineBootstrap(
+          {
+            method: 'qr',
+            agentDir: dir,
+            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+            client: loggingClient(dir),
+          },
+          managedConfigDeps,
+        )
 
         expect(status).toEqual({ ok: true })
         expect(console.log).toBe(captureLog)
@@ -312,25 +386,31 @@ describe('runLineBootstrap', () => {
         }
         console.log = captureLog
         try {
-          const first = runLineBootstrap({
-            method: 'qr',
-            agentDir: firstDir,
-            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-            client: controlledLoggingClient(firstDir, 'mid-first', entered, firstRelease.promise),
-          })
-          const second = runLineBootstrap({
-            method: 'qr',
-            agentDir: secondDir,
-            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-            client: controlledLoggingClient(secondDir, 'mid-second', entered, secondRelease.promise),
-          })
+          const first = runLineBootstrap(
+            {
+              method: 'qr',
+              agentDir: firstDir,
+              callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+              client: controlledLoggingClient(firstDir, 'mid-first', entered, firstRelease.promise),
+            },
+            managedConfigDeps,
+          )
+          const second = runLineBootstrap(
+            {
+              method: 'qr',
+              agentDir: secondDir,
+              callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+              client: controlledLoggingClient(secondDir, 'mid-second', entered, secondRelease.promise),
+            },
+            managedConfigDeps,
+          )
 
-          await Promise.resolve()
+          for (let i = 0; i < 5 && entered.length === 0; i++) await Promise.resolve()
           expect(entered).toEqual(['mid-first'])
 
           firstRelease.resolve()
           await expect(first).resolves.toEqual({ ok: true })
-          await Promise.resolve()
+          for (let i = 0; i < 5 && entered.length === 1; i++) await Promise.resolve()
           expect(entered).toEqual(['mid-first', 'mid-second'])
 
           secondRelease.resolve()
@@ -354,12 +434,15 @@ describe('runLineBootstrap', () => {
       }
       console.log = captureLog
       try {
-        const status = await runLineBootstrap({
-          method: 'qr',
-          agentDir: dir,
-          callbacks: { onPincode: () => {}, onQRUrl: () => {} },
-          client: throwingLoggingClient(),
-        })
+        const status = await runLineBootstrap(
+          {
+            method: 'qr',
+            agentDir: dir,
+            callbacks: { onPincode: () => {}, onQRUrl: () => {} },
+            client: throwingLoggingClient(),
+          },
+          managedConfigDeps,
+        )
 
         expect(status).toEqual({ ok: false, reason: 'login exploded' })
         expect(console.log).toBe(captureLog)

@@ -3,10 +3,16 @@ import { join } from 'node:path'
 
 const ENV_FILE = '.env'
 
-// Parse the agent's `.env` into a key-value map, matching Docker's
-// `--env-file` parser semantics: blank lines and `#`-lines ignored, no
-// quote stripping, no shell expansion, no whitespace trimming around `=`.
-// Lines without `=` are skipped. Last value wins on duplicate keys.
+// Parse the agent's `.env` into a key-value map, mirroring Docker's
+// `--env-file` parser (docker/cli `pkg/kvfile.parseKeyValueFile`): a UTF-8 BOM
+// is stripped from the FIRST line only, every line is left-trimmed of Unicode
+// whitespace BEFORE the blank/`#` check, and nothing is trimmed around or after
+// `=` (no quote stripping, no shell expansion). Last value wins on duplicates.
+//
+// The normalization is load-bearing, not cosmetic: Docker accepts a BOM-prefixed
+// or indented `KEY=value` and passes it to the container, so a parser that missed
+// those would report an operator-declared variable as absent — which callers read
+// as "TypeClaw may manage this", e.g. migrating a deliberately pinned directory.
 export function readEnvFile(cwd: string): Map<string, string> {
   const out = new Map<string, string>()
   let raw: string
@@ -16,14 +22,22 @@ export function readEnvFile(cwd: string): Map<string, string> {
     if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return out
     throw err
   }
-  for (const line of raw.split(/\r?\n/)) {
+  const lines = raw.split(/\r?\n/)
+  for (const [index, rawLine] of lines.entries()) {
+    const withoutBom = index === 0 ? rawLine.replace(/^\uFEFF/, '') : rawLine
+    // \p{White_Space}, not \s: JS \s also matches U+FEFF (and misses U+0085),
+    // so \s would strip a BOM on EVERY line while Go's unicode.IsSpace — which
+    // Docker uses — strips it on line 1 only.
+    const line = withoutBom.replace(/^\p{White_Space}+/u, '')
     if (line.length === 0) continue
     if (line.startsWith('#')) continue
     const eq = line.indexOf('=')
     if (eq <= 0) continue
     const key = line.slice(0, eq)
-    const value = line.slice(eq + 1)
-    out.set(key, value)
+    // Docker rejects the whole file when a key contains a space or tab, so such
+    // a line can never reach a container; skip it rather than inventing a key.
+    if (/[ \t]/.test(key)) continue
+    out.set(key, line.slice(eq + 1))
   }
   return out
 }

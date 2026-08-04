@@ -297,7 +297,7 @@ describe('runAddChannel', () => {
     }
     expect(kakao.currentAccount).toBe('user-1')
     expect(kakao.accounts['user-1']?.oauth_token).toBe('oauth-abc')
-    expect(existsSync(join(root, 'workspace', '.agent-messenger', 'kakaotalk-credentials.json'))).toBe(false)
+    expect(existsSync(join(root, 'workspace', '.config', 'agent-messenger', 'kakaotalk-credentials.json'))).toBe(false)
   })
 
   test('aborts and leaves typeclaw.json + secrets.json untouched when kakaotalk auth fails', async () => {
