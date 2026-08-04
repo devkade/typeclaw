@@ -5,9 +5,8 @@ import {
   resolveController,
   resolveHostPort,
   resolveTuiToken,
-  type StartOptions,
-  type StartResult,
-  type StopResult,
+  type RestartOptions,
+  type RestartResult,
 } from '@/container'
 import {
   applyCredentialRotation,
@@ -116,17 +115,15 @@ export const hostdCommand = defineCommand({
 
 export type HostdRestartDeps = {
   validateConfig: (cwd: string) => ValidateConfigResult
-  stop: (opts: { cwd: string }) => Promise<StopResult>
   loadConfigSync: (cwd: string) => Config
-  start: (opts: StartOptions) => Promise<StartResult>
+  restart: (opts: RestartOptions) => Promise<RestartResult>
 }
 
 const controller = resolveController()
 const defaultRestartDeps: HostdRestartDeps = {
   validateConfig,
-  stop: (opts) => controller.stop(opts),
   loadConfigSync,
-  start: (opts) => controller.start(opts),
+  restart: (opts) => controller.restart(opts),
 }
 
 export function buildHostdRestart(
@@ -134,7 +131,7 @@ export function buildHostdRestart(
   deps: HostdRestartDeps = defaultRestartDeps,
   daemonVersion?: string,
 ): SupervisorRestart {
-  return async ({ containerName, cwd, build = false, currentHostDaemon }) => {
+  return async ({ containerName, cwd, build = false, currentHostDaemon, operationLease }) => {
     const drift = await detectSourceDrift(cliEntry, daemonVersion)
     if (drift) return { ok: false, reason: drift }
 
@@ -142,19 +139,17 @@ export function buildHostdRestart(
     if (!validated.ok) {
       return { ok: false, reason: `invalid config for ${containerName}: ${validated.reason}` }
     }
-    const stopResult = await deps.stop({ cwd })
-    if (!stopResult.ok) return { ok: false, reason: `stop failed: ${stopResult.reason}` }
-
     const cfg = deps.loadConfigSync(cwd)
-    const startResult = await deps.start({
+    const restartResult = await deps.restart({
       cwd,
       preferredHostPort: cfg.port,
       forceBuild: build,
       cliEntry,
       reuseCurrentHostDaemon: true,
+      operationLease,
       ...(currentHostDaemon ? { currentHostDaemon } : {}),
     })
-    if (!startResult.ok) return { ok: false, reason: `start failed: ${startResult.reason}` }
+    if (!restartResult.ok) return restartResult
     return { ok: true }
   }
 }

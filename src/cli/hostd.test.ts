@@ -2,20 +2,19 @@ import { describe, expect, test } from 'bun:test'
 import { join } from 'node:path'
 
 import { configSchema } from '@/config'
-import type { StartOptions, StartResult } from '@/container'
+import type { RestartOptions, RestartResult, StartOptions, StartResult } from '@/container'
 
 import { buildHostdRestart, buildHostdRestartPreflight } from './hostd'
 
 describe('buildHostdRestart', () => {
   test('restarts through the already-running hostd instead of triggering drift respawn', async () => {
-    const starts: StartOptions[] = []
+    const starts: RestartOptions[] = []
     const restart = buildHostdRestart('/repo/src/cli/index.ts', {
       validateConfig: () => ({ ok: true }),
-      stop: async () => ({ ok: true, containerName: 'agent', running: true }),
       loadConfigSync: () => configSchema.parse({ port: 61234 }),
-      start: async (opts) => {
+      restart: async (opts) => {
         starts.push(opts)
-        return startOk(opts)
+        return restartOk(opts)
       },
     })
 
@@ -33,14 +32,13 @@ describe('buildHostdRestart', () => {
   })
 
   test('forwards build:true to start() as forceBuild', async () => {
-    const starts: StartOptions[] = []
+    const starts: RestartOptions[] = []
     const restart = buildHostdRestart('/repo/src/cli/index.ts', {
       validateConfig: () => ({ ok: true }),
-      stop: async () => ({ ok: true, containerName: 'agent', running: true }),
       loadConfigSync: () => configSchema.parse({ port: 61234 }),
-      start: async (opts) => {
+      restart: async (opts) => {
         starts.push(opts)
-        return startOk(opts)
+        return restartOk(opts)
       },
     })
 
@@ -52,16 +50,15 @@ describe('buildHostdRestart', () => {
   })
 
   test('refuses daemon-owned restart when hostd source has drifted', async () => {
-    const starts: StartOptions[] = []
+    const starts: RestartOptions[] = []
     const restart = buildHostdRestart(
       join(process.cwd(), 'src/cli/index.ts'),
       {
         validateConfig: () => ({ ok: true }),
-        stop: async () => ({ ok: true, containerName: 'agent', running: true }),
         loadConfigSync: () => configSchema.parse({ port: 61234 }),
-        start: async (opts) => {
+        restart: async (opts) => {
           starts.push(opts)
-          return startOk(opts)
+          return restartOk(opts)
         },
       },
       'stale-version',
@@ -131,15 +128,14 @@ describe('buildHostdRestart', () => {
   })
 
   test('forwards the daemon-supplied currentHostDaemon into start()', async () => {
-    const starts: StartOptions[] = []
+    const starts: RestartOptions[] = []
     const register = async (): Promise<{ ok: true }> => ({ ok: true })
     const restart = buildHostdRestart('/repo/src/cli/index.ts', {
       validateConfig: () => ({ ok: true }),
-      stop: async () => ({ ok: true, containerName: 'agent', running: true }),
       loadConfigSync: () => configSchema.parse({ port: 61234 }),
-      start: async (opts) => {
+      restart: async (opts) => {
         starts.push(opts)
-        return startOk(opts)
+        return restartOk(opts)
       },
     })
 
@@ -154,14 +150,13 @@ describe('buildHostdRestart', () => {
   })
 
   test('omits currentHostDaemon when the daemon does not supply one', async () => {
-    const starts: StartOptions[] = []
+    const starts: RestartOptions[] = []
     const restart = buildHostdRestart('/repo/src/cli/index.ts', {
       validateConfig: () => ({ ok: true }),
-      stop: async () => ({ ok: true, containerName: 'agent', running: true }),
       loadConfigSync: () => configSchema.parse({ port: 61234 }),
-      start: async (opts) => {
+      restart: async (opts) => {
         starts.push(opts)
-        return startOk(opts)
+        return restartOk(opts)
       },
     })
 
@@ -171,14 +166,13 @@ describe('buildHostdRestart', () => {
   })
 
   test('omitted build defaults to forceBuild:false', async () => {
-    const starts: StartOptions[] = []
+    const starts: RestartOptions[] = []
     const restart = buildHostdRestart('/repo/src/cli/index.ts', {
       validateConfig: () => ({ ok: true }),
-      stop: async () => ({ ok: true, containerName: 'agent', running: true }),
       loadConfigSync: () => configSchema.parse({ port: 61234 }),
-      start: async (opts) => {
+      restart: async (opts) => {
         starts.push(opts)
-        return startOk(opts)
+        return restartOk(opts)
       },
     })
 
@@ -189,7 +183,7 @@ describe('buildHostdRestart', () => {
   })
 })
 
-function startOk(opts: StartOptions): StartResult {
+function startOk(opts: StartOptions): Extract<StartResult, { ok: true }> {
   return {
     ok: true,
     plan: {
@@ -211,5 +205,13 @@ function startOk(opts: StartOptions): StartResult {
     autoUpgrade: { kind: 'skipped-no-dep' },
     skippedPlugins: [],
     dockerfileWarnings: [],
+  }
+}
+
+function restartOk(opts: RestartOptions): RestartResult {
+  return {
+    ok: true,
+    stop: { ok: true, containerName: 'agent', running: true },
+    start: startOk({ cwd: opts.cwd, preferredHostPort: opts.preferredHostPort }),
   }
 }

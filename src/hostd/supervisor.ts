@@ -1,4 +1,9 @@
 import type { CurrentHostDaemon } from '@/container'
+import {
+  type AgentOperationLease,
+  reserveAgentOperationLock,
+  type ReserveAgentOperationLock,
+} from '@/container/agent-operation-lock'
 
 import type { Response } from './protocol'
 
@@ -13,6 +18,7 @@ export type SupervisorRestart = (input: {
   // Injected by the daemon so the restart registers the container in-process
   // instead of over the socket — see CurrentHostDaemon docs in src/container.
   currentHostDaemon?: CurrentHostDaemon
+  operationLease?: AgentOperationLease
 }) => Promise<{ ok: true } | { ok: false; reason: string }>
 
 export type SupervisorOptions = {
@@ -30,34 +36,43 @@ export type Supervisor = {
     cwd: string
     build?: boolean
     currentHostDaemon?: CurrentHostDaemon
-  }) => Response
+  }) => Promise<Response>
 }
 
 export type SupervisorBuildOptions = {
   restart: SupervisorRestart
   onLog: (event: SupervisorLogEvent) => void
   isStopped: () => boolean
+  reserveLock?: ReserveAgentOperationLock
 }
 
-// The daemon ACKs the agent immediately so the container can exit cleanly,
-// then runs stop+start in the background. If we ran them inline the agent's
-// own RPC connection would die when its container stopped — guaranteed to
-// race because `docker stop` is the very thing we're about to do. Errors are
-// surfaced via the log channel; there is no connected client to receive them.
-export function buildSupervisor({ restart, onLog, isStopped }: SupervisorBuildOptions): Supervisor {
+// The daemon reserves the lifecycle lock before ACKing, then runs stop+start in
+// the background so the agent's RPC connection can close before `docker stop`.
+// The requester exits about 500 ms after the ACK, so a lock failure discovered
+// later would be invisible; rejecting the ACK lets the agent surface and retry
+// the error. Failures after scheduling are still surfaced through the log channel.
+export function buildSupervisor({
+  restart,
+  onLog,
+  isStopped,
+  reserveLock = reserveAgentOperationLock,
+}: SupervisorBuildOptions): Supervisor {
   return {
-    scheduleRestart: ({ containerName, cwd, build = false, currentHostDaemon }): Response => {
+    scheduleRestart: async ({ containerName, cwd, build = false, currentHostDaemon }): Promise<Response> => {
       if (isStopped()) return { ok: false, reason: 'daemon stopping' }
+      const reservation = await reserveLock({ agentDir: cwd, operation: 'restart' })
+      if (!reservation.ok) return { ok: false, reason: reservation.reason }
       onLog({ kind: 'restart-scheduled', containerName, build })
-      void runRestart()
+      void runRestart(reservation.lease, reservation.release)
       return { ok: true }
 
-      async function runRestart(): Promise<void> {
+      async function runRestart(lease: AgentOperationLease, release: () => Promise<void>): Promise<void> {
         try {
           const result = await restart({
             containerName,
             cwd,
             build,
+            operationLease: lease,
             ...(currentHostDaemon ? { currentHostDaemon } : {}),
           })
           if (result.ok) onLog({ kind: 'restart-completed', containerName })
@@ -68,6 +83,8 @@ export function buildSupervisor({ restart, onLog, isStopped }: SupervisorBuildOp
             containerName,
             reason: error instanceof Error ? error.message : String(error),
           })
+        } finally {
+          await release().catch(() => {})
         }
       }
     },

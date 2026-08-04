@@ -527,7 +527,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       ? await opts.restartPreflight({ containerName: req.containerName, cwd, build: req.build })
       : null
     if (preflight) return preflight
-    const ack = supervisor.scheduleRestart({
+    const ack = await supervisor.scheduleRestart({
       containerName: req.containerName,
       cwd,
       build: req.build,
