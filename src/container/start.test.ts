@@ -15,6 +15,7 @@ import { buildDockerfile } from '@/init/dockerfile'
 import { buildGitignore } from '@/init/gitignore'
 import { isWindows } from '@/shared'
 
+import type { WithAgentOperationLock } from './agent-operation-lock'
 import type { DockerExec } from './shared'
 import {
   commitSystemFile,
@@ -1640,6 +1641,108 @@ function fakeDockerExec(scenario: {
 }
 
 describe('start (composition)', () => {
+  test('holds the operation lock from inspection through migration, launch, and verification', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const legacy = join(root, 'workspace', '.agent-messenger')
+    const canonical = join(root, 'workspace', '.config', 'agent-messenger')
+    await mkdir(legacy, { recursive: true })
+    await writeFile(join(legacy, 'key'), 'material')
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const events: string[] = []
+    let recordedInspect = false
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'inspect' && !recordedInspect) {
+        recordedInspect = true
+        events.push('inspect')
+      }
+      if (args[0] === 'run') {
+        if (!existsSync(legacy) && existsSync(join(canonical, 'key'))) events.push('migration')
+        events.push('docker-run')
+      }
+      return await docker.exec(args, options)
+    }
+    const operationLock: WithAgentOperationLock = async (input, run) => {
+      events.push('lock-enter')
+      const value = await run({ containerName: basename(input.agentDir), agentDir: input.agentDir })
+      events.push('lock-exit')
+      return { ok: true, value }
+    }
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      operationLock,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      ensureModels: noEnsureModels,
+      autoUpgrade: noAutoUpgrade,
+      verifyRunning: async () => {
+        events.push('verify')
+        return { ok: true }
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(events).toEqual(['lock-enter', 'inspect', 'migration', 'docker-run', 'verify', 'lock-exit'])
+  })
+
+  test('contention prevents Docker and agent-messenger migration side effects', async () => {
+    const legacy = join(root, 'workspace', '.agent-messenger')
+    const canonical = join(root, 'workspace', '.config', 'agent-messenger')
+    await mkdir(legacy, { recursive: true })
+    await writeFile(join(legacy, 'key'), 'material')
+    const calls: string[][] = []
+    const operationLock: WithAgentOperationLock = async () => ({ ok: false, reason: 'contended' })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      operationLock,
+      exec: async (args) => {
+        calls.push(args)
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+      ensureModels: noEnsureModels,
+    })
+
+    expect(result).toEqual({ ok: false, reason: 'contended' })
+    expect(calls).toEqual([])
+    expect(await readFile(join(legacy, 'key'), 'utf8')).toBe('material')
+    expect(existsSync(canonical)).toBe(false)
+  })
+
+  test('re-probes immediately before migration and refuses a container that became running', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const legacy = join(root, 'workspace', '.agent-messenger')
+    const canonical = join(root, 'workspace', '.config', 'agent-messenger')
+    await mkdir(legacy, { recursive: true })
+    await writeFile(join(legacy, 'key'), 'material')
+    let inspections = 0
+    const calls: string[][] = []
+    const exec: DockerExec = async (args) => {
+      calls.push(args)
+      if (args[0] === 'inspect') {
+        inspections += 1
+        if (inspections === 1) return { exitCode: 1, stdout: '', stderr: 'No such container' }
+        return { exitCode: 0, stdout: `${'a'.repeat(64)}|true\n`, stderr: '' }
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    const result = await start({ cwd: root, preferredHostPort: 8973, exec, ensureModels: noEnsureModels })
+
+    expect(result).toEqual({
+      ok: false,
+      reason: `Container ${basename(root)} became running during start preflight; refusing to migrate agent-messenger credentials or launch a replacement.`,
+    })
+    expect(await readFile(join(legacy, 'key'), 'utf8')).toBe('material')
+    expect(existsSync(canonical)).toBe(false)
+    expect(calls.some((args) => args[0] === 'run')).toBe(false)
+  })
+
   test('fails closed before migration or launch when Docker container state is indeterminate', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -3359,7 +3462,7 @@ describe('start (composition)', () => {
     })
 
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toMatch(/became running.*preserving/i)
+    if (!result.ok) expect(result.reason).toMatch(/became running.*refusing to migrate/i)
     expect(archived).toBe(false)
     expect(calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false)
   })
@@ -3489,7 +3592,7 @@ describe('start (composition)', () => {
     })
 
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toMatch(/safely inspected.*preserving/i)
+    if (!result.ok) expect(result.reason).toMatch(/malformed.*preserving/i)
     expect(archived).toBe(false)
     expect(calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false)
   })
@@ -3731,7 +3834,7 @@ describe('start (composition)', () => {
       if (args[0] === 'image' && args[1] === 'inspect') return { exitCode: 0, stdout: '', stderr: '' }
       if (args[0] === 'inspect') {
         inspectCalls++
-        if (inspectCalls === 1) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
+        if (inspectCalls <= 2) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
         return { exitCode: 0, stdout: `${corpseId}|false\n`, stderr: '' }
       }
       if (args[0] === 'run') {
@@ -3781,8 +3884,8 @@ describe('start (composition)', () => {
       if (args[0] === 'image' && args[1] === 'inspect') return { exitCode: 0, stdout: '', stderr: '' }
       if (args[0] === 'inspect') {
         probeAttempts++
-        // First inspect (start's preflight) reports gone so we proceed to docker run.
-        if (probeAttempts === 1) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
+        // Both start preflight probes report gone so we proceed to docker run.
+        if (probeAttempts <= 2) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
         // Subsequent inspect (the retry-path corpse probe) reports running=true.
         // cleanupRunCorpse uses `{{.Id}}|{{.State.Running}}`; non-cleanupRunCorpse
         // callers use just State.Running. Emit both formats so either parser works.
@@ -3922,10 +4025,10 @@ describe('start (composition)', () => {
       if (args[0] === 'inspect') {
         if (!rmReturned) {
           inspectsBeforeRm++
-          // First inspect is start's preflight (name is free); second is
-          // cleanupRunCorpse's pre-rm probe AFTER the failed docker run
+          // First two inspects are start's preflight probes (name is free);
+          // third is cleanupRunCorpse's pre-rm probe AFTER the failed docker run
           // has populated the corpse — it must see the corpse to issue rm.
-          if (inspectsBeforeRm === 1) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
+          if (inspectsBeforeRm <= 2) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
           if (args.includes('{{.Id}}|{{.State.Running}}')) {
             return { exitCode: 0, stdout: `${corpseId}|false\n`, stderr: '' }
           }

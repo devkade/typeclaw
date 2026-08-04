@@ -33,6 +33,7 @@ import { linkWindowsDevTypeclaw, resolveBunLinkedPackage, type RunBunLink } from
 import { isWindows } from '@/shared'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
 
+import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
 import { archiveContainerLogs, type DockerLogArchiver } from './log-archive'
 import { CONTAINER_PORT, TUI_TOKEN_LABEL, findFreePort, isPortAllocatedError, resolveTuiToken } from './port'
 import {
@@ -178,6 +179,8 @@ export type StartOptions = {
   // Test seam for the host-stage writable-config preflight.
   assertConfigWritable?: (cwd: string) => void
   archiveLogs?: DockerLogArchiver
+  operationLock?: WithAgentOperationLock
+  operationLease?: AgentOperationLease
 }
 
 export type HostDaemonStatus =
@@ -212,7 +215,20 @@ export type StartResult =
     }
   | { ok: false; reason: string }
 
-export async function start({
+export async function start(options: StartOptions): Promise<StartResult> {
+  const operationLock = options.operationLock ?? withAgentOperationLock
+  try {
+    const locked = await operationLock(
+      { agentDir: options.cwd, operation: 'start', lease: options.operationLease },
+      async () => await runStart(options),
+    )
+    return locked.ok ? locked.value : { ok: false, reason: locked.reason }
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function runStart({
   cwd,
   preferredHostPort,
   forceBuild = false,
@@ -248,7 +264,7 @@ export async function start({
     // side effects (template writes, .gitignore commits, package.json migration)
     // that would surprise a user invoking `compose start` against a partially-up
     // tree.
-    const state = await inspectContainer(exec, containerName)
+    let state = await inspectContainer(exec, containerName)
 
     // Bound gc/repack memory even when start() is an already-running no-op below:
     // the running agent's backup keeps committing, so it must not keep using the
@@ -279,6 +295,25 @@ export async function start({
     assertConfigWritable(cwd)
 
     const agentMessengerPolicy = resolveAgentMessengerConfigPolicy(cwd)
+    state = await inspectContainer(exec, containerName)
+    if (state.kind === 'malformed') {
+      return {
+        ok: false,
+        reason: `docker inspect returned malformed container identity/state (${state.reason}); preserving container ${containerName} and its logs.`,
+      }
+    }
+    if (state.kind === 'indeterminate') {
+      return {
+        ok: false,
+        reason: `Docker state could not be determined for container ${containerName}; TypeClaw is refusing to migrate or launch while the container may be live. Resolve Docker access and retry. ${state.reason}`,
+      }
+    }
+    if (state.kind === 'present' && state.running) {
+      return {
+        ok: false,
+        reason: `Container ${containerName} became running during start preflight; refusing to migrate agent-messenger credentials or launch a replacement.`,
+      }
+    }
     if (agentMessengerPolicy.migrate) {
       const agentMessengerMigration = await migrateAgentMessengerConfigDir(cwd)
       if (!agentMessengerMigration.ok) return { ok: false, reason: agentMessengerMigration.reason }
