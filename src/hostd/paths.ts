@@ -8,6 +8,7 @@ import { isWindows } from '@/shared'
 const SOCKET_FILE = 'hostd.sock'
 const REGISTRATIONS_DIR = 'registrations'
 const KEYS_DIR = 'keys'
+const AGENT_OPERATION_LOCKS_DIR = 'agent-locks'
 
 // Defense-in-depth: containerName arrives from RPC payloads (some of which
 // originate inside the container). Docker already forbids slashes and most
@@ -67,6 +68,17 @@ export function registrationsDir(): string {
   return join(runDir(), REGISTRATIONS_DIR)
 }
 
+export function agentOperationLocksDir(): string {
+  return join(runDir(), AGENT_OPERATION_LOCKS_DIR)
+}
+
+export function agentOperationLockPath(containerName: string): string {
+  if (!SAFE_NAME.test(containerName)) {
+    throw new Error(`invalid container name for agent operation lock: ${JSON.stringify(containerName)}`)
+  }
+  return join(agentOperationLocksDir(), `${containerName}.lock`)
+}
+
 export function keysDir(): string {
   return join(homeRoot(), KEYS_DIR)
 }
@@ -100,4 +112,9 @@ export async function ensureDirs(): Promise<void> {
   await chmod(registrationsDir(), 0o700).catch(() => {})
   await chmod(keysDir(), 0o700).catch(() => {})
   await chmod(modelsDir(), 0o700).catch(() => {})
+}
+
+export async function ensureAgentOperationLocksDir(): Promise<void> {
+  await mkdir(agentOperationLocksDir(), { recursive: true })
+  await chmod(agentOperationLocksDir(), 0o700).catch(() => {})
 }

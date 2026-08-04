@@ -6,12 +6,14 @@ import {
   prepareAgentMessengerHostConfigDir,
   type HostAgentMessengerConfigResult,
 } from '@/agent-messenger/host-config-dir'
+import { type WithAgentOperationLock, withAgentOperationLock } from '@/container/agent-operation-lock'
 import { SecretsLineCredentialStore } from '@/secrets/line-store'
 
 export type LineBootstrapStatus = { ok: true } | { ok: false; reason: string }
 
 export type AgentMessengerHostConfigDeps = {
   prepareConfigDir?: (agentDir: string) => Promise<HostAgentMessengerConfigResult>
+  operationLock?: WithAgentOperationLock
 }
 
 export type LineLoginCallbacks = {
@@ -61,6 +63,21 @@ export function lineSecretsPath(agentDir: string): string {
 export async function runLineBootstrap(
   input: LineLoginInput,
   deps: AgentMessengerHostConfigDeps = {},
+): Promise<LineBootstrapStatus> {
+  const operationLock = deps.operationLock ?? withAgentOperationLock
+  try {
+    const locked = await operationLock({ agentDir: input.agentDir, operation: 'line-auth' }, async () => {
+      return await runLineBootstrapLocked(input, deps)
+    })
+    return locked.ok ? locked.value : { ok: false, reason: locked.reason }
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+async function runLineBootstrapLocked(
+  input: LineLoginInput,
+  deps: AgentMessengerHostConfigDeps,
 ): Promise<LineBootstrapStatus> {
   try {
     const prepared = await (deps.prepareConfigDir ?? prepareAgentMessengerHostConfigDir)(input.agentDir)

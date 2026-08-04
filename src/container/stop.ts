@@ -1,6 +1,7 @@
 import { DEFAULT_LOG_RETENTION_DAYS, loadConfigSync } from '@/config'
 import { isDaemonReachable, send as sendToDaemon } from '@/hostd/client'
 
+import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
 import { archiveContainerLogs, type DockerLogArchiver } from './log-archive'
 import {
   classifyRmStderr,
@@ -22,9 +23,24 @@ export type StopOptions = {
   cwd: string
   exec?: DockerExec
   archiveLogs?: DockerLogArchiver
+  operationLock?: WithAgentOperationLock
+  operationLease?: AgentOperationLease
 }
 
-export async function stop({
+export async function stop(options: StopOptions): Promise<StopResult> {
+  const operationLock = options.operationLock ?? withAgentOperationLock
+  try {
+    const locked = await operationLock(
+      { agentDir: options.cwd, operation: 'stop', lease: options.operationLease },
+      async () => await runStop(options),
+    )
+    return locked.ok ? locked.value : { ok: false, reason: locked.reason }
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function runStop({
   cwd,
   exec = defaultDockerExec,
   archiveLogs = archiveContainerLogs,

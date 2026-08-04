@@ -74,28 +74,26 @@ export const restartCommand = defineCommand({
 
     const stopSpin = spinner()
     stopSpin.start('Stopping container...')
-    const stopped = await controller.stop({ cwd })
-    if (!stopped.ok) {
-      stopSpin.error(stopped.reason)
-      process.exit(1)
-    }
-    stopSpin.stop(stopped.running ? `Stopped ${c.cyan(stopped.containerName)}.` : 'Already stopped.')
-
-    const startSpin = spinner()
-    startSpin.start('Starting container...')
-    const started = await controller.start({
+    let startSpin: ReturnType<typeof spinner> | undefined
+    const restarted = await controller.restart({
       cwd,
       preferredHostPort: Number(args.port),
       forceBuild: args.build,
       cliEntry: process.argv[1],
+      onStopped: (stopped) => {
+        stopSpin.stop(stopped.running ? `Stopped ${c.cyan(stopped.containerName)}.` : 'Already stopped.')
+        startSpin = spinner()
+        startSpin.start('Starting container...')
+      },
     })
-    if (!started.ok) {
-      startSpin.error(started.reason)
+    if (!restarted.ok) {
+      if (startSpin === undefined) stopSpin.error(restarted.reason)
+      else startSpin.error(restarted.reason)
       process.exit(1)
     }
-    startSpin.stop('Started.')
+    startSpin?.stop('Started.')
 
-    reportConfigWarnings(started.dockerfileWarnings)
-    console.log(renderStartSuccess(started))
+    reportConfigWarnings(restarted.start.dockerfileWarnings)
+    console.log(renderStartSuccess(restarted.start))
   },
 })

@@ -12,12 +12,14 @@ import {
   prepareAgentMessengerHostConfigDir,
   type HostAgentMessengerConfigResult,
 } from '@/agent-messenger/host-config-dir'
+import { type WithAgentOperationLock, withAgentOperationLock } from '@/container/agent-operation-lock'
 import { SecretsInstagramCredentialStore } from '@/secrets/instagram-store'
 
 export type InstagramBootstrapStatus = { ok: true } | { ok: false; reason: string }
 
 export type AgentMessengerHostConfigDeps = {
   prepareConfigDir?: (agentDir: string) => Promise<HostAgentMessengerConfigResult>
+  operationLock?: WithAgentOperationLock
 }
 
 // Instagram gates a fresh login behind one of two interactive second factors:
@@ -89,6 +91,21 @@ export function instagramSecretsPath(agentDir: string): string {
 export async function runInstagramBootstrap(
   input: InstagramLoginInput,
   deps: AgentMessengerHostConfigDeps = {},
+): Promise<InstagramBootstrapStatus> {
+  const operationLock = deps.operationLock ?? withAgentOperationLock
+  try {
+    const locked = await operationLock({ agentDir: input.agentDir, operation: 'instagram-auth' }, async () => {
+      return await runInstagramBootstrapLocked(input, deps)
+    })
+    return locked.ok ? locked.value : { ok: false, reason: locked.reason }
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+async function runInstagramBootstrapLocked(
+  input: InstagramLoginInput,
+  deps: AgentMessengerHostConfigDeps,
 ): Promise<InstagramBootstrapStatus> {
   try {
     const prepared = await (deps.prepareConfigDir ?? prepareAgentMessengerHostConfigDir)(input.agentDir)

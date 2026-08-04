@@ -58,12 +58,20 @@ async function runOne(
   if (!validated.ok) return { name, ok: false, reason: validated.reason }
   try {
     const controller = resolveController()
-    const stopped = await controller.stop({ cwd })
-    if (!stopped.ok) return { name, ok: false, reason: stopped.reason }
-    onStopped()
-    const started = await controller.start({ cwd, preferredHostPort, forceBuild, cliEntry })
-    if (!started.ok) return { name, ok: false, reason: started.reason }
-    return { name, ok: true, data: { stop: stopped, start: started }, warnings: validated.warnings }
+    const restarted = await controller.restart({
+      cwd,
+      preferredHostPort,
+      forceBuild,
+      cliEntry,
+      onStopped,
+    })
+    if (!restarted.ok) return { name, ok: false, reason: restarted.reason }
+    return {
+      name,
+      ok: true,
+      data: { stop: restarted.stop, start: restarted.start },
+      warnings: validated.warnings,
+    }
   } catch (error) {
     return { name, ok: false, reason: error instanceof Error ? error.message : String(error) }
   }

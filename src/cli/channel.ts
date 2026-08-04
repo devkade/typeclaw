@@ -654,16 +654,12 @@ async function maybePromptCredentialRefresh(
     return
   }
 
-  const stopped = await controller.stop({ cwd })
-  if (!stopped.ok) {
-    console.error(errorLine(`Restart failed during stop: ${stopped.reason}`))
+  const restarted = await controller.restart({ cwd, preferredHostPort: config.port, cliEntry: process.argv[1] })
+  if (!restarted.ok) {
+    console.error(errorLine(formatRestartFailure(restarted.reason)))
     process.exit(1)
   }
-  const started = await controller.start({ cwd, preferredHostPort: config.port, cliEntry: process.argv[1] })
-  if (!started.ok) {
-    console.error(errorLine(`Restart failed during start: ${started.reason}`))
-    process.exit(1)
-  }
+  const started = restarted.start
   done({
     title: c.green(`${label} ${verbPast}. Restarted ${started.plan.containerName} on host port ${started.hostPort}.`),
     hints: [
@@ -2002,16 +1998,12 @@ async function maybePromptRestart(
     return
   }
 
-  const stopped = await controller.stop({ cwd })
-  if (!stopped.ok) {
-    console.error(errorLine(`Restart failed during stop: ${stopped.reason}`))
+  const restarted = await controller.restart({ cwd, preferredHostPort: config.port, cliEntry: process.argv[1] })
+  if (!restarted.ok) {
+    console.error(errorLine(formatRestartFailure(restarted.reason)))
     process.exit(1)
   }
-  const started = await controller.start({ cwd, preferredHostPort: config.port, cliEntry: process.argv[1] })
-  if (!started.ok) {
-    console.error(errorLine(`Restart failed during start: ${started.reason}`))
-    process.exit(1)
-  }
+  const started = restarted.start
   done({
     title: c.green(
       `${label} channel ${verb}. Restarted ${started.plan.containerName} on host port ${started.hostPort}.`,
@@ -2021,4 +2013,11 @@ async function maybePromptRestart(
       { label: 'Follow logs:', command: 'typeclaw logs -f' },
     ],
   })
+}
+
+function formatRestartFailure(reason: string): string {
+  if (reason.startsWith('stop failed: ')) return `Restart failed during stop: ${reason.slice('stop failed: '.length)}`
+  if (reason.startsWith('start failed: '))
+    return `Restart failed during start: ${reason.slice('start failed: '.length)}`
+  return `Restart failed: ${reason}`
 }

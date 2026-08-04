@@ -7,11 +7,19 @@ import { join } from 'node:path'
 import type { LineLoginResult } from 'agent-messenger/line'
 
 import { prepareAgentMessengerHostConfigDir } from '@/agent-messenger/host-config-dir'
+import type { WithAgentOperationLock } from '@/container/agent-operation-lock'
 import { SecretsLineCredentialStore } from '@/secrets/line-store'
+import { FakeAgentOperationCoordinator } from '@/test-helpers/fake-agent-operation-lock'
 
 import { runLineBootstrap, type LineLoginClient } from './line-auth'
 
+const unlockedOperationLock: WithAgentOperationLock = async (input, run) => ({
+  ok: true,
+  value: await run({ containerName: input.agentDir, agentDir: input.agentDir }),
+})
+
 const managedConfigDeps = {
+  operationLock: unlockedOperationLock,
   prepareConfigDir: async (agentDir: string) => ({
     ok: true as const,
     hostDir: join(agentDir, 'workspace', '.config', 'agent-messenger'),
@@ -147,6 +155,55 @@ function throwingLoggingClient(): LineLoginClient {
 }
 
 describe('runLineBootstrap', () => {
+  test('holds the agent operation lock through the interactive QR callback', async () => {
+    await withDir(async (dir) => {
+      const legacy = join(dir, 'workspace', '.agent-messenger')
+      const canonical = join(dir, 'workspace', '.config', 'agent-messenger')
+      await mkdir(legacy, { recursive: true })
+      await mkdir(canonical, { recursive: true })
+      await writeFile(join(legacy, 'letter-sealing.key'), Buffer.from([0, 1, 2, 255]))
+      await writeFile(join(canonical, 'session.json'), Buffer.from([9, 8, 7]))
+      const beforeLegacy = await readFile(join(legacy, 'letter-sealing.key'))
+      const beforeCanonical = await readFile(join(canonical, 'session.json'))
+      const coordinator = new FakeAgentOperationCoordinator('lifecycle contended')
+      const parked = coordinator.park()
+      const client: LineLoginClient = {
+        loginWithQR: async ({ onQRUrl }) => {
+          await onQRUrl('https://example.com/qr')
+          return { authenticated: false, error: 'cancelled' }
+        },
+        loginWithEmail: async () => ({ authenticated: false, error: 'unused' }),
+      }
+
+      const auth = runLineBootstrap(
+        {
+          method: 'qr',
+          agentDir: dir,
+          callbacks: { onPincode: () => {}, onQRUrl: parked.wait },
+          client,
+        },
+        {
+          operationLock: coordinator.operationLock,
+          prepareConfigDir: async () => ({ ok: true, hostDir: legacy }),
+        },
+      )
+      await parked.entered
+
+      let lifecycleRan = false
+      const competing = await coordinator.operationLock({ agentDir: dir, operation: 'start' }, async () => {
+        lifecycleRan = true
+      })
+
+      expect(competing).toEqual({ ok: false, reason: 'lifecycle contended' })
+      expect(lifecycleRan).toBe(false)
+      expect(await readFile(join(legacy, 'letter-sealing.key'))).toEqual(beforeLegacy)
+      expect(await readFile(join(canonical, 'session.json'))).toEqual(beforeCanonical)
+      parked.release()
+      expect(await auth).toEqual({ ok: false, reason: 'cancelled' })
+      expect(coordinator.events).toEqual(['lock-enter:line-auth', 'lock-contention:start', 'lock-exit:line-auth'])
+    })
+  })
+
   test('prepares a stopped legacy install before login and exposes the migrated host path to the client', async () => {
     await withDir(async (dir) => {
       const legacy = join(dir, 'workspace', '.agent-messenger')

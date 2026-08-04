@@ -7,6 +7,8 @@ import { join } from 'node:path'
 import type { InstagramAccount } from 'agent-messenger/instagram'
 
 import { prepareAgentMessengerHostConfigDir } from '@/agent-messenger/host-config-dir'
+import type { WithAgentOperationLock } from '@/container/agent-operation-lock'
+import { FakeAgentOperationCoordinator } from '@/test-helpers/fake-agent-operation-lock'
 
 import {
   runInstagramBootstrap,
@@ -15,7 +17,13 @@ import {
   type InstagramLoginCredentialManager,
 } from './instagram-auth'
 
+const unlockedOperationLock: WithAgentOperationLock = async (input, run) => ({
+  ok: true,
+  value: await run({ containerName: input.agentDir, agentDir: input.agentDir }),
+})
+
 const managedConfigDeps = {
+  operationLock: unlockedOperationLock,
   prepareConfigDir: async (agentDir: string) => ({
     ok: true as const,
     hostDir: join(agentDir, 'workspace', '.config', 'agent-messenger'),
@@ -108,6 +116,68 @@ function observingClient(result: InstagramAuthenticateResult, onAuthenticate: ()
 }
 
 describe('runInstagramBootstrap', () => {
+  test('holds the agent operation lock through the interactive checkpoint callback', async () => {
+    await withDir(async (dir) => {
+      const legacy = join(dir, 'workspace', '.agent-messenger')
+      const canonical = join(dir, 'workspace', '.config', 'agent-messenger')
+      await mkdir(legacy, { recursive: true })
+      await mkdir(canonical, { recursive: true })
+      await writeFile(join(legacy, 'device.key'), Buffer.from([1, 3, 5, 7]))
+      await writeFile(join(canonical, 'session.json'), Buffer.from([2, 4, 6, 8]))
+      const beforeLegacy = await readFile(join(legacy, 'device.key'))
+      const beforeCanonical = await readFile(join(canonical, 'session.json'))
+      const coordinator = new FakeAgentOperationCoordinator('lifecycle contended')
+      const parked = coordinator.park()
+      const { manager } = fakeManagerWithSession(join(canonical, 'sdk-session.json'))
+      const client: InstagramLoginClient = {
+        authenticate: async () => ({ userId: '', challengeRequired: true, challengePath: '/challenge/' }),
+        challengeSendCode: async () => ({ contactPoint: 'u***@example.com', stepName: 'verify' }),
+        challengeSubmitCode: async () => ({ userId: '123' }),
+        twoFactorLogin: async () => ({ userId: '' }),
+        setSessionPath: () => {},
+        getUserId: () => null,
+      }
+
+      const auth = runInstagramBootstrap(
+        {
+          username: 'alice',
+          password: 'password',
+          agentDir: dir,
+          client,
+          credentialManager: manager,
+          callbacks: {
+            onChallengeCode: async () => {
+              await parked.wait()
+              return { code: '123456' }
+            },
+          },
+        },
+        {
+          operationLock: coordinator.operationLock,
+          prepareConfigDir: async () => ({ ok: true, hostDir: legacy }),
+        },
+      )
+      await parked.entered
+
+      let lifecycleRan = false
+      const competing = await coordinator.operationLock({ agentDir: dir, operation: 'restart' }, async () => {
+        lifecycleRan = true
+      })
+
+      expect(competing).toEqual({ ok: false, reason: 'lifecycle contended' })
+      expect(lifecycleRan).toBe(false)
+      expect(await readFile(join(legacy, 'device.key'))).toEqual(beforeLegacy)
+      expect(await readFile(join(canonical, 'session.json'))).toEqual(beforeCanonical)
+      parked.release()
+      expect(await auth).toEqual({ ok: true })
+      expect(coordinator.events).toEqual([
+        'lock-enter:instagram-auth',
+        'lock-contention:restart',
+        'lock-exit:instagram-auth',
+      ])
+    })
+  })
+
   test('uses a stale running container legacy path without creating the managed tree', async () => {
     await withDir(async (dir) => {
       const legacy = join(dir, 'workspace', '.agent-messenger')

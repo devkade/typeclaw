@@ -1,5 +1,6 @@
 import { join, posix } from 'node:path'
 
+import type { WithAgentOperationLock } from '@/container/agent-operation-lock'
 import { containerNameFromCwd, defaultDockerExec, type DockerExec, isGenuineMissingContainer } from '@/container/shared'
 
 import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } from './config-dir'
@@ -9,14 +10,15 @@ const CONFIG_ENV_PREFIX = 'AGENT_MESSENGER_CONFIG_DIR='
 
 export type HostAgentMessengerConfigResult = { ok: true; hostDir: string } | { ok: false; reason: string }
 
-export type HostAgentMessengerConfigDeps = { exec?: DockerExec }
+export type HostAgentMessengerConfigDeps = { exec?: DockerExec; operationLock?: WithAgentOperationLock }
 
 export async function prepareAgentMessengerHostConfigDir(
   agentDir: string,
   deps: HostAgentMessengerConfigDeps = {},
 ): Promise<HostAgentMessengerConfigResult> {
   const exec = deps.exec ?? defaultDockerExec
-  const inspected = await inspectRunningConfig(exec, containerNameFromCwd(agentDir))
+  const containerName = containerNameFromCwd(agentDir)
+  const inspected = await inspectRunningConfig(exec, containerName)
   if (!inspected.ok) return inspected
 
   if (inspected.state === 'running') {
@@ -26,6 +28,14 @@ export async function prepareAgentMessengerHostConfigDir(
   try {
     const policy = resolveAgentMessengerConfigPolicy(agentDir)
     if (policy.migrate) {
+      const reprobed = await inspectRunningConfig(exec, containerName)
+      if (!reprobed.ok) return reprobed
+      if (reprobed.state === 'running') {
+        return {
+          ok: false,
+          reason: `Container ${containerName} became running while authentication was being prepared. No credentials were written; retry authentication.`,
+        }
+      }
       const migration = await migrateAgentMessengerConfigDir(agentDir)
       if (!migration.ok) return migration
     }
