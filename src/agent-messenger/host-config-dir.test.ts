@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 import type { DockerExec } from '@/container/shared'
 
@@ -33,6 +33,33 @@ describe('prepareAgentMessengerHostConfigDir', () => {
     expect(await readFile(join(agentDir, 'workspace', '.config', 'agent-messenger', 'session.json'), 'utf8')).toBe(
       'legacy-session',
     )
+  })
+
+  test('re-probes before migration and refuses when the container became running', async () => {
+    const legacy = join(agentDir, 'workspace', '.agent-messenger')
+    const canonical = join(agentDir, 'workspace', '.config', 'agent-messenger')
+    await mkdir(legacy, { recursive: true })
+    await writeFile(join(legacy, 'session.json'), 'legacy-session')
+    let inspections = 0
+    const exec: DockerExec = async () => {
+      inspections += 1
+      return inspections === 1
+        ? { exitCode: 0, stdout: 'false\n[]\n', stderr: '' }
+        : {
+            exitCode: 0,
+            stdout: 'true\n["AGENT_MESSENGER_CONFIG_DIR=/agent/workspace/.config/agent-messenger"]\n',
+            stderr: '',
+          }
+    }
+
+    const result = await prepareAgentMessengerHostConfigDir(agentDir, { exec })
+
+    expect(result).toEqual({
+      ok: false,
+      reason: `Container ${basename(agentDir)} became running while authentication was being prepared. No credentials were written; retry authentication.`,
+    })
+    expect(await readFile(join(legacy, 'session.json'), 'utf8')).toBe('legacy-session')
+    expect(existsSync(canonical)).toBe(false)
   })
 
   test('uses a running container legacy env without changing either filesystem location', async () => {
