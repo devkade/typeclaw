@@ -1,4 +1,5 @@
 import { logs, type LogsOptions, type LogsResult } from './logs'
+import { restart, type RestartOptions, type RestartResult } from './restart'
 import { containerNameFromCwd, imageTagFromCwd } from './shared'
 import { shell, type ShellResult } from './shell'
 import { start, type StartOptions, type StartResult } from './start'
@@ -17,6 +18,7 @@ import { stop, type StopOptions, type StopResult } from './stop'
 export interface Controller {
   start(options: StartOptions): Promise<StartResult>
   stop(options: StopOptions): Promise<StopResult>
+  restart(options: RestartOptions): Promise<RestartResult>
   status(options: StatusOptions): Promise<ContainerStatus>
   stats(options: StatsOptions): Promise<ContainerStats>
   logs(options: LogsOptions): Promise<LogsResult>
@@ -31,6 +33,7 @@ export function createLocalDockerController(): Controller {
   return {
     start: (options) => start(options),
     stop: (options) => stop(options),
+    restart: (options) => restart(options),
     status: (options) => status(options),
     stats: (options) => stats(options),
     logs: (options) => logs(options),
@@ -52,6 +55,9 @@ export function createNoopController(): Controller {
     },
     async stop({ cwd }) {
       return { ok: false, reason: unsupported('stop', cwd) }
+    },
+    async restart({ cwd }) {
+      return { ok: false, reason: unsupported('restart', cwd) }
     },
     async status({ cwd }) {
       return { kind: 'missing', containerName: containerNameFromCwd(cwd), imageTag: imageTagFromCwd(cwd) }

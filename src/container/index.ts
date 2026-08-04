@@ -54,3 +54,11 @@ export {
   type StartResult,
 } from './start'
 export { planStop, stop, type StopOptions, type StopPlan, type StopResult } from './stop'
+export { restart, type RestartOptions, type RestartResult } from './restart'
+export {
+  type AgentOperation,
+  type AgentOperationLease,
+  type AgentOperationLockResult,
+  type WithAgentOperationLock,
+  withAgentOperationLock,
+} from './agent-operation-lock'
