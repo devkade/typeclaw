@@ -24,22 +24,31 @@ export function readEnvFile(cwd: string): Map<string, string> {
   }
   const lines = raw.split(/\r?\n/)
   for (const [index, rawLine] of lines.entries()) {
-    const withoutBom = index === 0 ? rawLine.replace(/^\uFEFF/, '') : rawLine
-    // \p{White_Space}, not \s: JS \s also matches U+FEFF (and misses U+0085),
-    // so \s would strip a BOM on EVERY line while Go's unicode.IsSpace — which
-    // Docker uses — strips it on line 1 only.
-    const line = withoutBom.replace(/^\p{White_Space}+/u, '')
-    if (line.length === 0) continue
-    if (line.startsWith('#')) continue
-    const eq = line.indexOf('=')
-    if (eq <= 0) continue
-    const key = line.slice(0, eq)
-    // Docker rejects the whole file when a key contains a space or tab, so such
-    // a line can never reach a container; skip it rather than inventing a key.
-    if (/[ \t]/.test(key)) continue
-    out.set(key, line.slice(eq + 1))
+    const parsed = parseEnvLine(rawLine, index)
+    if (parsed === null) continue
+    out.set(parsed.key, parsed.value)
   }
   return out
+}
+
+// Shared by the reader and the writer so a declaration one of them recognizes
+// can never be invisible to the other — an indented key that parsed as declared
+// but did not match on write would append a duplicate instead of replacing.
+function parseEnvLine(rawLine: string, index: number): { key: string; value: string } | null {
+  const withoutBom = index === 0 ? rawLine.replace(/^\uFEFF/, '') : rawLine
+  // \p{White_Space}, not \s: JS \s also matches U+FEFF (and misses U+0085),
+  // so \s would strip a BOM on EVERY line while Go's unicode.IsSpace — which
+  // Docker uses — strips it on line 1 only.
+  const line = withoutBom.replace(/^\p{White_Space}+/u, '')
+  if (line.length === 0) return null
+  if (line.startsWith('#')) return null
+  const eq = line.indexOf('=')
+  if (eq <= 0) return null
+  const key = line.slice(0, eq)
+  // Docker rejects the whole file when a key contains a space or tab, so such
+  // a line can never reach a container; skip it rather than inventing a key.
+  if (/[ \t]/.test(key)) return null
+  return { key, value: line.slice(eq + 1) }
 }
 
 export function hasEnvKey(cwd: string, key: string): boolean {
@@ -66,13 +75,14 @@ export function appendOrReplaceEnvKey(cwd: string, key: string, value: string): 
   // regardless of replace-vs-append path.
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
   let replaced = false
-  const next = lines.map((line) => {
-    if (line.startsWith('#')) return line
-    const eq = line.indexOf('=')
-    if (eq <= 0) return line
-    if (line.slice(0, eq) !== key) return line
+  const next = lines.map((line, index) => {
+    const parsed = parseEnvLine(line, index)
+    if (parsed === null || parsed.key !== key) return line
     replaced = true
-    return `${key}=${value}`
+    // Re-emit the BOM so replacing the first line does not silently strip the
+    // file's encoding marker.
+    const bom = index === 0 && line.startsWith('\uFEFF') ? '\uFEFF' : ''
+    return `${bom}${key}=${value}`
   })
   if (!replaced) next.push(`${key}=${value}`)
   const out = `${next.join('\n')}\n`

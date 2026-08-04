@@ -154,4 +154,29 @@ describe('appendOrReplaceEnvKey', () => {
     expect(out).toBe('EXISTING=keep\nFRESH=value\n')
     expect(out.split('\n').filter((line) => line === '').length).toBe(1)
   })
+
+  test('replaces an indented key instead of appending a duplicate', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), '   TARGET=old\nOTHER=keep\n', 'utf8')
+    appendOrReplaceEnvKey(cwd, 'TARGET', 'new')
+    const out = await readFile(join(cwd, '.env'), 'utf8')
+    expect(out).toBe('TARGET=new\nOTHER=keep\n')
+    expect(readEnvFile(cwd).get('TARGET')).toBe('new')
+  })
+
+  test('replaces a BOM-prefixed first key and keeps the BOM', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), '\uFEFFTARGET=old\nOTHER=keep\n', 'utf8')
+    appendOrReplaceEnvKey(cwd, 'TARGET', 'new')
+    const out = await readFile(join(cwd, '.env'), 'utf8')
+    expect(out).toBe('\uFEFFTARGET=new\nOTHER=keep\n')
+    expect(readEnvFile(cwd).get('TARGET')).toBe('new')
+  })
+
+  test('leaves an indented comment untouched when replacing', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), '   # TARGET=commented\nTARGET=old\n', 'utf8')
+    appendOrReplaceEnvKey(cwd, 'TARGET', 'new')
+    expect(await readFile(join(cwd, '.env'), 'utf8')).toBe('   # TARGET=commented\nTARGET=new\n')
+  })
 })
