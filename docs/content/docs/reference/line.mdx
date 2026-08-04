@@ -19,6 +19,14 @@ Transport: **LINE protocol** (no public URL required). Setup walkthrough: [Add a
 
 Sub-device login using QR code or email/password plus PIN. Credentials are stored in `secrets.json#channels.line` as one or more account records.
 
+<Callout type="warn" title="E2EE keys live outside secrets.json">
+  The SDK persists Letter-Sealing (end-to-end encryption) key material under
+  `workspace/.config/agent-messenger/line-storage/`, not in `secrets.json`. Back up that directory alongside
+  `secrets.json` — losing it leaves inbound Letter-Sealing messages permanently undecryptable, and no re-login recovers
+  the old keys. TypeClaw masks the directory from every model-driven tool, and moves it automatically on `typeclaw
+  start` if it is still at the older `workspace/.agent-messenger/` location.
+</Callout>
+
 Unlike bot-token adapters, `secrets.json#channels.line` is not a flat credential object — it wraps one or more account records:
 
 ```json

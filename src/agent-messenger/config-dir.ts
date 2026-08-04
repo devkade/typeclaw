@@ -51,12 +51,18 @@ export async function migrateAgentMessengerConfigDir(agentDir: string): Promise<
   const current = await inspectDirectory(configDir)
   if (legacy.exists && !legacy.directory) return invalidDirectoryResult(legacyDir, legacy.kind)
   if (current.exists && !current.directory) return invalidDirectoryResult(configDir, current.kind)
-  if (!legacy.exists) return { ok: true, migrated: false }
 
+  // Validated before the nothing-to-migrate return below: callers use the
+  // destination for host-stage credential writes even when no legacy tree
+  // exists, and lstat on the leaf follows a symlinked parent. Checking this
+  // only on the migrating path would leave the common post-migration state
+  // writing E2EE key material through an unvalidated symlink.
   const configParent = await inspectDirectory(dirname(configDir))
   if (configParent.exists && !configParent.directory) {
     return invalidDirectoryResult(dirname(configDir), configParent.kind)
   }
+
+  if (!legacy.exists) return { ok: true, migrated: false }
 
   if (!current.exists) {
     await mkdir(dirname(configDir), { recursive: true })

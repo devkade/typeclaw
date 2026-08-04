@@ -238,7 +238,7 @@ GitHub delivers events over webhooks, so it needs a public URL to reach your con
 
 <Accordion title="LINE — a personal account, not a bot">
 
-LINE logs in as a real user account by QR or email/PIN and stores the resulting account record in `secrets.json`. It sends plain text only — no outbound attachments, stickers, rich formatting, or bot-style mentions. See the [LINE adapter reference](/docs/reference/line) for the rest.
+LINE logs in as a real user account by QR or email/PIN and stores the resulting account record in `secrets.json`. Letter-Sealing (E2EE) key material lands separately under `workspace/.config/agent-messenger/line-storage/` and is not recoverable by logging in again, so back that directory up too. It sends plain text only — no outbound attachments, stickers, rich formatting, or bot-style mentions. See the [LINE adapter reference](/docs/reference/line) for the rest.
 
 </Accordion>
 
