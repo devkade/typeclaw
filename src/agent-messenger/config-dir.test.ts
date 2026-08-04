@@ -194,6 +194,22 @@ describe('migrateAgentMessengerConfigDir', () => {
     expect(existsSync(join(outside, 'agent-messenger'))).toBe(false)
   })
 
+  // The post-migration steady state has no legacy tree, yet callers still write
+  // credentials to the destination — so the parent must be rejected here too.
+  test('rejects a symlinked destination parent even when there is nothing to migrate', async () => {
+    const outside = join(agentDir, 'outside')
+    await mkdir(outside)
+    await mkdir(join(agentDir, 'workspace'), { recursive: true })
+    await symlink(outside, join(agentDir, 'workspace', '.config'))
+
+    const result = await migrateAgentMessengerConfigDir(agentDir)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toContain('symbolic link')
+    expect(existsSync(join(outside, 'agent-messenger'))).toBe(false)
+  })
+
   test('rejects a non-directory new path without modifying legacy data', async () => {
     await mkdir(legacyAgentMessengerConfigDir(agentDir), { recursive: true })
     await writeFile(join(legacyAgentMessengerConfigDir(agentDir), 'credential'), 'secret')
