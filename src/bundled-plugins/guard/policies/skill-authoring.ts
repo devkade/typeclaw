@@ -1,6 +1,8 @@
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
+import { RECOVER_MISSING, realIntendedPath } from '@/path-safety/real-intended-path'
+
 import type { GuardBlock } from '../policy'
 
 export const GUARD_SKILL_AUTHORING = 'skillAuthoring'
@@ -161,25 +163,11 @@ function isInside(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
+// RECOVER_MISSING only: this policy decides whether a write is ALLOWED, so an
+// ancestor that cannot be resolved must never widen the permitted surface.
 async function resolveRealIntendedPath(absolutePath: string): Promise<string> {
-  const pending: string[] = []
-  let current = absolutePath
-
-  while (true) {
-    try {
-      const realCurrent = await realpath(current)
-      return path.join(realCurrent, ...pending.reverse())
-    } catch (err) {
-      if (!isNotFoundError(err)) throw err
-    }
-
-    const parent = path.dirname(current)
-    if (parent === current) throw new Error(`could not resolve existing parent for ${absolutePath}`)
-    pending.push(path.basename(current))
-    current = parent
-  }
-}
-
-function isNotFoundError(err: unknown): boolean {
-  return err instanceof Error && 'code' in err && err.code === 'ENOENT'
+  return await realIntendedPath(absolutePath, realpath, {
+    recoverable: RECOVER_MISSING,
+    onExhausted: 'throw',
+  })
 }
