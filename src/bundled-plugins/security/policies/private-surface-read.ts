@@ -16,6 +16,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from '@/agent/tools-without-local-file-operands'
+import { RECOVER_MISSING_OR_UNSEARCHABLE, realIntendedPathSync } from '@/path-safety/real-intended-path'
 import type { ToolFileOperands } from '@/plugin'
 import {
   CANONICAL_AGENT_SECRET_DIRS,
@@ -959,30 +960,16 @@ function hasSameFileIdentity(candidate: string, deniedFile: string): boolean {
   }
 }
 
-// Resolves symlinks on the longest existing prefix of an absolute path, then
-// re-appends the non-existent tail. A bare realpathSync throws on a path that
-// does not exist yet (a write target, or a read of a not-yet-created file), so
-// we walk up to the nearest existing ancestor, realpath THAT (collapsing any
-// symlinked component including a planted symlink), and rejoin the remainder.
-// This catches `public/leak/x` where `public/leak` is a symlink into a hidden
-// dir even though `public/leak/x` itself does not exist. Sync (realpathSync)
-// keeps the guard synchronous; the cost is one syscall per existing component,
-// negligible at the tool-call boundary. Sync mirror of resolveRealIntendedPath
-// in the guard plugin's non-workspace-write policy.
+// Sync keeps the guard synchronous; the cost is one syscall per existing
+// component, negligible at the tool-call boundary. EACCES is recoverable here
+// (but NOT in the guard plugin's write policies): this is denylist matching, so
+// a path under an unsearchable ancestor must still be matched rather than
+// aborting the whole guard. See @/path-safety/real-intended-path.
 function realpathRealIntendedPath(absolutePath: string, realpath: (candidate: string) => string): string {
-  const pending: string[] = []
-  let current = absolutePath
-  while (true) {
-    try {
-      return path.join(realpath(current), ...pending.reverse())
-    } catch (err) {
-      if (!isNotFoundError(err)) throw err
-    }
-    const parent = path.dirname(current)
-    if (parent === current) return absolutePath
-    pending.push(path.basename(current))
-    current = parent
-  }
+  return realIntendedPathSync(absolutePath, realpath, {
+    recoverable: RECOVER_MISSING_OR_UNSEARCHABLE,
+    onExhausted: 'return-input',
+  })
 }
 
 function isNotFoundError(err: unknown): boolean {
