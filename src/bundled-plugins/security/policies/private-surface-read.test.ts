@@ -63,10 +63,89 @@ describe('private-surface-read guard — builtin file tools', () => {
 })
 
 describe('private-surface-read guard — fail-closed across ALL tools (not a whitelist)', () => {
-  test('blocks with a generic reason when realpathSync.native reports EACCES', () => {
-    // Must resolve like the guard does: a POSIX literal would not match on Windows.
+  test('allows an EACCES-shadowed path that is NOT on the denied surface', () => {
+    // given a runtime uid that cannot traverse an ancestor (container /root is
+    // mode 700 while the agent runs as uid 501), so realpath reports EACCES
+    // rather than ENOENT for every component under it.
+    // The child must NOT be a canonical secret dir: when this test process runs
+    // as root, homedir() is /root and `.config/agent-messenger` would be denied
+    // lexically, short-circuiting before realpath and testing nothing.
+    const barrier = path.resolve(path.sep, 'root')
+    const target = path.join(barrier, '.config', 'example-service', 'state.json')
+    const internalErrors: unknown[] = []
+
+    // when a tool reads that path
+    const result = checkPrivateSurfaceReadGuard(
+      { tool: 'read', args: { path: target }, agentDir: AGENT, hidden: guestHidden },
+      {
+        realpathNative(candidate) {
+          if (candidate === barrier || candidate.startsWith(`${barrier}${path.sep}`)) {
+            throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+          }
+          return realpathSync.native(candidate)
+        },
+        onInternalError: (error) => internalErrors.push(error),
+      },
+    )
+
+    // then it is allowed: the path is neither a secret nor on the deny list, and
+    // canonicalization failure alone must not deny it
+    expect(result).toBeUndefined()
+    expect(internalErrors).toEqual([])
+  })
+
+  test('still blocks when the EACCES leaf resolves under a denied directory', () => {
+    // given a leaf that cannot be statted but whose parent resolves into memory/
+    const parent = path.resolve(AGENT, 'public/gate')
+    const leaf = path.join(parent, 'stolen.md')
+
+    const result = checkPrivateSurfaceReadGuard(
+      { tool: 'read', args: { path: leaf }, agentDir: AGENT, hidden: guestHidden },
+      {
+        realpathNative(candidate) {
+          if (candidate === leaf) throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+          if (candidate === parent) return path.resolve(AGENT, 'memory')
+          return realpathSync.native(candidate)
+        },
+      },
+    )
+
+    // then the deny-list match still fires — EACCES recovery is not a bypass
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toMatch(/memory/)
+    expect(result?.reason).not.toMatch(/internal guard error/i)
+  })
+
+  for (const code of ['ELOOP', 'ENOTDIR', 'EPERM', 'ENAMETOOLONG', 'EIO']) {
+    test(`blocks with a generic reason when realpathSync.native reports ${code}`, () => {
+      // Must resolve like the guard does: a POSIX literal would not match on Windows.
+      const inaccessible = path.resolve(AGENT, 'public/protected.md')
+      const error = Object.assign(new Error(`failure while resolving protected path`), { code })
+      const internalErrors: unknown[] = []
+
+      const result = checkPrivateSurfaceReadGuard(
+        { tool: 'read', args: { path: inaccessible }, agentDir: AGENT, hidden: guestHidden },
+        {
+          realpathNative(candidate) {
+            if (candidate === inaccessible) throw error
+            return realpathSync.native(candidate)
+          },
+          onInternalError: (thrown) => internalErrors.push(thrown),
+        },
+      )
+
+      expect(result?.block).toBe(true)
+      expect(result?.reason).toMatch(/internal guard error/i)
+      expect(result?.reason).not.toContain(inaccessible)
+      expect(result?.reason).not.toContain(error.message)
+      expect(result?.reason).not.toContain(code)
+      expect(internalErrors).toEqual([error])
+    })
+  }
+
+  test('blocks with a generic reason when realpath throws a non-errno error', () => {
     const inaccessible = path.resolve(AGENT, 'public/protected.md')
-    const error = Object.assign(new Error('permission denied while resolving protected path'), { code: 'EACCES' })
+    const error = new Error('bare failure')
 
     const result = checkPrivateSurfaceReadGuard(
       { tool: 'read', args: { path: inaccessible }, agentDir: AGENT, hidden: guestHidden },
@@ -80,9 +159,6 @@ describe('private-surface-read guard — fail-closed across ALL tools (not a whi
 
     expect(result?.block).toBe(true)
     expect(result?.reason).toMatch(/internal guard error/i)
-    expect(result?.reason).not.toContain(inaccessible)
-    expect(result?.reason).not.toContain(error.message)
-    expect(result?.reason).not.toContain(error.code)
   })
 
   test('blocks find_entry reading a hidden transcript via top-level path', () => {
