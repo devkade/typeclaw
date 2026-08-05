@@ -335,6 +335,20 @@ describe('planStart', () => {
     expect(idx).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
   })
 
+  test('sets --init unconditionally so tini reaps orphaned bwrap sandboxes instead of leaking their user namespaces', async () => {
+    // given
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+
+    // when
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    // then
+    const idx = plan.runArgs.indexOf('--init')
+    expect(idx).toBeGreaterThan(-1)
+    expect(idx).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
+  })
+
   test('can publish the TUI websocket port on all host interfaces', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })

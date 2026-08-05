@@ -724,6 +724,47 @@ export async function planStart({
   // misattribute to bot detection. 2g matches the Playwright/Puppeteer
   // canonical recommendation and is a memory cap, not an allocation (only
   // used pages count against the host).
+  // `--init` puts Docker's bundled `docker-init` (tini) at PID 1 and demotes
+  // the entrypoint shim to PID 2. It is load-bearing, not hygiene: without it
+  // the container leaks a kernel user namespace on every aborted or timed-out
+  // model bash call, until every `bwrap` in the container — and in every other
+  // typeclaw container on the same host — dies with
+  // `unshare user ns: No space left on device`.
+  //
+  // The chain: each model bash call runs the sandbox under `bash -c`, and the
+  // sandbox mints a fresh user namespace per call on BOTH strategies — under
+  // the default `proc-bind`/`tmpfs` it is `bwrap --unshare-all`, while
+  // `sandbox.realProc` splits the pid namespace out into `unshare --pid --fork
+  // --mount --mount-proc` and has bwrap take the user namespace via an
+  // explicit `--unshare-user` (see buildArgv in src/sandbox/build.ts). On
+  // timeout or abort the upstream bash tool SIGKILLs the process GROUP, then
+  // reaps its own direct `bash` child by waiting on the handle it holds. The
+  // sandbox descendant it holds no handle for is re-parented to PID 1 instead.
+  // Since the shim `exec`s into bun, PID 1 was the Bun runtime — and a JS
+  // runtime never `wait()`s on orphans it did not spawn, so that descendant
+  // stays a zombie for the life of the container. A zombie drops its
+  // `nsproxy` at `do_exit()` (so
+  // mount/net namespaces are freed early) but keeps its `struct cred` until
+  // it is reaped, and `cred->user_ns` pins the user namespace; its surviving
+  // `struct pid` pins the pid namespace, which pins that same user namespace
+  // again. The `UCOUNT_USER_NAMESPACES` charge is only returned by
+  // `free_user_ns()`, so it is never returned at all.
+  //
+  // That charge is accounted against the ANCESTOR (host) user namespace, so
+  // the exhausted resource is the host kernel's `user.max_user_namespaces`,
+  // shared across every container on the box. Raising the host sysctl only
+  // buys time; reaping is the fix. tini reaps re-parented orphans, which
+  // releases the creds and returns the ucount.
+  //
+  // Chosen over baking `tini` into the image because the per-agent Dockerfile
+  // pins a PUBLISHED `typeclaw-base:X.Y.Z` (see refreshDockerfile): a new
+  // baseline apt package would not exist in already-released base tags. This
+  // flag needs no image change and takes effect on the next container create.
+  // `--init` is create-time state, so a container launched before this flag
+  // existed keeps leaking: `start()` deliberately no-ops on a live container.
+  // Operators must `typeclaw restart` (removes and recreates), not
+  // `docker restart` (reuses the old HostConfig).
+  //
   // `seccomp=unconfined` lets `bwrap(1)` (installed in baseline; see
   // BASELINE_APT_PACKAGES in src/init/dockerfile.ts) create user/pid/mount
   // namespaces from inside the container. Docker's default seccomp profile
@@ -742,6 +783,7 @@ export async function planStart({
   const runArgs = [
     'run',
     '-d',
+    '--init',
     '--name',
     containerName,
     '--shm-size=2g',
