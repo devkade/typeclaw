@@ -261,6 +261,8 @@ describe('finishing the job — completion + anti-fabrication steer', () => {
     expect(p).toMatch(/restart-required/i)
     expect(p).toMatch(/unverified/i)
     expect(p).toMatch(/never (say you performed|claim) an action you did not perform/i)
+    expect(p).toMatch(/verify the (reported )?symptom is gone in the (running|live) system/i)
+    expect(p).toMatch(/label (any account of the cause as the inference it is|a suspected cause as inference)/i)
   })
 
   // Cache-suffix contract: steering blocks must live in the least-volatile
