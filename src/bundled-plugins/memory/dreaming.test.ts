@@ -12,6 +12,7 @@ import {
   compactDailyStreams,
   createDreamingSubagent,
   DREAM_EMOJI_POOL,
+  DREAMING_SYSTEM_PROMPT,
   deleteRedundantDreamedCitedStreamVectors,
   type DreamingLogger,
   type DreamingPayload,
@@ -1658,5 +1659,25 @@ describe('dreaming over-budget compaction signal', () => {
     const { prompts } = await invokeDreaming(agentDir)
 
     expect(prompts[0]).not.toContain('Over the embedding budget')
+  })
+})
+
+describe('rule 10 — the agent’s own response style is not a belief', () => {
+  // Regression: dreaming consolidated a shard describing how the agent
+  // apologized ("unqualified apology, root-cause explanation, concrete fix,
+  // under 70 words"). Retrieved on later turns, it became a template the
+  // agent performed instead of verifying work, producing false fix claims.
+  test('the dreaming prompt refuses to consolidate the agent’s own reply shape', () => {
+    expect(DREAMING_SYSTEM_PROMPT).toMatch(/never turn the main agent's own response style into a belief/i)
+    expect(DREAMING_SYSTEM_PROMPT).toMatch(/how it apologized/i)
+  })
+
+  test('the dreaming prompt keeps the user-side fact and drops the agent-side self-description', () => {
+    expect(DREAMING_SYSTEM_PROMPT).toMatch(/keep the user-side fact/i)
+    expect(DREAMING_SYSTEM_PROMPT).toMatch(/when a fragment carries both, keep only the user-side half/i)
+  })
+
+  test('the dreaming prompt routes voice and register to SOUL.md rather than a shard', () => {
+    expect(DREAMING_SYSTEM_PROMPT).toMatch(/voice and register live in `SOUL\.md`/i)
   })
 })

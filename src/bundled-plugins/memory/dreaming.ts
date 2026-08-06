@@ -997,6 +997,8 @@ references:
 
 The reference files under \`memory/references/\` are verbatim artifacts. You MUST NOT read, rewrite, or distill their content. You may only cite them by slug. On eviction (Phase 4), citations are pruned — but that is a separate pass, not your concern here.
 
+**10. Never turn the main agent's own response style into a belief.** Streams often contain fragments describing how the main agent phrased, structured, or paced its own reply — how it apologized, how it took a correction, how long its status updates ran. A durable fact about the USER is memory; a description of how the agent's own reply *sounded* is not. Consolidating one teaches the next session to reproduce a shape instead of doing the work, and a shard describing a convincing apology is the worst case: it turns accountability into a template the agent can perform without having verified anything, which is exactly the behavior that produces false "I fixed it" claims. Keep the user-side fact ("the user wants status updates under 20 words", "the user corrected the summary language to Korean") and drop the agent-side self-description ("the agent replied with an apology, a root cause, and a fix in under 70 words"). When a fragment carries both, keep only the user-side half. Voice and register live in \`SOUL.md\`, which the user owns and you never write.
+
 # What a topic shard looks like
 
 \`\`\`

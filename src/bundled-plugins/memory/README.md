@@ -111,6 +111,8 @@ The subagent uses these signals to:
 
 There is no `## Historical observations` bucket. Demoted topics live as their own shards; injection-time filtering (the index/direct split) handles the prompt-budget pressure.
 
+**The agent's own response style never becomes a belief (rule 10).** Streams capture the agent's own turns, so fragments sometimes describe how it replied rather than what is true — how it apologized, how it took a correction, how terse its status updates were. Consolidating those teaches the next session to reproduce a shape instead of doing the work; a shard describing a convincing apology is the worst case, because it makes accountability a template the agent can perform without having verified anything. The user-side fact is kept ("the user wants status updates under 20 words"), the agent-side self-description dropped. Voice and register belong in `SOUL.md`, which the subagent never writes.
+
 ## Muscle memory (three forms)
 
 While reading streams, the dreaming subagent watches for **repeated multi-step procedures** the user has guided the main agent through, and codifies them. There are three forms, picked smallest-that-fits (top to bottom, stop at the first match):
