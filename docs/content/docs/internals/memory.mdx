@@ -63,6 +63,12 @@ The promotion ladder is encoded in the belief sentence's wording, never in a sep
 
 Demotion has no bucket: weak/old topics stay as their own shards but get terse, and the injection-time index/direct split keeps them out of the prompt when the budget is tight.
 
+## What never becomes a belief: the agent's own response style
+
+Streams capture the agent's own turns, so fragments sometimes describe how it _replied_ — how it apologized, how it absorbed a correction, how terse its status updates were. Dreaming rule 10 discards these. A durable fact about the **user** is memory; a description of how the agent's own reply sounded is a mimicry target that teaches the next session to reproduce a shape instead of doing the work.
+
+The sharp edge is accountability language. A shard recording "the agent replied with an apology, a root cause, and a fix in under 70 words" turns owning a mistake into a template the agent can perform without having verified anything — and because retrieval reinforces whatever it surfaces, the performance gets stronger each time it fires while the underlying verification never happens. The user-side half is kept ("the user wants status updates under 20 words"); the agent-side self-description is dropped. Voice and register belong in `SOUL.md`, which the dreaming subagent never writes.
+
 ## Supersession: handling contradictions without losing history
 
 When a new fragment overturns an existing belief (e.g. "uses bun" → "uses pnpm"), the dreaming subagent rewrites the belief sentence and **moves the old fragment id from `fragments:` into a `superseded:` list in the same shard**. Both lists keep the ids cited — so the citation-superset invariant holds and history is auditable — but `superseded:` ids are **excluded from vector retrieval** (`passages.ts` does not embed them). A stale "uses bun" fragment can never resurface as a retrieval hook against the current "uses pnpm" belief.
