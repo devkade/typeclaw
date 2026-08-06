@@ -781,10 +781,14 @@ export const KNOWN_PROVIDERS = {
   // the console, the OpenAI-SDK example, and the agent docs all use bare `/v1`.
   //
   // Model lineup spans two families on the same Console API + key:
-  //   * Closed chat models from the official agent API reference
-  //     (console.upstage.ai/api/docs/for-agents) as of 2026-03-23:
-  //     solar-pro3 (102B MoE / 12B active, 128K, flagship), solar-pro2
-  //     (31B, 65K), solar-mini (10.7B, 32K, cheap/fast).
+  //   * Closed chat models. solar-pro4 (512K context / 128K output, released
+  //     2026-08-06, current flagship) is per the live model page
+  //     console.upstage.ai/docs/models/solar-pro4; the rest are from the agent
+  //     API reference (console.upstage.ai/api/docs/for-agents) as of
+  //     2026-03-23: solar-pro3 (102B MoE / 12B active, 128K), solar-pro2
+  //     (31B, 65K), solar-mini (10.7B, 32K, cheap/fast). Note that the
+  //     for-agents dump is stale (self-dated 2026-03-07) and omits pro4 — its
+  //     absence there is not evidence the model is unavailable.
   //   * The open-weight Solar Open family: solar-open2 (Solar Open 2), a 102B
   //     MoE / 12B active model with a 128K context. It launched on the Console
   //     API for the Solar Agent Partner program (Stage 1, from 2026-07-17) —
@@ -799,6 +803,7 @@ export const KNOWN_PROVIDERS = {
   // versioned release.
   //
   // Costs are USD per 1M tokens from upstage.ai/pricing/api (VAT-exclusive).
+  // solar-pro4 is $0.30 in / $1.20 out with a $0.06 "Input(Cached)" rate.
   // solar-pro3/pro2 publish an "Input(Cached)" cache-read rate ($0.015); no
   // cache-write surcharge is published, so cacheWrite is 0. solar-mini
   // publishes a single flat $0.15 rate with no cache line, so cacheRead and
@@ -819,18 +824,37 @@ export const KNOWN_PROVIDERS = {
   // definitions are both undocumented, so supportsUsageInStreaming and
   // supportsStrictMode are false (both conservative — pi-ai defaults them to
   // true, and Upstage only documents `strict` inside response_format.json_schema,
-  // never on tool defs). `reasoning_effort` IS documented for solar-pro3/pro2
-  // (and the solar-open2 chat template), so supportsReasoningEffort stays true
-  // there; solar-mini ignores it, so it is false and reasoning is off.
+  // never on tool defs). `reasoning_effort` IS documented for solar-pro4,
+  // solar-open2, solar-pro3 and solar-pro2, so supportsReasoningEffort stays
+  // true there; solar-mini rejects it, so it is false and reasoning is off.
   //
-  // Upstage documents reasoning_effort values minimal/low/medium/high only. pi
-  // adds an `xhigh` level that typeclaw's attention escalation can select
-  // (src/agent/attention-escalation.ts), and pi-ai passes the pi level straight
-  // through as reasoning_effort when no map is set — which would send the
-  // unsupported `xhigh`. `thinkingLevelMap` clamps xhigh -> high (and maps off ->
-  // null so nothing is sent) on the reasoning models so every emitted
-  // reasoning_effort is a value Upstage accepts. solar-mini needs no map (it
-  // never sends reasoning_effort).
+  // Reasoning splits the lineup into two groups with OPPOSITE defaults, per
+  // Upstage's reasoning table (console.upstage.ai/docs/capabilities/generate/
+  // reasoning). pi adds an `xhigh` level that typeclaw's attention escalation
+  // can select (src/agent/attention-escalation.ts), and pi-ai passes the pi
+  // level straight through as reasoning_effort when no map is set, so each
+  // group needs a different `thinkingLevelMap`:
+  //
+  //   * solar-pro4 and solar-open2 — omitted reasoning_effort means reasoning
+  //     is ON; `none`/`minimal` turn it OFF; low/medium/high/xhigh/max turn it
+  //     on. So `off` maps to the string 'none', NOT null: pi-ai emits a string
+  //     off value verbatim and omits the field only when it is null, and
+  //     omitting it here would silently leave reasoning enabled (and billed) on
+  //     every non-reasoning turn. `xhigh` is documented, so it passes through
+  //     unclamped. Upstage's `max` sits above xhigh, but pi has no level above
+  //     xhigh to reach it, so `max` is intentionally unreachable.
+  //   * solar-pro3 and solar-pro2 — omitted means reasoning is OFF, `minimal`
+  //     and `low` ALSO turn it off, and only `medium`/`high` turn it on. So
+  //     `off` maps to null (nothing sent) and xhigh clamps to high.
+  //
+  // Note the trap in both rows: Upstage's `minimal` is an OFF value, but pi's
+  // `minimal` is an enabled level meaning "reason a little". Forwarding it
+  // verbatim would silently disable reasoning on a request that asked for it.
+  // Each group therefore floors pi's enabled levels at its own lowest
+  // reasoning-ON value — `low` for pro4/open2, `medium` for pro3/pro2 (which is
+  // why pi's `low` also maps to `medium` there). Every level pi can select thus
+  // emits a value Upstage treats as reasoning-on. solar-mini needs no map: it
+  // does not accept reasoning_effort at all (any value returns HTTP 400).
   upstage: {
     id: 'upstage',
     name: 'Upstage (Solar)',
@@ -839,6 +863,35 @@ export const KNOWN_PROVIDERS = {
     apiKeyEnv: 'UPSTAGE_API_KEY',
     oauthProviderId: null,
     models: {
+      'solar-pro4': {
+        id: 'solar-pro4',
+        name: 'Solar Pro 4',
+        api: 'openai-completions',
+        provider: 'upstage',
+        baseUrl: 'https://api.upstage.ai/v1',
+        reasoning: true,
+        // pro4 and open2 reason by DEFAULT — see the reasoning-group note above.
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: 'low',
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+        },
+        input: ['text'],
+        cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
+        contextWindow: 524288,
+        maxTokens: 131072,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: true,
+          supportsUsageInStreaming: false,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+      },
       'solar-open2': {
         id: 'solar-open2',
         name: 'Solar Open 2',
@@ -846,7 +899,14 @@ export const KNOWN_PROVIDERS = {
         provider: 'upstage',
         baseUrl: 'https://api.upstage.ai/v1',
         reasoning: true,
-        thinkingLevelMap: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'high' },
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: 'low',
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+        },
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128000,
@@ -867,7 +927,14 @@ export const KNOWN_PROVIDERS = {
         provider: 'upstage',
         baseUrl: 'https://api.upstage.ai/v1',
         reasoning: true,
-        thinkingLevelMap: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'high' },
+        thinkingLevelMap: {
+          off: null,
+          minimal: 'medium',
+          low: 'medium',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'high',
+        },
         input: ['text'],
         cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0 },
         contextWindow: 128000,
@@ -888,7 +955,14 @@ export const KNOWN_PROVIDERS = {
         provider: 'upstage',
         baseUrl: 'https://api.upstage.ai/v1',
         reasoning: true,
-        thinkingLevelMap: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'high' },
+        thinkingLevelMap: {
+          off: null,
+          minimal: 'medium',
+          low: 'medium',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'high',
+        },
         input: ['text'],
         cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0 },
         contextWindow: 65000,

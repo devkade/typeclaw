@@ -186,7 +186,7 @@ describe('KNOWN_PROVIDERS', () => {
 
   test('upstage ships the Solar chat lineup plus the open-weight solar-open2, text-only, syn-pro omitted', () => {
     const models = KNOWN_PROVIDERS.upstage.models
-    expect(Object.keys(models)).toEqual(['solar-open2', 'solar-pro3', 'solar-pro2', 'solar-mini'])
+    expect(Object.keys(models)).toEqual(['solar-pro4', 'solar-open2', 'solar-pro3', 'solar-pro2', 'solar-mini'])
     expect(Object.keys(models)).not.toContain('syn-pro')
     for (const [modelId, model] of Object.entries(models)) {
       expect((model.input as ReadonlyArray<string>).includes('image'), `upstage/${modelId} should be text-only`).toBe(
@@ -224,7 +224,8 @@ describe('KNOWN_PROVIDERS', () => {
     const models = KNOWN_PROVIDERS.upstage.models
     const compatFor = (id: keyof typeof models) =>
       (models[id] as { compat?: { supportsReasoningEffort?: boolean } }).compat
-    // solar-pro3/pro2 and the solar-open2 template document reasoning_effort; solar-mini ignores it.
+    // solar-pro4/pro3/pro2 and the solar-open2 template document reasoning_effort; solar-mini ignores it.
+    expect(compatFor('solar-pro4')!.supportsReasoningEffort).toBe(true)
     expect(compatFor('solar-open2')!.supportsReasoningEffort).toBe(true)
     expect(compatFor('solar-pro3')!.supportsReasoningEffort).toBe(true)
     expect(compatFor('solar-pro2')!.supportsReasoningEffort).toBe(true)
@@ -232,19 +233,48 @@ describe('KNOWN_PROVIDERS', () => {
     expect(models['solar-mini']!.reasoning, 'solar-mini does not reason').toBe(false)
   })
 
-  test('reasoning upstage models clamp pi\u2019s xhigh to Upstage\u2019s documented reasoning_effort=high', () => {
+  test('the reasoning-off-by-default models clamp pi\u2019s xhigh to their documented max reasoning_effort=high', () => {
     const models = KNOWN_PROVIDERS.upstage.models
-    for (const id of ['solar-open2', 'solar-pro3', 'solar-pro2'] as const) {
+    for (const id of ['solar-pro3', 'solar-pro2'] as const) {
       const map = (models[id] as { thinkingLevelMap?: Record<string, string | null> }).thinkingLevelMap
       expect(map, `upstage/${id} missing thinkingLevelMap`).toBeDefined()
-      // Upstage documents minimal/low/medium/high only; xhigh must not leak through.
+      // These two only accept medium/high as reasoning-on; xhigh must not leak through
+      // and minimal/low would disable reasoning, so pi's enabled levels floor at medium.
       expect(map!.xhigh, `upstage/${id} must clamp xhigh -> high`).toBe('high')
       expect(map!.off, `upstage/${id} must omit reasoning_effort when off`).toBeNull()
+      expect(map!.minimal, `upstage/${id} must floor minimal at medium`).toBe('medium')
+      expect(map!.low, `upstage/${id} must floor low at medium`).toBe('medium')
     }
     expect(
       (models['solar-mini'] as { thinkingLevelMap?: unknown }).thinkingLevelMap,
       'solar-mini needs no map (never sends reasoning_effort)',
     ).toBeUndefined()
+  })
+
+  test('the reasoning-on-by-default models pass xhigh through natively instead of clamping it', () => {
+    for (const id of ['solar-pro4', 'solar-open2'] as const) {
+      const map = (KNOWN_PROVIDERS.upstage.models[id] as { thinkingLevelMap?: Record<string, string | null> })
+        .thinkingLevelMap
+      expect(map, `upstage/${id} missing thinkingLevelMap`).toBeDefined()
+      expect(map!.xhigh, `upstage/${id} documents xhigh, so it must not be clamped to high`).toBe('xhigh')
+      // Upstage's `minimal` disables reasoning, so pi's enabled `minimal` floors at `low`.
+      expect(map!.minimal, `upstage/${id} must floor minimal at the lowest reasoning-on level`).toBe('low')
+      for (const level of ['low', 'medium', 'high'] as const) {
+        expect(map![level], `upstage/${id} level ${level} must pass through unchanged`).toBe(level)
+      }
+    }
+  })
+
+  test('the reasoning-on-by-default models disable reasoning with an explicit none, not by omission', () => {
+    // Upstage documents pro4 and open2 as reasoning when reasoning_effort is
+    // omitted, with `none` as the off switch — inverted from pro3/pro2, where off
+    // is null so pi-ai omits the field. A null here would silently reason on
+    // every turn, which is a latency and billing bug rather than a hard failure.
+    for (const id of ['solar-pro4', 'solar-open2'] as const) {
+      const map = (KNOWN_PROVIDERS.upstage.models[id] as { thinkingLevelMap?: Record<string, string | null> })
+        .thinkingLevelMap
+      expect(map!.off, `upstage/${id} must send reasoning_effort=none to turn reasoning off`).toBe('none')
+    }
   })
 
   test('anthropic supports both api-key and oauth on the same provider id', () => {
@@ -551,6 +581,7 @@ describe('listKnownModelRefs', () => {
 
   test('includes upstage Solar model refs', () => {
     const refs = listKnownModelRefs()
+    expect(refs).toContain('upstage/solar-pro4')
     expect(refs).toContain('upstage/solar-open2')
     expect(refs).toContain('upstage/solar-pro3')
     expect(refs).toContain('upstage/solar-pro2')
