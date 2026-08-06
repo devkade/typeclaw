@@ -224,6 +224,45 @@ describe('finishing the job — completion + anti-fabrication steer', () => {
     },
   )
 
+  // Regression: an agent reported "fixed it, build and lint passed" for a
+  // restart-required plugin change that never loaded into the running
+  // container, then invented a cause for the resulting tool failure. A green
+  // build proves the artifact is well-formed, never that it took effect.
+  test('the default prompt separates a green build from a change that actually took effect', () => {
+    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')
+    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel'))
+    expect(section).toMatch(/not done because it compiled/i)
+    expect(section).toMatch(/restart-required/i)
+    expect(section).toMatch(/verify the reported symptom is gone in the running system/i)
+    expect(section).toMatch(/name what is still unverified/i)
+  })
+
+  test('the default prompt forbids claiming actions the agent did not or cannot perform', () => {
+    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')
+    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel'))
+    expect(section).toMatch(/never say you performed an action you did not perform/i)
+    expect(section).toMatch(/cannot perform from where you run/i)
+  })
+
+  test('the default prompt makes an unverified cause a fabrication, not an explanation', () => {
+    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')
+    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel'))
+    expect(section).toMatch(/separate what a tool returned from why you think it happened/i)
+    expect(section).toMatch(/label any account of the cause as the inference it is/i)
+  })
+
+  // The incident spanned BOTH modes: a full-mode channel session made the
+  // false claim, and slim-mode cron runs repeated an invented cause every 30
+  // minutes. Adding the rule to only one mode silently regresses the other.
+  test.each([
+    ['default prompt', DEFAULT_SYSTEM_PROMPT],
+    ['slim prompt', SLIM_SYSTEM_PROMPT],
+  ])('the %s requires verifying the fix landed in the live system before reporting it', (_n, p) => {
+    expect(p).toMatch(/restart-required/i)
+    expect(p).toMatch(/unverified/i)
+    expect(p).toMatch(/never (say you performed|claim) an action you did not perform/i)
+  })
+
   // Cache-suffix contract: steering blocks must live in the least-volatile
   // base prefix, AHEAD of the per-agent identity block, so they never
   // invalidate cached bytes when IDENTITY.md / SOUL.md change.
