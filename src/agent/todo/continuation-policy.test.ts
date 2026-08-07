@@ -124,6 +124,20 @@ describe('parseContinuationState (fail-closed validation)', () => {
     expect(parseContinuationState(corrupt).lastTurnOutcome).toBeNull()
   })
 
+  test('an unknown termination provenance is dropped and cannot authorize an abort', () => {
+    const persisted = {
+      lastTurnOutcome: {
+        turnId: 't',
+        stopReason: 'aborted',
+        termination: 'something-else',
+        endedAt: 1,
+      },
+    }
+    const state = parseContinuationState(persisted)
+    expect(state.lastTurnOutcome).toEqual({ turnId: 't', stopReason: 'aborted', endedAt: 1 })
+    expect(decide(state)).toEqual({ kind: 'skip', reason: 'turn-not-safe' })
+  })
+
   test('a length stopReason round-trips (budget truncation is continuation-eligible)', () => {
     const state = { lastTurnOutcome: { turnId: 't', stopReason: 'length', endedAt: 1 } }
     expect(parseContinuationState(state).lastTurnOutcome).toEqual({ turnId: 't', stopReason: 'length', endedAt: 1 })
@@ -158,6 +172,20 @@ describe('decideContinuation', () => {
   test('skips when the last turn was a user abort', () => {
     const d = decide(baseState({ lastTurnOutcome: { turnId: 't', stopReason: 'aborted', endedAt: 1 } }))
     expect(d).toEqual({ kind: 'skip', reason: 'turn-not-safe' })
+  })
+
+  test('injects only for an aborted turn trusted as a terminal channel reply', () => {
+    const d = decide(
+      baseState({
+        lastTurnOutcome: {
+          turnId: 't',
+          stopReason: 'aborted',
+          termination: 'terminal-after-channel-reply',
+          endedAt: 1,
+        },
+      }),
+    )
+    expect(d.kind).toBe('inject')
   })
 
   test('injects after a length truncation (budget exhaustion is continuation-eligible)', () => {

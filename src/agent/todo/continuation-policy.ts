@@ -46,6 +46,9 @@ export type ContinuationEpisode = {
 export type TurnOutcome = {
   turnId: string
   stopReason: 'stop' | 'length' | 'aborted' | 'error' | 'unknown'
+  // Trusted runtime provenance for the one intentional abort that is safe to
+  // continue. Optional so older state files remain valid.
+  termination?: 'terminal-after-channel-reply'
   endedAt: number
   // Total tokens the just-completed turn consumed (from the assistant
   // message's usage). Accumulated into the episode's cumulativeTokens so the
@@ -136,6 +139,7 @@ function parseOutcome(value: unknown): TurnOutcome | null {
     turnId: o.turnId,
     stopReason: o.stopReason as TurnOutcome['stopReason'],
     endedAt: o.endedAt,
+    ...(o.termination === 'terminal-after-channel-reply' ? { termination: o.termination } : {}),
     ...(isFiniteNumber(o.tokens) ? { tokens: o.tokens } : {}),
   }
 }
@@ -209,7 +213,13 @@ export function decideContinuation(args: {
   if (state.autoResumeBlockedUntilRealUserTurn) return { kind: 'skip', reason: 'user-abort-blocked' }
 
   const outcome = state.lastTurnOutcome
-  if (outcome === null || outcome.stopReason === 'unknown' || outcome.stopReason === 'aborted') {
+  const isSafeTerminalReplyAbort =
+    outcome?.stopReason === 'aborted' && outcome.termination === 'terminal-after-channel-reply'
+  if (
+    outcome === null ||
+    outcome.stopReason === 'unknown' ||
+    (outcome.stopReason === 'aborted' && !isSafeTerminalReplyAbort)
+  ) {
     return { kind: 'skip', reason: 'turn-not-safe' }
   }
 
