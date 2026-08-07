@@ -99,6 +99,29 @@ export function findUnknownPermissions(
   return out
 }
 
+// The mirror of findUnknownPermissions. `definePlugin({ permissions })`
+// registers a string but grants nothing, so a plugin gating a surface on a
+// fresh id without a matching `roles.<role>.permissions[]` entry is denied
+// for EVERY caller including owner -- previously with no signal until the
+// block fired at call time. Non-fatal: withholding a capability is a valid
+// operator choice.
+//
+// Resolves the role table rather than reading raw config because
+// expandOwnerWildcard auto-flows a plugin's `security.bypass.*` strings to
+// owner; reading config would report every one of them as ungranted.
+export function findUngrantedPluginPermissions(
+  roles: RolesConfig | undefined,
+  pluginPermissions: readonly string[],
+  ownerWildcardExclusions: readonly string[] = [],
+): string[] {
+  if (pluginPermissions.length === 0) return []
+  const granted = new Set<string>()
+  for (const role of buildRoleTable(roles ?? {}, pluginPermissions, ownerWildcardExclusions)) {
+    for (const permission of role.permissions) granted.add(permission)
+  }
+  return pluginPermissions.filter((permission) => !granted.has(permission))
+}
+
 function closestPermission(target: string, known: ReadonlySet<string>): string {
   let best: { name: string; distance: number } | null = null
   for (const name of known) {

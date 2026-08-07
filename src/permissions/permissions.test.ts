@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { SessionOrigin } from '@/agent/session-origin'
 
 import { BUILTIN_ROLES, expandOwnerWildcard } from './builtins'
-import { createBoundedCache, createPermissionService } from './permissions'
+import { createBoundedCache, createPermissionService, findUngrantedPluginPermissions } from './permissions'
 import { rolesConfigSchema, type RolesConfig } from './schema'
 
 function parseRoles(raw: unknown): RolesConfig {
@@ -480,5 +480,47 @@ describe('PermissionService — compareRoleSeverity', () => {
     const svc = createPermissionService()
     expect(svc.compareRoleSeverity('ghost', 'member')).toBeUndefined()
     expect(svc.compareRoleSeverity('owner', 'ghost')).toBeUndefined()
+  })
+})
+
+describe('findUngrantedPluginPermissions', () => {
+  test('a plugin permission no role lists is reported', () => {
+    expect(findUngrantedPluginPermissions(undefined, ['standup.publish.remote'])).toEqual(['standup.publish.remote'])
+  })
+
+  test('granting it on a built-in role clears the report', () => {
+    const roles = parseRoles({
+      owner: { match: ['tui'], permissions: ['channel.respond', 'standup.publish.remote'] },
+    })
+    expect(findUngrantedPluginPermissions(roles, ['standup.publish.remote'])).toEqual([])
+  })
+
+  test('granting it on a custom role clears the report', () => {
+    const roles = parseRoles({ ops: { match: ['discord:G1'], permissions: ['standup.publish.remote'] } })
+    expect(findUngrantedPluginPermissions(roles, ['standup.publish.remote'])).toEqual([])
+  })
+
+  test('security.bypass.* is NOT reported — the owner wildcard auto-grants it', () => {
+    expect(findUngrantedPluginPermissions(undefined, ['security.bypass.myGuard'])).toEqual([])
+  })
+
+  test('a security.bypass.* string excluded from the wildcard IS reported', () => {
+    expect(findUngrantedPluginPermissions(undefined, ['security.bypass.myGuard'], ['security.bypass.myGuard'])).toEqual(
+      ['security.bypass.myGuard'],
+    )
+  })
+
+  test('replacing owner permissions without re-listing the plugin string re-reports it', () => {
+    const roles = parseRoles({ owner: { match: ['tui'], permissions: ['channel.respond'] } })
+    expect(findUngrantedPluginPermissions(roles, ['security.bypass.myGuard'])).toEqual(['security.bypass.myGuard'])
+  })
+
+  test('reports only the ungranted subset', () => {
+    const roles = parseRoles({ member: { match: ['*'], permissions: ['a.one'] } })
+    expect(findUngrantedPluginPermissions(roles, ['a.one', 'a.two'])).toEqual(['a.two'])
+  })
+
+  test('no plugin permissions → nothing to report', () => {
+    expect(findUngrantedPluginPermissions(undefined, [])).toEqual([])
   })
 })
