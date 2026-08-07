@@ -19,11 +19,11 @@ import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from '@/agent/tools-without-local-f
 import { RECOVER_MISSING_OR_UNSEARCHABLE, realIntendedPathSync } from '@/path-safety/real-intended-path'
 import type { ToolFileOperands } from '@/plugin'
 import {
-  CANONICAL_AGENT_SECRET_DIRS,
   CANONICAL_AGENT_SECRET_FILES,
   CANONICAL_HOME_SECRET_DIRS,
   CANONICAL_HOME_SECRET_FILES,
   CONTAINER_RUNTIME_HOME,
+  RUNTIME_OWNED_SECRET_DIRS,
   type HiddenPaths,
 } from '@/sandbox'
 
@@ -179,7 +179,7 @@ function deniedSurface(agentDir: string, hidden: HiddenPaths): { deniedDirs: str
     deniedDirs: [
       ...new Set([
         ...hidden.dirs,
-        ...CANONICAL_AGENT_SECRET_DIRS.map((dir) => path.join(agentDir, dir)),
+        ...RUNTIME_OWNED_SECRET_DIRS.map((dir) => path.join(agentDir, dir)),
         // homedir() follows the live container HOME; the fixed runtime path
         // keeps the same denial deterministic in host-stage tests and any
         // partially-initialized caller whose environment has not switched yet.
