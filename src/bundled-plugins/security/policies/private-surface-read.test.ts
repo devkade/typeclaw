@@ -384,7 +384,7 @@ describe('private-surface-read guard — traversal + scope', () => {
     expect(check('read', { path: '/agent/auth.json.bak' })).toBeUndefined()
   })
 
-  test('privileged roles may read private directories but never canonical agent secret files', () => {
+  test('privileged roles may read private directories but never runtime-owned credential stores', () => {
     expect(check('read', { path: 'workspace/notes.md' }, privilegedHidden)).toBeUndefined()
     expect(check('look_at', { images: [{ path: 'workspace/x' }] }, privilegedHidden)).toBeUndefined()
     expect(check('read', { path: '.env' }, privilegedHidden)?.block).toBe(true)
@@ -393,14 +393,15 @@ describe('private-surface-read guard — traversal + scope', () => {
     expect(check('ls', { path: '/agent/.env' }, privilegedHidden)?.block).toBe(true)
     expect(check('read', { path: '/agent/auth.json' }, privilegedHidden)?.block).toBe(true)
     expect(
-      check('read', { path: '/agent/workspace/.config/agent-messenger/instagram/session.json' }, privilegedHidden)
-        ?.block,
-    ).toBe(true)
-    expect(
       check('read', { path: '/agent/workspace/.agent-messenger/slack-credentials.json' }, privilegedHidden)?.block,
     ).toBe(true)
-    expect(check('read', { path: '/agent/workspace/.config/gws/credentials.json' }, privilegedHidden)?.block).toBe(true)
     expect(check('read', { path: '/agent/workspace/.config' }, privilegedHidden)).toBeUndefined()
+    expect(
+      check('read', { path: '/agent/workspace/.config/agent-messenger/instagram/session.json' }, privilegedHidden),
+    ).toBeUndefined()
+    expect(check('read', { path: '/agent/workspace/.config/gws/credentials.json' }, privilegedHidden)).toBeUndefined()
+    expect(check('read', { path: '/agent/workspace/.config/gws/credentials.json' })?.block).toBe(true)
+    expect(check('read', { path: '/agent/workspace/.config/agent-messenger/slack-credentials.json' })?.block).toBe(true)
     expect(
       check('read', { path: '/agent/workspace/.config/agent-messenger-backup/session.json' }, privilegedHidden),
     ).toBeUndefined()

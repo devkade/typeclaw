@@ -7,7 +7,12 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import { createPermissionService } from '@/permissions/permissions'
 import { rolesConfigSchema, type RolesConfig } from '@/permissions/schema'
 
-import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from './canonical-secrets'
+import {
+  CANONICAL_AGENT_SECRET_DIRS,
+  CANONICAL_AGENT_SECRET_FILES,
+  OPERATOR_CLI_CREDENTIAL_DIRS,
+  RUNTIME_OWNED_SECRET_DIRS,
+} from './canonical-secrets'
 import {
   canWriteAgentRootInSandbox,
   ensureHiddenMaskTargets,
@@ -17,19 +22,18 @@ import {
 import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 
 const AGENT = '/agent'
-const hiddenDirs = (agentDir: string) => [
+const operatorCliCredentialDirs = (agentDir: string) => [
   join(agentDir, 'workspace', '.config', 'gws'),
   join(agentDir, 'workspace', '.config', 'agent-messenger'),
-  join(agentDir, 'workspace', '.agent-messenger'),
-  join(agentDir, '.typeclaw', 'home'),
-  join(agentDir, '.typeclaw', 'logs'),
+]
+const hiddenDirs = (agentDir: string) => [
+  ...canonicalSecretDirs(agentDir),
+  ...operatorCliCredentialDirs(agentDir),
   join(agentDir, 'workspace'),
   join(agentDir, 'memory'),
   join(agentDir, 'sessions'),
 ]
 const canonicalSecretDirs = (agentDir: string) => [
-  join(agentDir, 'workspace', '.config', 'gws'),
-  join(agentDir, 'workspace', '.config', 'agent-messenger'),
   join(agentDir, 'workspace', '.agent-messenger'),
   join(agentDir, '.typeclaw', 'home'),
   join(agentDir, '.typeclaw', 'logs'),
@@ -60,7 +64,7 @@ describe('resolveHiddenPaths — builtin tiers', () => {
     expect(CANONICAL_AGENT_RUNTIME_PRIVATE_FILES).toEqual(['.typeclaw/incidents.json'])
     expect(CANONICAL_AGENT_SECRET_FILES).not.toContain('.typeclaw/incidents.json')
     const resolved = resolveHiddenPaths(createPermissionService(), tui, AGENT)
-    expect(resolved.dirs).toEqual(CANONICAL_AGENT_SECRET_DIRS.map((entry) => join(AGENT, entry)))
+    expect(resolved.dirs).toEqual(RUNTIME_OWNED_SECRET_DIRS.map((entry) => join(AGENT, entry)))
     expect(resolved.files).toEqual([
       ...CANONICAL_AGENT_SECRET_FILES.map((entry) => join(AGENT, entry)),
       ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES.map((entry) => join(AGENT, entry)),
@@ -105,6 +109,26 @@ describe('resolveHiddenPaths — builtin tiers', () => {
     const { dirs, files } = resolveHiddenPaths(svc, spawnedBy('guest'), AGENT)
     expect(dirs).toEqual(hiddenDirs(AGENT))
     expect(files).toEqual(secretFiles(AGENT))
+  })
+
+  test('operator CLI credential dirs stay readable for roles trusted with the private surface', () => {
+    // The bundled agent-* and gws skills shell out to CLIs that resolve these
+    // paths; masking them at every role breaks the skill instead of withholding
+    // a secret. Fails if either path is moved back into the unconditional list.
+    const svc = createPermissionService()
+    for (const origin of [tui, spawnedBy('trusted'), spawnedBy('member')]) {
+      const { dirs } = resolveHiddenPaths(svc, origin, AGENT)
+      for (const credentialDir of operatorCliCredentialDirs(AGENT)) expect(dirs).not.toContain(credentialDir)
+    }
+    const { dirs: guestDirs } = resolveHiddenPaths(svc, spawnedBy('guest'), AGENT)
+    for (const credentialDir of operatorCliCredentialDirs(AGENT)) expect(guestDirs).toContain(credentialDir)
+  })
+
+  test('the two classification lists partition the union with no overlap', () => {
+    expect([...OPERATOR_CLI_CREDENTIAL_DIRS, ...RUNTIME_OWNED_SECRET_DIRS].sort()).toEqual(
+      [...CANONICAL_AGENT_SECRET_DIRS].sort(),
+    )
+    for (const dir of OPERATOR_CLI_CREDENTIAL_DIRS) expect(RUNTIME_OWNED_SECRET_DIRS).not.toContain(dir)
   })
 
   test('guest never hides public/ — it is the guest-visible zone', () => {
