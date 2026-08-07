@@ -245,12 +245,18 @@ async function removePinnedSnapshot(root: string): Promise<void> {
   await rm(root, { recursive: true, force: true })
 }
 
+// Canonical credential denial is the one check no operand declaration can waive:
+// `fileOperands` is destructured away rather than spread through, so a tool (or a
+// remote MCP server) declaring `nonFile` on an operand cannot make `secrets.json`,
+// `.env`, or `~/.ssh` pass here. Role-derived private directories stay declarable
+// and are enforced separately by the private-surface-read guard.
 export function enforceCanonicalSecretDenial(options: {
   tool: string
   args: Record<string, unknown>
   agentDir: string
 }): void {
-  const blocked = checkPrivateSurfaceReadGuard({ ...options, hidden: { dirs: [], files: [] } })
+  const { tool, args, agentDir } = options
+  const blocked = checkPrivateSurfaceReadGuard({ tool, args, agentDir, hidden: { dirs: [], files: [] } })
   if (blocked !== undefined) throw new Error(`blocked: ${blocked.reason}`)
 }
 
