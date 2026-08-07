@@ -18,6 +18,7 @@ export {
 } from './match-rule'
 export {
   createPermissionService,
+  findUngrantedPluginPermissions,
   findUnknownPermissions,
   noopPermissionService,
   type CreatePermissionServiceOptions,

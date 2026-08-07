@@ -60,6 +60,21 @@ describe('rolesConfigSchema', () => {
     expect(result.success).toBe(false)
   })
 
+  // A hyphenated plugin name cannot reuse itself as a permission namespace:
+  // `definePlugin({ permissions })` never validates, so the id declares fine
+  // and only becomes un-grantable here, at the config edit.
+  test('rejects a hyphenated permission segment, accepts the hyphen-free form', () => {
+    const hyphenated = rolesConfigSchema.safeParse({
+      partner: { match: ['slack:T0123'], permissions: ['standup-log.write.entry'] },
+    })
+    expect(hyphenated.success).toBe(false)
+
+    const valid = rolesConfigSchema.safeParse({
+      partner: { match: ['slack:T0123'], permissions: ['standup.write.entry'] },
+    })
+    expect(valid.success).toBe(true)
+  })
+
   test('rejects unknown keys in role config (strict mode)', () => {
     const result = rolesConfigSchema.safeParse({
       trusted: { match: ['slack:T0123'], unknown: 'oops' },

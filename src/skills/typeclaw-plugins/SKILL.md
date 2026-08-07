@@ -1,6 +1,6 @@
 ---
 name: typeclaw-plugins
-description: TypeClaw plugin authoring and operation guide. Use when writing, editing, configuring, debugging, or installing a TypeClaw plugin — including any work with definePlugin, defineTool, defineSubagent, plugin hooks (session.start/end/idle/prompt, tool.before/after), plugin cron jobs, plugin commands (host/container/either CLI subcommands callable as `typeclaw <name>`), plugin skills, the typeclaw/plugin import path, or per-plugin config blocks in typeclaw.json. Also use when you need to bridge a cron `exec` job to LLM-driven work — the canonical pattern is a `surface: 'container'` plugin command whose `run` calls `ctx.prompt(...)`, invoked as `typeclaw <command>` from cron's `command` array. Triggers on mentions of 'TypeClaw plugin', 'definePlugin', 'plugin hook', 'plugin cron', 'plugin command', 'PluginCommand', 'ContainerCommand', 'HostCommand', 'EitherCommand', 'ctx.prompt', 'ctx.subagent', 'ctx.exec', 'plugins[]', 'typeclaw-plugin-', or any file under src/plugin/ or plugins/.
+description: TypeClaw plugin authoring and operation guide. Use when writing, editing, configuring, debugging, or installing a TypeClaw plugin — including any work with definePlugin, defineTool, defineSubagent, plugin hooks (session.start/end/idle/prompt, tool.before/after), plugin cron jobs, plugin commands (host/container/either CLI subcommands callable as `typeclaw <name>`), plugin skills, the typeclaw/plugin import path, or per-plugin config blocks in typeclaw.json. Also use when you need to bridge a cron `exec` job to LLM-driven work — the canonical pattern is a `surface: 'container'` plugin command whose `run` calls `ctx.prompt(...)`, invoked as `typeclaw <command>` from cron's `command` array. Triggers on mentions of 'TypeClaw plugin', 'definePlugin', 'plugin hook', 'plugin cron', 'plugin command', 'PluginCommand', 'ContainerCommand', 'HostCommand', 'EitherCommand', 'ctx.prompt', 'ctx.subagent', 'ctx.exec', 'plugins[]', 'typeclaw-plugin-', 'plugin permission', 'definePlugin permissions', 'missing permission', 'permission-gated tool', or any file under src/plugin/ or plugins/.
 ---
 
 # TypeClaw Plugins
@@ -203,6 +203,7 @@ tools: {
 - Args are **validated once** before `tool.before` hooks see them — no double-parse. Hooks receive `event.args` as a **mutable bag** (`Record<string, unknown>`); mutations propagate to later hooks and to `execute`.
 - `ToolContext` is **stripped down** to `{ signal, sessionId, agentDir, logger }`. It does NOT expose the engine's `ExtensionContext`. If your tool wants `read`/`bash`/etc., it cannot call them — declare a subagent with `tools: [readTool, ...]` instead.
 - `ToolResult.content` uses TypeClaw's `ContentPart` union: `{ type: 'text'; text }` or `{ type: 'image'; mimeType; data }`.
+- Tools have **no `permissions` field**. To gate one per role, declare the string on the plugin and block from a `tool.before` hook — and grant it in `typeclaw.json`, or the tool is dead for every caller. See "`permissions: [...]` — declaring and gating" in §5.7.
 
 #### Declare every filesystem operand
 
@@ -330,7 +331,7 @@ type CronHandlerContext = {
   readonly agentDir: string // /agent in container
   readonly logger: PluginLogger
   readonly signal: AbortSignal // reserved for future cancellation; currently inert
-  readonly permissions: PermissionService
+  readonly permissions: PermissionService // live service — has() gating, see "permissions: [...] — declaring and gating" in §5.7 below
   readonly origin: SessionOrigin // { kind: 'cron', jobKind: 'handler', ... }
   readonly prompt: (text: string) => Promise<string> // full agent session, slim system prompt mode
   readonly subagent: (name, payload?) => Promise<void>
@@ -481,7 +482,7 @@ type ContainerCommandContext = {
   readonly version: string | undefined
   readonly agentDir: string // /agent inside the container
   readonly logger: PluginLogger
-  readonly permissions: PermissionService
+  readonly permissions: PermissionService // live service — has() gating, see "permissions: [...] — declaring and gating" below
   readonly origin: SessionOrigin // caller's origin — cron job, TUI op, etc.
   readonly signal: AbortSignal // aborts on ws close or host Ctrl-C
   readonly stdin: ReadableStream<Uint8Array>
@@ -579,20 +580,98 @@ args: z.object({
 - `.describe(...)` populates `--help` output. Use it.
 - Omit `args` entirely if the command takes no flags.
 
-#### `permissions: [...]` on the command
+#### `permissions: [...]` — declaring and gating
+
+**Declaring a permission grants it to nobody.** `definePlugin({ permissions: [...] })` only registers the string into the known-permission universe — used for the boot-time typo warning and, for `security.bypass.*` strings only, owner-wildcard expansion. Every other permission string starts out held by no role: not owner, not trusted, not member, not guest. A plugin that gates a command or tool on a permission and never adds that string to any `roles.<role>.permissions[]` in `typeclaw.json` has shipped a permanently blocked surface — declaring is half the work, granting is the other half. Never ship one without the other.
+
+**`definePlugin({ permissions })` is the only declaration that does anything.** `ContainerCommand.permissions` exists in the type but no production path reads it — it is not rendered in `--help` (`renderCommandHelp` prints description, plugin, surface, options), not collected into the known-permission universe (`collectDeclaredPermissions` reads only the plugin-level list), and never checked for you. Declare at the plugin level. Setting it on a command instead is worse than useless: the string stays outside the known universe, so granting it in a role also trips the `unknown permission` typo warning at boot.
+
+**Gating a command** — declare the string on the plugin, then check it inside `run`:
 
 ```ts
+const WRITE_PERMISSION = 'standup.write.entry'
+
+export default definePlugin({
+  permissions: [WRITE_PERMISSION],
+  commands: {
+    standup: {
+      surface: 'container',
+      description: 'Append a standup entry.',
+      async run(ctx, args) {
+        if (!ctx.permissions.has(ctx.origin, WRITE_PERMISSION)) {
+          const writer = ctx.stderr.getWriter()
+          await writer.write(new TextEncoder().encode(`missing permission: ${WRITE_PERMISSION}\n`))
+          writer.releaseLock()
+          return 1
+        }
+        // ...
+        return 0
+      },
+    },
+  },
+  plugin: async () => ({}),
+})
+```
+
+```jsonc
+// typeclaw.json — the grant this declaration needs, or the command always fails
 {
-  surface: 'container',
-  permissions: ['standup-log.write.standup'],
-  async run(ctx, args) {
-    ctx.permissions.assert(ctx.origin, 'standup-log.write.standup')
-    // ...
+  "roles": {
+    "trusted": {
+      "permissions": ["standup.write.entry" /* ...trusted's full default list too, see below */],
+    },
   },
 }
 ```
 
-Declared permissions are surfaced in `--help` and (for container commands) checked against the caller's origin. Same `<plugin>.<verb>.<noun>` shape as the rest of the permission system; see `typeclaw-permissions`.
+`PermissionService` exposes `has(origin, permission)` — a boolean. **There is no `assert`.** Nothing authorizes on your behalf: `has` resolves the caller's origin to a role and returns false unless that role's permission list contains the exact string, and it is on you to fail the call. Same `<plugin>.<verb>.<noun>` shape as the rest of the permission system; see `typeclaw-permissions`.
+
+**Permission ids cannot contain hyphens.** `roles[].permissions[]` validates against `^[a-z][a-z0-9]*(\.[a-z][a-zA-Z0-9]*)+$` — dot-separated segments, each starting lowercase, alphanumeric after (camelCase is fine, `-` is not). Nothing validates the `definePlugin({ permissions })` side, so a hyphenated id like `standup-log.write.entry` declares happily and then **cannot be granted at all**: the config edit fails schema validation. A hyphenated plugin name needs a hyphen-free permission namespace — plugin `standup-log` uses `standup.write.entry`.
+
+**Gating a tool** — tools have no `permissions` field of their own; gate them from a `tool.before` hook with `pluginContext.permissions.has(event.origin, ...)`:
+
+```ts
+const PUBLISH_PERMISSION = 'standup.publish.remote'
+
+export default definePlugin({
+  permissions: [PUBLISH_PERMISSION],
+  plugin: async (pluginContext) => ({
+    tools: {
+      standup_publish: defineTool({
+        /* ... */
+      }),
+    },
+    hooks: {
+      'tool.before': (event) => {
+        if (event.tool !== 'standup_publish') return
+        if (pluginContext.permissions.has(event.origin, PUBLISH_PERMISSION)) return
+        return { block: true, reason: `missing permission: ${PUBLISH_PERMISSION}` }
+      },
+    },
+  }),
+})
+```
+
+```jsonc
+// typeclaw.json — same recipe: declaring PUBLISH_PERMISSION above grants nothing on its own
+{
+  "roles": {
+    "trusted": {
+      "permissions": ["standup.publish.remote" /* ...trusted's full default list too, see below */],
+    },
+  },
+}
+```
+
+Omit that second half and the failure is silent and total: the plugin compiles, boots, and registers the tool, but every call — including from `owner` — is blocked forever, because nothing ever granted the string. The tool looks wired and is dead.
+
+**Built-in roles: an explicit `permissions[]` REPLACES the default, it does not add to it.** Add your string to `roles.owner.permissions[]` and you must re-list `owner`'s entire default permission set alongside it, including the `security.bypass.*` strings the wildcard sentinel would otherwise expand for you (the sentinel is an internal runtime value — you cannot write it, and the schema rejects it). Don't copy the default lists from memory; read `typeclaw-permissions` for the current per-role defaults.
+
+**Restart required.** `roles.<role>.permissions[]` is a `restart-required` field — `typeclaw reload` will not pick up a new grant. `roles.<role>.match[]` is live-reloadable; permissions are not. Run `typeclaw restart`.
+
+**The boot-time signal for a forgotten grant**: `[permissions] plugin "<name>" declares "<id>" but no role grants it — every surface gated on it will be denied. Add it to roles.<role>.permissions[] in typeclaw.json and restart.` If you see this at boot, or a tool/command you just wired is blocked for every caller including yourself, this is why.
+
+**When NOT to declare a permission.** If your plugin is the only caller of the surface it gates — no operator will ever want to withhold or grant this capability per role — the check is just an `if (false)` with extra steps. Declare a permission only when you actually want an operator able to grant or withhold it per role.
 
 #### `isolated: true` (container surface only)
 
@@ -631,6 +710,7 @@ type PluginContext<TConfig = never> = {
   readonly agentDir: string // absolute, agent folder root
   readonly config: TConfig // inferred from configSchema
   readonly logger: PluginLogger // prefixed: [plugin:<name>]
+  readonly permissions: PermissionService // live service — has() gating, see "permissions: [...] — declaring and gating" in §5.7 above
   spawnSubagent: (name: string, payload?: unknown) => Promise<void>
 }
 ```
@@ -872,7 +952,7 @@ export default definePlugin({
   commands: {
     /* name: { surface, run, args?, ... } */
   }, // optional, declared BY-VALUE (not inside factory)
-  permissions: ['my-plugin.write.x'], // optional
+  permissions: ['myplugin.write.x'], // optional; declares only — grant it in roles.<role>.permissions[] in typeclaw.json or nobody has it
   plugin: async (ctx) => ({
     // required
     tools,

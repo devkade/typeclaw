@@ -4,6 +4,7 @@ import type { ResolveGithubTokenForRepo } from '@/channels/github-token-bridge'
 import type { CronJob } from '@/cron'
 import {
   createPermissionService,
+  findUngrantedPluginPermissions,
   findUnknownPermissions,
   type PermissionService,
   type RolesConfig,
@@ -154,9 +155,10 @@ export async function loadPlugins(opts: LoadPluginsOptions): Promise<LoadPlugins
   // captured `permissions` by reference (their hooks read it at request time),
   // so we mutate that same object in place rather than returning a new one.
   const declaredPermissions = collectDeclaredPermissions(survivors)
+  const ownerWildcardExclusions = collectOwnerWildcardExclusions(survivors)
   permissions.replacePluginPermissions?.({
     pluginPermissions: declaredPermissions,
-    ownerWildcardExclusions: collectOwnerWildcardExclusions(survivors),
+    ownerWildcardExclusions,
   })
 
   // Non-fatal: surface user-declared `permissions[]` strings that aren't in
@@ -168,6 +170,22 @@ export async function loadPlugins(opts: LoadPluginsOptions): Promise<LoadPlugins
   for (const warning of findUnknownPermissions(opts.roles, declaredPermissions)) {
     console.warn(
       `[permissions] role "${warning.role}" declares unknown permission "${warning.permission}" — ${warning.hint}`,
+    )
+  }
+
+  // The opposite direction, and the one that silently ships dead code: the
+  // plugin declared a permission but no role grants it, so every surface
+  // gated on it is denied for all callers. Without this the only symptom is
+  // a `missing permission` block at call time, long after the boot that
+  // could have explained it.
+  for (const permission of findUngrantedPluginPermissions(opts.roles, declaredPermissions, ownerWildcardExclusions)) {
+    const declaredBy = survivors
+      .filter((p) => p.resolved.defined.permissions?.includes(permission))
+      .map((p) => p.resolved.name)
+      .join(', ')
+    console.warn(
+      `[permissions] plugin "${declaredBy}" declares "${permission}" but no role grants it — ` +
+        `every surface gated on it will be denied. Add it to roles.<role>.permissions[] in typeclaw.json and restart.`,
     )
   }
 
