@@ -24,6 +24,7 @@ import {
 } from './slack-bot'
 import { classifyInbound, type SlackInboundAppMentionEvent } from './slack-bot-classify'
 import { createSlackDedupe } from './slack-bot-dedupe'
+import { encodeSlackReactionRef } from './slack-bot-reactions'
 
 describe('slack-bot createTypingCallback', () => {
   type SetStatusCall = { channel: string; threadTs: string; status: string }
@@ -1686,7 +1687,12 @@ describe('slack-bot createOutboundCallback', () => {
     // when
     const result = await cb(makeMsg({ text: 'hello' }))
     // then
-    expect(result).toEqual({ ok: true, messageId: 'ts1', messageIds: ['ts1'] })
+    expect(result).toEqual({
+      ok: true,
+      messageId: 'ts1',
+      messageIds: ['ts1'],
+      reactionRef: encodeSlackReactionRef({ channel: 'C0', ts: 'ts1' }),
+    })
     expect(uploads).toHaveLength(0)
     expect(posts).toEqual([
       {
