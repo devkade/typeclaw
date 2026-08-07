@@ -273,8 +273,11 @@ export type SendErrorCode =
 // Optional throughout: an adapter whose SDK does not hand back an id (legacy
 // slack/discord user-account adapters) omits both, and callers must treat a
 // missing id as "not available", never as an error.
+// `reactionRef` is the outbound message's adapter-owned TARGET ref — the entity
+// a later ReactionRequest reacts to. It is explicitly NOT the per-reaction
+// removal-instance ref returned by `ReactionResult.reactionRef` after an add.
 export type SendResult =
-  | { ok: true; messageId?: string; messageIds?: readonly string[] }
+  | { ok: true; messageId?: string; messageIds?: readonly string[]; reactionRef?: ReactionRef }
   | { ok: false; error: string; code?: SendErrorCode }
 
 export type OutboundCallback = (msg: OutboundMessage) => Promise<SendResult>
