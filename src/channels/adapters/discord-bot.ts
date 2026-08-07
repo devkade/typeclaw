@@ -60,7 +60,11 @@ import {
 } from './discord-bot-classify'
 import { createDiscordEditMessageCallback } from './discord-bot-edit'
 import { convertDiscordTables } from './discord-bot-format'
-import { createDiscordReactionCallback, createDiscordRemoveReactionCallback } from './discord-bot-reactions'
+import {
+  createDiscordReactionCallback,
+  createDiscordRemoveReactionCallback,
+  encodeDiscordReactionRef,
+} from './discord-bot-reactions'
 import { enrichDiscordMessageReferences } from './discord-bot-reference'
 import {
   ackInteraction,
@@ -840,7 +844,12 @@ export function createOutboundCallback(deps: {
         Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
       )
       logger.info(`[discord-bot] sent id=${sent.id} ${tag}`)
-      return { ok: true, messageId: sent.id, messageIds: [sent.id] }
+      return {
+        ok: true,
+        messageId: sent.id,
+        messageIds: [sent.id],
+        reactionRef: encodeDiscordReactionRef({ channel: msg.chat, message: sent.id }),
+      }
     } catch (err) {
       const message = describeError(err)
       logger.error(`[discord-bot] sendMessage failed: ${message}`)
