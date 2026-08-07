@@ -39,6 +39,7 @@ import type { Stream } from '@/stream'
 
 import { extractMentionedUserIds } from './adapters/mention-hints'
 import { formatChannelCommandHelp } from './commands'
+import { isQualifyingWorkResult } from './completion-claim'
 import { detectContinuationWillingness } from './continuation-willingness'
 import { describeError } from './describe-error'
 import {
@@ -1168,6 +1169,10 @@ type LiveSession = {
   // retry iterations that end the turn. Reset ONLY on a real user batch,
   // beside `githubReviewOutputTurn`.
   toolExecutionThisLogicalTurn: boolean
+  // Successful, non-communication, non-control tool output observed during
+  // this logical turn. Unlike toolExecutionThisLogicalTurn, channel_reply and
+  // todo/control calls cannot satisfy a later durable completion claim.
+  qualifyingWorkThisLogicalTurn: boolean
   // True while a successful `channel_reply({ more_work_this_turn: true })`
   // promise remains unfulfilled in this LOGICAL turn. Unlike the per-iteration
   // `continueReplyTurn` stamp used by retry authorization and empty-stop
@@ -1310,6 +1315,7 @@ export type ChannelRouter = {
     chat: string
     thread?: string | null
   }) => number
+  hasQualifyingWorkThisLogicalTurn?: (target: ChannelKey) => boolean
   getSendRate: (target: {
     adapter: ChannelKey['adapter']
     workspace: string
@@ -2345,6 +2351,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         stagedFallbackCause: null,
         githubReviewOutputTurn: null,
         toolExecutionThisLogicalTurn: false,
+        qualifyingWorkThisLogicalTurn: false,
         promisedWorkOutstandingThisLogicalTurn: false,
         pendingQuoteCandidate: null,
         recentEngagedPeerBotTurns: [],
@@ -2738,6 +2745,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     agent.afterToolCall = async (context, signal) => {
       const result = prior ? await prior(context, signal) : undefined
       const details = context.result.details as { ok?: unknown; more_work_this_turn?: unknown } | undefined
+      if (
+        isQualifyingWorkResult({
+          toolName: context.toolCall.name,
+          isError: context.isError,
+          details: context.result.details,
+        })
+      ) {
+        live.qualifyingWorkThisLogicalTurn = true
+      }
       const succeeded = context.toolCall.name === 'channel_reply' && !context.isError && details?.ok === true
       const keepTurnAlive = details?.more_work_this_turn === true
       if (succeeded) {
@@ -3255,6 +3271,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           // empty-turn fallback across the reminder-only retry iterations.
           live.githubReviewOutputTurn = null
           live.toolExecutionThisLogicalTurn = false
+          live.qualifyingWorkThisLogicalTurn = false
           live.promisedWorkOutstandingThisLogicalTurn = false
         } else if (live.lastTurnAuthorId !== null) {
           live.currentTurnEngageReactions = []
@@ -5435,6 +5452,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return live.consecutiveSends.get(consecutiveSendKey(target.chat, target.thread)) ?? 0
   }
 
+  const hasQualifyingWorkThisLogicalTurn = (target: ChannelKey): boolean => {
+    return liveSessions.get(channelKeyId(target))?.qualifyingWorkThisLogicalTurn === true
+  }
+
   const getSendRate = (target: {
     adapter: ChannelKey['adapter']
     workspace: string
@@ -6219,6 +6240,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     route,
     send,
     getConsecutiveSendCount,
+    hasQualifyingWorkThisLogicalTurn,
     getSendRate,
     registerOutbound,
     unregisterOutbound,

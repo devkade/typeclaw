@@ -1,6 +1,7 @@
 import { Type } from '@mariozechner/pi-ai'
 import { defineTool } from '@mariozechner/pi-coding-agent'
 
+import { checkCompletionClaim } from '@/channels/completion-claim'
 import { checkFalseReceipt } from '@/channels/github-false-receipt'
 import { evaluateRereviewGuard } from '@/channels/github-rereview-guard'
 import {
@@ -197,6 +198,19 @@ export function createChannelReplyTool({
       }
       const falseReceiptNotice = falseReceipt.kind === 'warn' ? falseReceipt.notice : null
 
+      const completionClaim = checkCompletionClaim({
+        text,
+        qualifyingWorkObserved: router.hasQualifyingWorkThisLogicalTurn?.(origin) === true,
+      })
+      if (completionClaim.kind === 'block') {
+        logger.warn(formatChannelToolFailure('channel_reply', completionClaim.reason))
+        return {
+          content: [{ type: 'text' as const, text: `channel_reply denied: ${completionClaim.reason}` }],
+          details: { ok: false, error: completionClaim.reason },
+        }
+      }
+      const completionClaimNotice = completionClaim.kind === 'warn' ? completionClaim.notice : null
+
       // Re-review stranding guard: block a thread close-out / verdict ack while
       // the bot still holds its own CHANGES_REQUESTED on this PR, so it can't
       // silently leave the PR blocked (PR #644). Runs before the resolve so a
@@ -307,7 +321,10 @@ export function createChannelReplyTool({
         // TOOL_RESULT_PREFIX to match the denial branch below. The prefix is
         // intentionally weaker and is safe ONLY because denials carry no echoed
         // prose; the success result does, and the weak prefix let Kimi loop.
-        const warnNote = falseReceiptNotice !== null ? fenceRuntimeNotice(falseReceiptNotice) : ''
+        const warnings = [falseReceiptNotice, completionClaimNotice].filter(
+          (notice): notice is string => notice !== null,
+        )
+        const warnNote = warnings.length > 0 ? fenceRuntimeNotice(warnings.join('\n\n')) : ''
         const missNote = resolveMissNotice ?? ''
         return {
           content: [{ type: 'text' as const, text: `${fenceToolResult(receipt)}${hint}${warnNote}${missNote}` }],
