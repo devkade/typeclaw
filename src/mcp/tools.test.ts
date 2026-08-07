@@ -234,7 +234,7 @@ describe('createMcpDispatcherTools', () => {
     expect(received).toEqual(args)
   })
 
-  test('mcp_call honors the target tool\'s declared fileOperands.nonFile operands', async () => {
+  test("mcp_call honors the target tool's declared fileOperands.nonFile operands", async () => {
     let received: Record<string, unknown> | undefined
     const connection = fakeConnection('search', [
       {
@@ -249,10 +249,7 @@ describe('createMcpDispatcherTools', () => {
       return { content: [{ type: 'text', text: 'ok' }] }
     }
     const [, , callTool] = createMcpDispatcherTools(fakeManager({ search: connection }))
-    await callTool.execute(
-      { server: 'search', tool: 'search_web', args: { query: 'SPPN 3/2017' } },
-      toolContext(),
-    )
+    await callTool.execute({ server: 'search', tool: 'search_web', args: { query: 'SPPN 3/2017' } }, toolContext())
     expect(received).toEqual({ query: 'SPPN 3/2017' })
   })
 
