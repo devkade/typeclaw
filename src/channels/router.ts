@@ -1072,6 +1072,10 @@ type LiveSession = {
   // reason-specific stranded-toolUse recovery logs. `turnSeq`-stamped so stale
   // abort provenance from an earlier turn can never leak into a later retry.
   abortReasonThisTurn: { turnSeq: number; reason: string } | null
+  // Set synchronously when a user invokes /stop so user intent supersedes a
+  // terminal-reply stamp even while abort delivery or outcome persistence is
+  // still in flight. Cleared only when a fresh real-user batch starts.
+  userStoppedTurnSeq: number | null
   // One-shot output-token budget for the NEXT `session.prompt()` only.
   // `installChannelOutputCap` reads and clears it per stream call, so it
   // overrides the default backstop for exactly one re-prompt. Set by the
@@ -2332,6 +2336,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         lastTerminalReplyAbort: null,
         continueReplyTurn: null,
         abortReasonThisTurn: null,
+        userStoppedTurnSeq: null,
         nextPromptMaxTokens: undefined,
         skippedTurn: null,
         skipLockedSendTurn: null,
@@ -2376,6 +2381,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const stampedAbort = live.abortReasonThisTurn
         const termination: 'terminal-after-channel-reply' | undefined =
           usage.stopReason === 'aborted' &&
+          live.userStoppedTurnSeq !== live.turnSeq &&
           stampedAbort?.turnSeq === live.turnSeq &&
           stampedAbort.reason === 'terminal_after_channel_reply'
             ? 'terminal-after-channel-reply'
@@ -2744,7 +2750,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
         }
       }
-      if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true) {
+      if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true && live.userStoppedTurnSeq !== live.turnSeq) {
         logger.info(`[channels] ${live.keyId} terminal_after_channel_reply`)
         const replyText = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
         live.lastTerminalReplyAbort = typeof replyText === 'string' ? { turnSeq: live.turnSeq, text: replyText } : null
@@ -3043,6 +3049,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const stopCurrentChannelTurn = async (live: LiveSession): Promise<void> => {
+    live.userStoppedTurnSeq = live.turnSeq
+    live.lastTerminalReplyAbort = null
+    live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'user_stop' }
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
     live.debounceTimer = null
     live.firstUnprocessedAt = 0
@@ -3050,6 +3059,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.pendingSystemReminders.length = 0
     live.continueReplyTurn = null
     void dropContinuationReactions(live)
+    enqueueTodoOutcomeWrite(live, {
+      agentDir: options.agentDir,
+      origin: buildLiveOrigin(live),
+      turnId: live.sessionId,
+      stopReason: 'aborted',
+    })
     await stopTypingHeartbeat(live)
     try {
       await live.session.abort()
@@ -3057,6 +3072,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     } catch (err) {
       logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describeError(err)}`)
     }
+    await awaitLatestTodoOutcomeWrite(live)
   }
 
   // ensureLive() installs a session BEFORE the engage/observe decision, so a
@@ -3219,6 +3235,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.stagedFallbackCause = null
           }
           live.abortReasonThisTurn = null
+          live.userStoppedTurnSeq = null
           live.nextPromptMaxTokens = undefined
           // Cleared with the retry budgets (NOT beside resetReviewTurn below) so a
           // review landed earlier in this logical turn keeps suppressing the
@@ -3433,6 +3450,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const outcomeWriteSucceeded = await awaitLatestTodoOutcomeWrite(live)
         if (!outcomeWriteSucceeded) {
           logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
+        } else if (live.userStoppedTurnSeq === live.turnSeq) {
+          logger.info(`[channels] ${live.keyId}: skipping todo continuation after user stop`)
         } else {
           await maybeContinueTodosChannel(live)
         }

@@ -332,6 +332,25 @@ function emptyStopAfterToolWork(session: FakeSession, id: string = 'tw', userId:
   session.leafEntry = emptyStopEntry
 }
 
+function terminalReplyContext(replyText: string): AfterToolCallContext {
+  return {
+    assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
+    toolCall: {
+      type: 'toolCall',
+      id: 'tc-terminal-reply',
+      name: 'channel_reply',
+      arguments: { text: replyText },
+    } as AfterToolCallContext['toolCall'],
+    args: { text: replyText },
+    result: {
+      content: [{ type: 'text' as const, text: 'ignored' }],
+      details: { ok: true },
+    } as AfterToolCallContext['result'],
+    isError: false,
+    context: { systemPrompt: '', messages: [], tools: [] },
+  }
+}
+
 const baseConfig: ChannelAdapterConfig = {
   engagement: { trigger: ['mention', 'reply', 'dm'], stickiness: { perReply: { window: 60_000 } } },
   enabled: true,
@@ -7901,6 +7920,92 @@ describe('ChannelRouter commands', () => {
     expect(sessions[0]!.aborted).toBe(1)
     expect(sessions[0]!.prompts).toHaveLength(1)
     expect(sessions[0]!.prompts[0]).toContain('long task')
+  })
+
+  test('/stop supersedes terminal-reply provenance before the aborted outcome is captured', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    let continuationRuns = 0
+    const { router, sessions } = makeRouter(dir, {
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
+      await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
+      await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(continuationRuns).toBe(0)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test('/stop supersedes a terminal outcome whose write is already pending', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    let releaseTerminalWrite: (() => void) | undefined
+    let terminalWriteStarted = false
+    let outcomeWrites = 0
+    let continuationRuns = 0
+    const terminalWriteGate = new Promise<void>((resolve) => {
+      releaseTerminalWrite = resolve
+    })
+    const { router, sessions } = makeRouter(dir, {
+      recordTurnOutcome: async (args) => {
+        outcomeWrites++
+        if (outcomeWrites === 1) {
+          terminalWriteStarted = true
+          await terminalWriteGate
+        }
+        await recordTurnOutcome(args)
+      },
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
+      await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
+      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+      await waitFor(() => terminalWriteStarted)
+      const stopping = router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+      releaseTerminalWrite!()
+      await stopping
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(outcomeWrites).toBe(2)
+    expect(continuationRuns).toBe(0)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
   })
 
   test('unknown commands are consumed instead of sent as prompts', async () => {
