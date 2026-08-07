@@ -1,26 +1,129 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 
-import { buildMcpDispatcherToolDefinitions } from '@/agent'
+import { buildMcpDispatcherToolDefinitions, wrapSystemTools } from '@/agent'
 import { wrapSystemTool } from '@/agent/plugin-tools'
+import type { SessionOrigin } from '@/agent/session-origin'
 import { enforceAndPinToolFiles } from '@/agent/tool-file-safety'
+import securityPlugin from '@/bundled-plugins/security'
+import { createPermissionService, type PermissionService } from '@/permissions'
 import { createHookBus } from '@/plugin'
-import type { ToolContext } from '@/plugin/types'
+import type { PluginContext, PluginLogger, ToolContext, ToolFileOperands } from '@/plugin/types'
 
 import type { McpConnection, McpToolInfo } from './client'
 import type { McpManager } from './manager'
 import {
   createMcpDispatcherTools,
+  resolveMcpCallPreflightFileOperands,
   sanitizeMcpError,
   type McpCallArgs,
   type McpDescribeArgs,
   type McpListToolsArgs,
 } from './tools'
+
+const unrestrictedDispatcherOptions = { resolveHidden: () => ({ dirs: [], files: [] }) }
+
+describe('resolveMcpCallPreflightFileOperands', () => {
+  test('rebases every declared file operand category under the dispatcher args envelope', () => {
+    const manager = fakeManager({
+      search: fakeConnection('search', [
+        {
+          name: 'web',
+          description: 'Search',
+          inputSchema: { type: 'object' },
+          fileOperands: {
+            input: ['a'],
+            output: ['b.c'],
+            create: ['d'],
+            destructive: ['e'],
+            nonFile: ['f'],
+          },
+        },
+      ]),
+    })
+
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'search', tool: 'web' })).toEqual({
+      input: ['args.a'],
+      output: ['args.b.c'],
+      create: ['args.d'],
+      destructive: ['args.e'],
+      nonFile: ['args.f'],
+    })
+  })
+
+  test('resolves namespaced tool ids against the namespace server like dispatch', () => {
+    const manager = fakeManager({
+      search: fakeConnection('search', [
+        {
+          name: 'web',
+          description: 'Search',
+          inputSchema: { type: 'object' },
+          fileOperands: { nonFile: ['pattern'] },
+        },
+      ]),
+    })
+
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'other', tool: 'search__web' })).toEqual({
+      nonFile: ['args.pattern'],
+    })
+  })
+
+  test('returns undefined when cached target metadata cannot provide file operands', () => {
+    const cold = fakeConnection('cold', [])
+    cold.peekTools = () => undefined
+    const manager = fakeManager({
+      cold,
+      search: fakeConnection('search', [
+        { name: 'plain', description: '', inputSchema: { type: 'object' } },
+        {
+          name: 'empty',
+          description: '',
+          inputSchema: { type: 'object' },
+          fileOperands: { input: [], output: [], create: [], destructive: [], nonFile: [] },
+        },
+      ]),
+    })
+
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'cold', tool: 'web' })).toBeUndefined()
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'missing', tool: 'web' })).toBeUndefined()
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'search', tool: 'missing' })).toBeUndefined()
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'search', tool: 'plain' })).toBeUndefined()
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'search', tool: 'empty' })).toBeUndefined()
+  })
+
+  test('reads only the cached catalog without connecting or listing tools', () => {
+    let ensureConnectedCalls = 0
+    let listToolsCalls = 0
+    const connection = fakeConnection('search', [
+      {
+        name: 'web',
+        description: 'Search',
+        inputSchema: { type: 'object' },
+        fileOperands: { nonFile: ['pattern'] },
+      },
+    ])
+    connection.listTools = async () => {
+      listToolsCalls += 1
+      return []
+    }
+    const manager = fakeManager({ search: connection })
+    manager.ensureConnected = async () => {
+      ensureConnectedCalls += 1
+      return connection
+    }
+
+    expect(resolveMcpCallPreflightFileOperands(manager, { server: 'search', tool: 'web' })).toEqual({
+      nonFile: ['args.pattern'],
+    })
+    expect(ensureConnectedCalls).toBe(0)
+    expect(listToolsCalls).toBe(0)
+  })
+})
 
 describe('createMcpDispatcherTools', () => {
   test('mcp_list_tools returns namespaced tool names and descriptions', async () => {
@@ -30,7 +133,7 @@ describe('createMcpDispatcherTools', () => {
         { name: 'write', description: '', inputSchema: { type: 'object' } },
       ]),
     })
-    const [listTools] = createMcpDispatcherTools(manager)
+    const [listTools] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const result = await listTools.execute({ server: 'files' } satisfies McpListToolsArgs, toolContext())
 
@@ -44,7 +147,7 @@ describe('createMcpDispatcherTools', () => {
 
   test('mcp_list_tools reports unknown servers with available server names', async () => {
     const manager = fakeManager({ files: fakeConnection('files', []) })
-    const [listTools] = createMcpDispatcherTools(manager)
+    const [listTools] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const result = await listTools.execute({ server: 'missing' } satisfies McpListToolsArgs, toolContext())
 
@@ -64,7 +167,7 @@ describe('createMcpDispatcherTools', () => {
         },
       ]),
     })
-    const [, describeTool] = createMcpDispatcherTools(manager)
+    const [, describeTool] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const bare = await describeTool.execute({ server: 'files', tool: 'read' } satisfies McpDescribeArgs, toolContext())
     const namespaced = await describeTool.execute(
@@ -83,7 +186,7 @@ describe('createMcpDispatcherTools', () => {
     const manager = fakeManager({
       files: fakeConnection('files', [], { content: [{ type: 'text', text: 'file contents' }] }),
     })
-    const [, , callTool] = createMcpDispatcherTools(manager)
+    const [, , callTool] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const result = await callTool.execute(
       { server: 'files', tool: 'read', args: { id: 'readme-id' } } satisfies McpCallArgs,
@@ -105,7 +208,7 @@ describe('createMcpDispatcherTools', () => {
       called = true
       return { content: [{ type: 'text', text: 'leaked' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     try {
       await expect(
         callTool.execute(
@@ -136,7 +239,7 @@ describe('createMcpDispatcherTools', () => {
       const url = (args as { nested: { url: string } }).nested.url
       return { content: [{ type: 'text', text: await readFile(new URL(url), 'utf8') }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     try {
       const result = await callTool.execute(
         {
@@ -202,7 +305,7 @@ describe('createMcpDispatcherTools', () => {
       called = true
       return { content: [{ type: 'text', text: 'unexpected' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     try {
       await expect(
         callTool.execute({ server: 'files', tool: 'read', args: { inputPath: safe } }, toolContext(agentDir)),
@@ -220,7 +323,7 @@ describe('createMcpDispatcherTools', () => {
       received = args
       return { content: [{ type: 'text', text: 'ok' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     const args = {
       path: '/v1/repos',
       repository: 'acme/widgets',
@@ -248,7 +351,7 @@ describe('createMcpDispatcherTools', () => {
       received = args
       return { content: [{ type: 'text', text: 'ok' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ search: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ search: connection }), unrestrictedDispatcherOptions)
     await callTool.execute({ server: 'search', tool: 'search_web', args: { query: 'SPPN 3/2017' } }, toolContext())
     expect(received).toEqual({ query: 'SPPN 3/2017' })
   })
@@ -262,7 +365,7 @@ describe('createMcpDispatcherTools', () => {
         called = true
         return { content: [{ type: 'text', text: 'unexpected' }] }
       }
-      const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+      const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
       await expect(
         callTool.execute({ server: 'files', tool: 'request', args: { path: route } }, toolContext()),
       ).rejects.toThrow(/ambiguous local file operand/i)
@@ -277,7 +380,7 @@ describe('createMcpDispatcherTools', () => {
       called = true
       return { content: [{ type: 'text', text: 'unexpected' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     for (const args of [{ files: ['workspace/missing.txt'] }, { value: 'workspace/missing.txt' }]) {
       await expect(callTool.execute({ server: 'files', tool: 'read', args }, toolContext())).rejects.toThrow(
         /ambiguous local file operand/i,
@@ -298,7 +401,7 @@ describe('createMcpDispatcherTools', () => {
       called = true
       return { content: [{ type: 'text', text: 'unexpected' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     await expect(
       callTool.execute({ server: 'files', tool: 'write', args: { [key]: value } }, toolContext()),
     ).rejects.toThrow(/ambiguous local file operand/i)
@@ -318,7 +421,7 @@ describe('createMcpDispatcherTools', () => {
       const [url] = (args as { files: string[] }).files
       return { content: [{ type: 'text', text: await readFile(new URL(url as string), 'utf8') }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     try {
       const result = await callTool.execute(
         { server: 'files', tool: 'read', args: { files: [pathToFileURL(safe).href] } },
@@ -340,7 +443,7 @@ describe('createMcpDispatcherTools', () => {
       called = true
       return { content: [{ type: 'text', text: 'unexpected' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     const warnings: string[] = []
     try {
       for (const value of [local, './input.txt', 'input.txt']) {
@@ -371,7 +474,7 @@ describe('createMcpDispatcherTools', () => {
       called = true
       return { content: [{ type: 'text', text: 'unexpected' }] }
     }
-    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }))
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ files: connection }), unrestrictedDispatcherOptions)
     try {
       await expect(
         callTool.execute(
@@ -397,7 +500,11 @@ describe('createMcpDispatcherTools', () => {
       return { content: [{ type: 'text', text: String(bytes.byteLength) }] }
     }
     const manager = fakeManager({ files: connection })
-    const definition = buildMcpDispatcherToolDefinitions(manager)[2]
+    const definition = buildMcpDispatcherToolDefinitions(manager, {
+      permissions: undefined,
+      getOrigin: () => undefined,
+      agentDir,
+    })[2]
     if (definition === undefined) throw new Error('mcp_call definition missing')
     const wrapped = wrapSystemTool(definition, {
       agentDir,
@@ -430,7 +537,7 @@ describe('createMcpDispatcherTools', () => {
         ],
       }),
     })
-    const [, , callTool] = createMcpDispatcherTools(manager)
+    const [, , callTool] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const result = await callTool.execute({ server: 'files', tool: 'screenshot' } satisfies McpCallArgs, toolContext())
 
@@ -448,7 +555,7 @@ describe('createMcpDispatcherTools', () => {
         ],
       }),
     })
-    const [, , callTool] = createMcpDispatcherTools(manager)
+    const [, , callTool] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const result = await callTool.execute({ server: 'files', tool: 'read' } satisfies McpCallArgs, toolContext())
 
@@ -459,7 +566,7 @@ describe('createMcpDispatcherTools', () => {
     const manager = fakeManager({
       files: fakeConnection('files', [], { content: [{ type: 'text', text: 'permission denied' }], isError: true }),
     })
-    const [, , callTool] = createMcpDispatcherTools(manager)
+    const [, , callTool] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const result = await callTool.execute({ server: 'files', tool: 'read' } satisfies McpCallArgs, toolContext())
 
@@ -476,11 +583,272 @@ describe('createMcpDispatcherTools', () => {
         isError: true,
       }),
     })
-    const [, , callTool] = createMcpDispatcherTools(manager)
+    const [, , callTool] = createMcpDispatcherTools(manager, unrestrictedDispatcherOptions)
 
     const result = await callTool.execute({ server: 'files', tool: 'read' } satisfies McpCallArgs, toolContext())
 
     expect(result.content).toEqual([{ type: 'text', text: 'MCP tool error: failed at <path> with API_KEY=<redacted>' }])
+  })
+})
+
+describe('production-wrapped restricted-role MCP calls', () => {
+  test('blocks a cold-catalog prose-named declared input before snapshotting or dispatch', async () => {
+    const fixture = await restrictedWrappedMcpFixture({
+      coldCatalog: true,
+      targetFileOperands: { input: ['query'] },
+    })
+    try {
+      await mkdir(path.join(fixture.agentDir, 'memory'))
+      await writeFile(path.join(fixture.agentDir, 'memory/secret.txt'), 'private')
+
+      await expect(
+        fixture.withResolver.execute(
+          'cold-input',
+          { server: 'search', tool: 'web', args: { query: 'memory/secret.txt' } },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:.*privateSurfaceRead/i)
+      expect(fixture.callCount()).toBe(0)
+      expect(fixture.snapshotCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('allows a cold-catalog prose value declared non-file', async () => {
+    const fixture = await restrictedWrappedMcpFixture({
+      coldCatalog: true,
+      targetFileOperands: { nonFile: ['query'] },
+    })
+    try {
+      await fixture.withResolver.execute(
+        'cold-non-file',
+        { server: 'search', tool: 'web', args: { query: 'memory leak notes' } },
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(fixture.received()).toEqual({ query: 'memory leak notes' })
+      expect(fixture.callCount()).toBe(1)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('blocks stricter live metadata when the cached outer metadata is stale', async () => {
+    const fixture = await restrictedWrappedMcpFixture({
+      peekTargetFileOperands: { nonFile: ['query'] },
+      targetFileOperands: { input: ['query'] },
+    })
+    try {
+      await mkdir(path.join(fixture.agentDir, 'memory'))
+      await writeFile(path.join(fixture.agentDir, 'memory/secret.txt'), 'private')
+
+      await expect(
+        fixture.withResolver.execute(
+          'stale-metadata',
+          { server: 'search', tool: 'web', args: { query: 'memory/secret.txt' } },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:.*privateSurfaceRead/i)
+      expect(fixture.callCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('blocks a cold-catalog nested input using target-relative operand paths', async () => {
+    const fixture = await restrictedWrappedMcpFixture({
+      coldCatalog: true,
+      targetFileOperands: { input: ['payload.files'] },
+    })
+    try {
+      await mkdir(path.join(fixture.agentDir, 'memory'))
+      await writeFile(path.join(fixture.agentDir, 'memory/secret.txt'), 'private')
+
+      await expect(
+        fixture.withResolver.execute(
+          'cold-nested-input',
+          {
+            server: 'search',
+            tool: 'web',
+            args: { payload: { files: ['memory/secret.txt'] } },
+          },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:.*privateSurfaceRead/i)
+      expect(fixture.callCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('allows a hidden-directory-shaped value at a target-declared non-file operand', async () => {
+    const fixture = await restrictedWrappedMcpFixture()
+    try {
+      await fixture.withResolver.execute(
+        'declared',
+        { server: 'search', tool: 'web', args: { pattern: 'memory/.*' } },
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(fixture.received()).toEqual({ pattern: 'memory/.*' })
+      expect(fixture.callCount()).toBe(1)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('blocks the same hidden-directory-shaped value at an undeclared operand', async () => {
+    const fixture = await restrictedWrappedMcpFixture()
+    try {
+      await expect(
+        fixture.withResolver.execute(
+          'undeclared',
+          { server: 'search', tool: 'web', args: { filter: 'memory/.*' } },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:.*privateSurfaceRead/i)
+      expect(fixture.callCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('blocks a canonical credential filename despite a target non-file declaration', async () => {
+    const fixture = await restrictedWrappedMcpFixture()
+    try {
+      await writeFile(path.join(fixture.agentDir, 'secrets.json'), '{}')
+      await expect(
+        fixture.withResolver.execute(
+          'canonical',
+          { server: 'search', tool: 'web', args: { pattern: 'secrets.json' } },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:.*privateSurfaceRead/i)
+      expect(fixture.callCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('blocks a canonical credential filename at a prose-named target non-file operand', async () => {
+    const fixture = await restrictedWrappedMcpFixture({ targetFileOperands: { nonFile: ['query'] } })
+    try {
+      await expect(
+        fixture.withResolver.execute(
+          'canonical-prose',
+          { server: 'search', tool: 'web', args: { query: 'secrets.json' } },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:/)
+      expect(fixture.callCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('blocks a cold-catalog canonical credential filename at a prose-named target non-file operand', async () => {
+    const fixture = await restrictedWrappedMcpFixture({
+      coldCatalog: true,
+      targetFileOperands: { nonFile: ['query'] },
+    })
+    try {
+      await expect(
+        fixture.withResolver.execute(
+          'cold-canonical-prose',
+          { server: 'search', tool: 'web', args: { query: 'secrets.json' } },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:/)
+      expect(fixture.callCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test('blocks a declared non-file operand when the preflight resolver is absent', async () => {
+    const fixture = await restrictedWrappedMcpFixture()
+    try {
+      await expect(
+        fixture.withoutResolver.execute(
+          'without-resolver',
+          { server: 'search', tool: 'web', args: { pattern: 'memory/.*' } },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked:.*privateSurfaceRead/i)
+      expect(fixture.callCount()).toBe(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  const declaredLocalOperandCases: ReadonlyArray<{
+    category: 'input' | 'output' | 'create' | 'destructive'
+    key: string
+    value: string
+  }> = [
+    { category: 'input', key: 'query', value: 'memory/secret.txt' },
+    { category: 'output', key: 'name', value: 'memory/out.txt' },
+    { category: 'create', key: 'title', value: 'memory/new.txt' },
+    { category: 'destructive', key: 'content', value: 'memory/gone.txt' },
+  ]
+
+  for (const { category, key, value } of declaredLocalOperandCases) {
+    test(`blocks a hidden path at target-declared ${category} prose key ${key}`, async () => {
+      const fixture = await restrictedWrappedMcpFixture({ targetFileOperands: { [category]: [key] } })
+      try {
+        await expect(
+          fixture.withResolver.execute(
+            `declared-${category}`,
+            { server: 'search', tool: 'web', args: { [key]: value } },
+            undefined,
+            undefined,
+            {} as never,
+          ),
+        ).rejects.toThrow(/blocked:.*privateSurfaceRead/i)
+        expect(fixture.callCount()).toBe(0)
+      } finally {
+        await fixture.cleanup()
+      }
+    })
+  }
+
+  test('allows an undeclared prose key that merely mentions a hidden directory', async () => {
+    const fixture = await restrictedWrappedMcpFixture({ targetFileOperands: null })
+    try {
+      await fixture.withResolver.execute(
+        'undeclared-prose',
+        { server: 'search', tool: 'web', args: { query: 'memory leak notes' } },
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(fixture.received()).toEqual({ query: 'memory leak notes' })
+      expect(fixture.callCount()).toBe(1)
+    } finally {
+      await fixture.cleanup()
+    }
   })
 })
 
@@ -535,6 +903,9 @@ function fakeConnection(name: string, tools: McpToolInfo[], result?: CallToolRes
     async listTools() {
       return tools
     },
+    peekTools() {
+      return tools
+    },
     async refresh() {
       return tools
     },
@@ -542,6 +913,125 @@ function fakeConnection(name: string, tools: McpToolInfo[], result?: CallToolRes
       return result ?? { content: [{ type: 'text', text: 'ok' }] }
     },
     async close() {},
+  }
+}
+
+async function restrictedWrappedMcpFixture(
+  options: {
+    targetFileOperands?: ToolFileOperands | null
+    coldCatalog?: boolean
+    peekTargetFileOperands?: ToolFileOperands | null
+  } = {},
+): Promise<{
+  agentDir: string
+  withResolver: ReturnType<typeof wrapSystemTools>[number]
+  withoutResolver: ReturnType<typeof wrapSystemTools>[number]
+  received(): Record<string, unknown> | undefined
+  callCount(): number
+  snapshotCount(): number
+  cleanup(): Promise<void>
+}> {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-mcp-restricted-'))
+  const permissions = createPermissionService()
+  const origin: SessionOrigin = {
+    kind: 'channel',
+    adapter: 'slack-bot',
+    workspace: 'T_TEST',
+    chat: 'C_TEST',
+    thread: null,
+    lastInboundAuthorId: 'U_GUEST',
+  }
+  let received: Record<string, unknown> | undefined
+  let callCount = 0
+  let snapshotCount = 0
+  const targetFileOperands =
+    options.targetFileOperands === undefined ? { nonFile: ['pattern'] } : options.targetFileOperands
+  const listedTools: McpToolInfo[] = [
+    {
+      name: 'web',
+      description: 'Search',
+      inputSchema: { type: 'object' },
+      ...(targetFileOperands === null ? {} : { fileOperands: targetFileOperands }),
+    },
+  ]
+  const connection = fakeConnection('search', listedTools)
+  if (options.coldCatalog === true) {
+    connection.peekTools = () => undefined
+  } else if (options.peekTargetFileOperands !== undefined) {
+    connection.peekTools = () => [
+      {
+        name: 'web',
+        description: 'Search',
+        inputSchema: { type: 'object' },
+        ...(options.peekTargetFileOperands === null ? {} : { fileOperands: options.peekTargetFileOperands }),
+      },
+    ]
+  }
+  connection.callTool = async (_tool, args) => {
+    callCount += 1
+    received = args
+    snapshotCount += countPinnedSnapshotOperands(args)
+    return { content: [{ type: 'text', text: 'ok' }] }
+  }
+  const manager = fakeManager({ search: connection })
+  const definition = buildMcpDispatcherToolDefinitions(manager, {
+    permissions,
+    getOrigin: () => origin,
+    agentDir,
+  })[2]
+  if (definition === undefined) throw new Error('mcp_call definition missing')
+  const logger: PluginLogger = { info() {}, warn() {}, error() {} }
+  const exports = await securityPlugin.plugin(securityPluginContext(agentDir, permissions, logger))
+  const hooks = createHookBus()
+  hooks.registerAll('security', agentDir, logger, exports.hooks ?? {})
+  const common = {
+    agentDir,
+    sessionId: 'mcp-restricted',
+    hooks,
+    getOrigin: () => origin,
+    getAbort: () => undefined,
+  }
+
+  const withResolver = wrapSystemTools([definition], { ...common, mcpManager: manager })[0]
+  const withoutResolver = wrapSystemTools([definition], common)[0]
+  if (withResolver === undefined || withoutResolver === undefined)
+    throw new Error('wrapped mcp_call definition missing')
+
+  return {
+    agentDir,
+    withResolver,
+    withoutResolver,
+    received: () => received,
+    callCount: () => callCount,
+    snapshotCount: () => snapshotCount,
+    cleanup: () => rm(agentDir, { recursive: true, force: true }),
+  }
+}
+
+function countPinnedSnapshotOperands(value: unknown): number {
+  if (typeof value === 'string') return value.includes('typeclaw-tool-input-') ? 1 : 0
+  if (Array.isArray(value)) return value.reduce((count, entry) => count + countPinnedSnapshotOperands(entry), 0)
+  if (typeof value !== 'object' || value === null) return 0
+  return Object.values(value).reduce((count, entry) => count + countPinnedSnapshotOperands(entry), 0)
+}
+
+function securityPluginContext(
+  agentDir: string,
+  permissions: PermissionService,
+  logger: PluginLogger,
+): PluginContext<undefined> {
+  return {
+    name: 'security',
+    version: undefined,
+    agentDir,
+    config: undefined,
+    logger,
+    permissions,
+    github: {
+      resolveTokenForRepo: async () => ({ kind: 'unavailable', reason: 'test' }),
+      hasAppTokenResolver: () => false,
+    },
+    spawnSubagent: async () => {},
   }
 }
 

@@ -23,7 +23,7 @@ import {
 import { defaultThinkingLevelForRef, isOpenAiFamilyRef, providerForModelRef, type ModelRef } from '@/config/providers'
 import { renderMcpCatalog } from '@/mcp/catalog'
 import type { McpManager } from '@/mcp/manager'
-import { createMcpDispatcherTools, MCP_DISPATCHER_TOOL_NAMES } from '@/mcp/tools'
+import { createMcpDispatcherTools, MCP_DISPATCHER_TOOL_NAMES, resolveMcpCallPreflightFileOperands } from '@/mcp/tools'
 import { noopPermissionService, type PermissionService, type RolesConfig } from '@/permissions'
 import type {
   BuiltinToolRef,
@@ -35,6 +35,7 @@ import type {
 } from '@/plugin'
 import { createHookBus, materializeSkills } from '@/plugin'
 import type { ReloadRegistry } from '@/reload'
+import { resolveHiddenPaths } from '@/sandbox'
 import type { Stream } from '@/stream'
 
 import { applyAdaptiveThinkingCompat } from './adaptive-thinking-compat'
@@ -406,7 +407,13 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
             webSearchTool,
             webFetchTool,
             createLookAtTool(options.permissions),
-            ...(options.mcpManager ? buildMcpDispatcherToolDefinitions(options.mcpManager) : []),
+            ...(options.mcpManager
+              ? buildMcpDispatcherToolDefinitions(options.mcpManager, {
+                  permissions: options.permissions,
+                  getOrigin,
+                  agentDir: options.plugins?.agentDir ?? process.cwd(),
+                })
+              : []),
             ...(options.reloadRegistry ? [createReloadTool({ registry: options.reloadRegistry })] : []),
             ...(options.stream ? [createStreamSnapshotTool({ stream: options.stream })] : []),
             ...buildChannelTools(
@@ -471,6 +478,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     getOrigin,
     getAbort,
     getLoopGuardTurn,
+    ...(options.mcpManager === undefined ? {} : { mcpManager: options.mcpManager }),
   })
   const customToolsPreBudget = [...wrappedCustomSystemTools, ...pluginCustomTools, ...builtinPiToolOverrides]
   const customTools =
@@ -783,16 +791,26 @@ export function buildChannelTools(
   return tools
 }
 
-export function buildMcpDispatcherToolDefinitions(manager: McpManager): ToolDefinition[] {
-  const tools = createMcpDispatcherTools(manager)
+export function buildMcpDispatcherToolDefinitions(
+  manager: McpManager,
+  opts: {
+    permissions: PermissionService | undefined
+    getOrigin: () => SessionOrigin | undefined
+    agentDir: string
+  },
+): ToolDefinition[] {
+  const permissions = opts.permissions ?? noopPermissionService
+  const tools = createMcpDispatcherTools(manager, {
+    resolveHidden: () => resolveHiddenPaths(permissions, opts.getOrigin(), opts.agentDir),
+  })
   return [
-    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[0], tools[0]),
-    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[1], tools[1]),
-    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[2], tools[2]),
+    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[0], tools[0], opts.agentDir),
+    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[1], tools[1], opts.agentDir),
+    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[2], tools[2], opts.agentDir),
   ]
 }
 
-function defineMcpDispatcherTool<P>(name: string, tool: PluginTool<P>): ToolDefinition {
+function defineMcpDispatcherTool<P>(name: string, tool: PluginTool<P>, agentDir: string): ToolDefinition {
   return definePiTool({
     name,
     label: name,
@@ -809,7 +827,7 @@ function defineMcpDispatcherTool<P>(name: string, tool: PluginTool<P>): ToolDefi
       const result = await tool.execute(validated.data, {
         signal,
         sessionId: 'mcp-dispatcher',
-        agentDir: process.cwd(),
+        agentDir,
         logger: { info() {}, warn() {}, error() {} },
       })
       return { content: result.content, details: result.details ?? null }
@@ -925,8 +943,15 @@ export function wrapSystemTools(
     getOrigin: () => SessionOrigin | undefined
     getAbort: () => ((reason?: string) => void) | undefined
     getLoopGuardTurn?: () => number | undefined
+    mcpManager?: McpManager
   },
 ): ToolDefinition[] {
+  const mcpManager = options.mcpManager
+  const resolvePreflightFileOperands =
+    mcpManager === undefined
+      ? undefined
+      : (tool: string, args: Record<string, unknown>) =>
+          tool === MCP_DISPATCHER_TOOL_NAMES[2] ? resolveMcpCallPreflightFileOperands(mcpManager, args) : undefined
   return tools.map((tool) =>
     wrapSystemTool(tool, {
       agentDir: options.agentDir,
@@ -935,6 +960,7 @@ export function wrapSystemTools(
       getOrigin: options.getOrigin,
       getAbort: options.getAbort,
       getLoopGuardTurn: options.getLoopGuardTurn,
+      ...(resolvePreflightFileOperands === undefined ? {} : { resolvePreflightFileOperands }),
     }),
   )
 }

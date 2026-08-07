@@ -989,6 +989,31 @@ describe('private-surface-read guard — bounded hardlink identity proof', () =>
 })
 
 describe('private-surface-read guard — honors a tool author fileOperands.nonFile declaration', () => {
+  for (const key of ['query', 'text', 'content', 'name']) {
+    test(`blocks a canonical credential filename under prose key ${key} without file operands`, () => {
+      expect(
+        checkPrivateSurfaceReadGuard({
+          tool: 'plugin_reader',
+          args: { [key]: 'secrets.json' },
+          agentDir: AGENT,
+          hidden: privilegedHidden,
+        })?.block,
+      ).toBe(true)
+    })
+  }
+
+  test('blocks a canonical credential filename at an exact declared nonFile operand', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'plugin_reader',
+        args: { query: 'secrets.json' },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        fileOperands: { nonFile: ['query'] },
+      })?.block,
+    ).toBe(true)
+  })
+
   test('skips a declared nonFile operand colliding with a hidden dir', () => {
     expect(
       checkPrivateSurfaceReadGuard({
@@ -1026,6 +1051,74 @@ describe('private-surface-read guard — honors a tool author fileOperands.nonFi
         fileOperands: { input: ['path'], nonFile: ['tenant'] },
       })?.block,
     ).toBe(true)
+  })
+
+  const declaredProseOperandCases = [
+    { category: 'input', key: 'query', value: 'memory/secret.txt' },
+    { category: 'output', key: 'name', value: 'memory/out.txt' },
+    { category: 'create', key: 'title', value: 'memory/new.txt' },
+    { category: 'destructive', key: 'content', value: 'memory/gone.txt' },
+  ] as const
+
+  for (const { category, key, value } of declaredProseOperandCases) {
+    test(`blocks a declared ${category} operand under prose key ${key}`, () => {
+      expect(
+        checkPrivateSurfaceReadGuard({
+          tool: 'plugin_reader',
+          args: { [key]: value },
+          agentDir: AGENT,
+          hidden: guestHidden,
+          fileOperands: { [category]: [key] },
+        })?.block,
+      ).toBe(true)
+    })
+  }
+
+  test('local input takes precedence when the same path is also declared nonFile', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'plugin_reader',
+        args: { query: 'memory/secret.txt' },
+        agentDir: AGENT,
+        hidden: guestHidden,
+        fileOperands: { input: ['query'], nonFile: ['query'] },
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('keeps a nonFile-only operand exempt from private-surface scanning', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'plugin_reader',
+        args: { query: 'memory/secret.txt' },
+        agentDir: AGENT,
+        hidden: guestHidden,
+        fileOperands: { nonFile: ['query'] },
+      }),
+    ).toBeUndefined()
+  })
+
+  test('keeps an ordinary hidden directory name exempt under a prose nonFile operand', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'plugin_reader',
+        args: { query: 'memory' },
+        agentDir: AGENT,
+        hidden: guestHidden,
+        fileOperands: { nonFile: ['query'] },
+      }),
+    ).toBeUndefined()
+  })
+
+  test('keeps an undeclared prose key exempt from private-surface scanning', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'plugin_reader',
+        args: { query: 'memory/secret.txt' },
+        agentDir: AGENT,
+        hidden: guestHidden,
+      }),
+    ).toBeUndefined()
   })
 })
 

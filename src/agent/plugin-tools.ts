@@ -44,6 +44,7 @@ import type {
   Tool,
   ToolBeforeEvent,
   ToolContext,
+  ToolFileOperands,
   ToolResult,
 } from '@/plugin'
 import {
@@ -300,6 +301,14 @@ export type WrapSystemToolOptions = {
   bashSandboxBoundary?: BashSandboxBoundary
   realProcDependencyCheck?: typeof commandNeedsRealProc
   remediations?: RemediationRegistry
+  // A dispatcher system tool (mcp_call) forwards a nested payload to a target
+  // chosen at call time, so its operand declarations are not knowable from the
+  // static tool definition the way a plugin tool's are. This seam resolves them
+  // per call, BEFORE the hooks run. The result feeds the security hooks ONLY —
+  // it is never handed to `enforceAndPinToolFiles`, so it can never make this
+  // boundary pin a file. It must not perform I/O against an unconnected target;
+  // returning undefined keeps the existing fail-closed scan.
+  resolvePreflightFileOperands?: (tool: string, args: Record<string, unknown>) => ToolFileOperands | undefined
   incidentLedger?: IncidentLedger
 }
 
@@ -438,12 +447,14 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
       const mutableArgs = params as Record<string, unknown>
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
       const liveOrigin = opts.getOrigin?.()
+      const preflightFileOperands = opts.resolvePreflightFileOperands?.(tool.name, mutableArgs)
       const blockResult = await opts.hooks.runToolBefore({
         tool: tool.name,
         sessionId: opts.sessionId,
         callId: toolCallId,
         args: mutableArgs,
         ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
+        ...(preflightFileOperands !== undefined ? { fileOperands: preflightFileOperands } : {}),
       })
       if (blockResult !== undefined) {
         throw new Error(`blocked: ${blockResult.reason}`)
@@ -467,6 +478,9 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
       }
       stripGuardAcknowledgements(mutableArgs)
 
+      // `preflightFileOperands` is deliberately NOT forwarded: this boundary's
+      // canonical credential denial must stay unconditional, so a target-declared
+      // nonFile operand can never exempt `secrets.json`/`.env`/`~/.ssh` from it.
       const pinnedFiles = await enforceAndPinToolFiles({
         tool: tool.name,
         args: mutableArgs,

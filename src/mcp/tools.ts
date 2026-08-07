@@ -2,8 +2,10 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 
 import { enforceAndPinToolFiles } from '@/agent/tool-file-safety'
+import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
 import { defineTool } from '@/plugin/define'
-import type { ContentPart, Tool, ToolResult } from '@/plugin/types'
+import type { ContentPart, Tool, ToolFileOperands, ToolResult } from '@/plugin/types'
+import type { HiddenPaths } from '@/sandbox'
 
 import type { McpConnection, McpToolInfo } from './client'
 import type { McpManager } from './manager'
@@ -17,8 +19,45 @@ export type McpCallArgs = { server: string; tool: string; args?: Record<string, 
 export type McpDispatcherTool = Tool<McpListToolsArgs> | Tool<McpDescribeArgs> | Tool<McpCallArgs>
 export type McpDispatcherTools = [Tool<McpListToolsArgs>, Tool<McpDescribeArgs>, Tool<McpCallArgs>]
 
-export function createMcpDispatcherTools(manager: McpManager): McpDispatcherTools {
-  return [createListToolsTool(manager), createDescribeTool(manager), createCallTool(manager)]
+export function createMcpDispatcherTools(
+  manager: McpManager,
+  opts: { resolveHidden: () => HiddenPaths },
+): McpDispatcherTools {
+  return [createListToolsTool(manager), createDescribeTool(manager), createCallTool(manager, opts)]
+}
+
+// `wrapSystemTool` runs the security hooks — including the fail-closed
+// private-surface-read scan — against the whole `{ server, tool, args }` envelope
+// BEFORE the dispatcher body resolves the target, so without this preflight a
+// target-declared free-text operand is scanned as an undeclared path and blocked
+// for a restricted role.
+//
+// EVERY category is surfaced, not just `nonFile`. `nonFile` relaxes the scan, so
+// alone it could only ever weaken the guard; the local categories are what let
+// the guard scan a declared real-file operand that a prose-named key (`query`,
+// `content`, ...) would otherwise exempt. Surfacing one without the other is the
+// bypass. This is security metadata only: it is never forwarded to a pinning
+// boundary, so pinning still happens exactly once, at the dispatcher's inner-args
+// boundary below.
+//
+// The lookup is cache-only. Connecting here would spawn an MCP server before the
+// security hooks have run; a cold catalog yields undefined, which keeps the
+// existing fail-closed scan.
+export function resolveMcpCallPreflightFileOperands(
+  manager: McpManager,
+  args: Record<string, unknown>,
+): ToolFileOperands | undefined {
+  if (typeof args.server !== 'string' || typeof args.tool !== 'string') return undefined
+  const resolved = resolveToolArgs(args.server, args.tool)
+  const declared = manager.getConnection(resolved.server)?.peekTools()
+  const fileOperands = declared?.find((item) => item.name === resolved.tool)?.fileOperands
+  if (fileOperands === undefined) return undefined
+  const rebased: Record<string, readonly string[]> = {}
+  for (const [category, paths] of Object.entries(fileOperands)) {
+    if (paths === undefined || paths.length === 0) continue
+    rebased[category] = paths.map((operandPath) => `args.${operandPath}`)
+  }
+  return Object.keys(rebased).length === 0 ? undefined : (rebased as ToolFileOperands)
 }
 
 function createListToolsTool(manager: McpManager): Tool<McpListToolsArgs> {
@@ -80,7 +119,7 @@ function createDescribeTool(manager: McpManager): Tool<McpDescribeArgs> {
   })
 }
 
-function createCallTool(manager: McpManager): Tool<McpCallArgs> {
+function createCallTool(manager: McpManager, opts: { resolveHidden: () => HiddenPaths }): Tool<McpCallArgs> {
   return defineTool<McpCallArgs>({
     description: 'Call an MCP tool on a connected server. Use mcp_describe first to learn the input schema.',
     parameters: z.object({
@@ -94,21 +133,28 @@ function createCallTool(manager: McpManager): Tool<McpCallArgs> {
       if (connection === undefined) return textResult(unknownServerMessage(manager, resolved.server))
 
       const toolArgs = args.args ?? {}
-      // Honor the target tool's own `_meta['x-file-operands']` declaration
-      // (e.g. nonFile free-text args) instead of scanning every string as a
-      // potential local file operand.
-      let targetFileOperands: McpToolInfo['fileOperands']
-      try {
-        targetFileOperands = (await safeListTools(connection)).find((item) => item.name === resolved.tool)?.fileOperands
-      } catch {
-        targetFileOperands = undefined
+      const targetFileOperands = await declaredFileOperands(connection, resolved.tool)
+      // Scoped to targets that actually declare operands. The cold-catalog gap
+      // this closes requires a declaration by definition: without one the outer
+      // envelope guard already scanned these values under the same role, and the
+      // generic fail-closed scan below stays the authority on undeclared ones —
+      // including its more precise "ambiguous local file operand" rejection.
+      if (targetFileOperands !== undefined) {
+        const blocked = checkPrivateSurfaceReadGuard({
+          tool: 'mcp_call',
+          args: toolArgs,
+          agentDir: ctx.agentDir,
+          hidden: opts.resolveHidden(),
+          fileOperands: targetFileOperands,
+        })
+        if (blocked !== undefined) throw new Error(`blocked: ${blocked.reason}`)
       }
       const pinned = await enforceAndPinToolFiles({
         tool: 'mcp_call',
         args: toolArgs,
         agentDir: ctx.agentDir,
         genericInputs: true,
-        fileOperands: targetFileOperands,
+        ...(targetFileOperands === undefined ? {} : { fileOperands: targetFileOperands }),
         logger: ctx.logger,
         signal: ctx.signal,
       })
@@ -137,6 +183,17 @@ function unknownServerMessage(manager: McpManager, server: string): string {
     .map((entry) => entry.name)
     .join(', ')
   return `Unknown MCP server ${JSON.stringify(server)}. Available servers: ${available || 'none'}.`
+}
+
+// Operand paths here are relative to the target's own schema, matching the inner
+// `args.args` scan; a catalog failure degrades to the fail-closed generic scan
+// rather than aborting, and safeCallTool surfaces the real transport error.
+async function declaredFileOperands(connection: McpConnection, tool: string): Promise<ToolFileOperands | undefined> {
+  try {
+    return (await connection.listTools()).find((item) => item.name === tool)?.fileOperands
+  } catch {
+    return undefined
+  }
 }
 
 async function safeListTools(connection: McpConnection): Promise<McpToolInfo[]> {
