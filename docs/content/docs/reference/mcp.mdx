@@ -1,0 +1,103 @@
+---
+title: MCP
+description: How MCP servers declare file operands over the wire via `_meta['x-file-operands']`
+icon: Plug
+---
+
+import { Callout } from 'fumadocs-ui/components/callout'
+
+This page is for MCP **server** authors who want their tools to work smoothly through typeclaw's `mcp_call` dispatcher. The source of truth is `src/mcp/client.ts` (`parseDeclaredFileOperands`) and `src/mcp/tools.ts` (`resolveMcpCallPreflightFileOperands`, `createCallTool`).
+
+## The three MCP tools
+
+typeclaw exposes every configured MCP server through a fixed three-tool dispatcher: `mcp_list_tools`, `mcp_describe`, and `mcp_call`. The agent calls `mcp_describe` to read your tool's input schema, then `mcp_call` with `{ server, tool, args }` to invoke it.
+
+`mcp_call`'s `args` are opaque to typeclaw until dispatch. An MCP server can accept arbitrary string fields, and typeclaw has no static contract for them the way it does for a plugin-defined `Tool`. So by default **every string argument is scanned as a potential local file operand**, fail-closed, the same generic-boundary scan described in [the sandbox internals doc](/docs/internals/sandbox#role-based-path-hiding). A free-text field that happens to look path-shaped, or that matches an existing agent-root entry name, or a bare filename, gets rejected before your tool ever runs, unless you tell typeclaw it isn't a file.
+
+## Declaring operands: `_meta['x-file-operands']`
+
+MCP's `_meta` is an arbitrary record per the MCP spec, attached to each tool entry your server returns from `tools/list`. It survives the server-to-wire-to-SDK-to-typeclaw round trip unchanged. typeclaw reads one key off it:
+
+```json
+{
+  "name": "search_web",
+  "description": "Search the web for a query.",
+  "inputSchema": { "...": "..." },
+  "_meta": {
+    "x-file-operands": {
+      "nonFile": ["query"]
+    }
+  }
+}
+```
+
+The wire key is `x-file-operands` (`MCP_FILE_OPERANDS_META_KEY` in `src/mcp/client.ts`). typeclaw parses it into the same `ToolFileOperands` shape plugin tools use. See [Plugin API, `fileOperands`](/docs/reference/plugin-api#tool) for the full semantics; the categories are repeated briefly here so this page is usable on its own:
+
+```ts
+type ToolFileOperands = {
+  input?: readonly string[] // local paths the tool reads; snapshotted before dispatch
+  output?: readonly string[] // local paths the tool writes; anchored to a fresh/existing target
+  create?: readonly string[] // exclusive-create paths; the runtime verifies absence first
+  destructive?: readonly string[] // delete/move paths; not snapshotted, tool owns authorization
+  nonFile?: readonly string[] // remote identifiers or control tokens, never treated as a path
+}
+```
+
+### Dotted operand paths
+
+Every path in every category is relative to **your tool's own input schema**, i.e. relative to `mcp_call`'s `args`, not the `{ server, tool, args }` envelope. So a declaration of `"nonFile": ["query"]` on `search_web` covers `args.query`, not `args.args.query`.
+
+Array indexes are omitted: `attachments.path` covers the `path` field of every object in an `attachments` array (`args.attachments[0].path`, `args.attachments[1].path`, and so on), not one indexed entry.
+
+## Minimal example
+
+Say your server exposes a `search_web` tool with a free-text `query` field. A query like `"SPPN 3/2017"` looks like a version-ish path fragment to the generic scanner and would otherwise be rejected as an ambiguous local file operand before the call reaches your server. Declare it as `nonFile` and it's treated like any other prose argument:
+
+```json
+{
+  "tools": [
+    {
+      "name": "search_web",
+      "description": "Search the web for a query and return matching results.",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "query": { "type": "string" } },
+        "required": ["query"]
+      },
+      "_meta": {
+        "x-file-operands": { "nonFile": ["query"] }
+      }
+    }
+  ]
+}
+```
+
+With that declared, `mcp_call({ server: "example", tool: "search_web", args: { query: "SPPN 3/2017" } })` passes the file-operand scan and dispatches normally instead of failing closed.
+
+## Malformed declarations
+
+Parsing is fail-closed by design (`parseDeclaredFileOperands`), not best-effort:
+
+- The `_meta` value itself must be a plain object. If it's missing, `null`, or not an object, no declaration is read.
+- `_meta['x-file-operands']` must be a plain object too, not `null` and not an array. Otherwise it's ignored.
+- Only the five recognized category keys (`input`, `output`, `create`, `destructive`, `nonFile`) are read. **Unrecognized keys are silently dropped**, not rejected.
+- Each recognized category, if present, must be an array of non-empty (post-trim) strings. If **any** recognized category is malformed, not an array, or containing a non-string or blank-string entry, then **the entire declaration is discarded**, not just that category.
+- One operand path may appear in at most one category. Repeating a path within a category or claiming it in two categories discards the entire declaration. In particular, `nonFile` and `input` are contradictory claims—one says the value is never dereferenced locally, while the other says it is a local file to snapshot—so typeclaw rejects the conflict instead of resolving it by precedence.
+- A discarded or absent declaration means the tool is scanned exactly as if it had declared nothing: the generic fail-closed boundary scan applies to all of its string arguments.
+
+There's no partial-credit path. A single malformed category can't leave the well-formed categories in effect. The whole tool falls back to the default scan.
+
+<Callout type="warn" title="nonFile never waives canonical credential denial">
+  Declaring an operand `nonFile` only exempts it from the generic path-shaped-string heuristic. It does **not** let
+  `secrets.json`, `.env`, `~/.ssh`, or any other canonical credential path through: those stay blocked unconditionally
+  regardless of what a server declares, at the same layer described in [the sandbox internals
+  doc](/docs/internals/sandbox). `nonFile` is for remote identifiers and control tokens only: query strings, ids, URLs
+  your server resolves itself. Never use it for a value your server will dereference as a local path. That value belongs
+  under `input`, `output`, `create`, or `destructive` instead, where it gets proper snapshotting or anchoring.
+</Callout>
+
+Declaring a path as `input`, `output`, `create`, or `destructive` does not exempt it from role-based private-directory denial. A declared local operand is still scanned against the caller's hidden paths and is blocked if it resolves under one. The declaration controls how typeclaw handles the operand; it never changes whether the caller is allowed to reach it.
+
+## When the declaration takes effect
+
+Declarations are read off the connection's cached tool catalog, not fetched fresh on every call. The pre-execution security preflight (`resolveMcpCallPreflightFileOperands`) is cache-only by design: it never spawns a stdio server or opens an HTTP session just to check a declaration, so it only sees the operand categories once the server's catalog has been listed at least once in the session (e.g. via `mcp_list_tools`, `mcp_describe`, or a prior `mcp_call`). Until then, the catalog reads as empty and the generic fail-closed scan applies. The inner dispatch that actually pins `input`/`output`/`create`/`destructive` operands lists the catalog itself if it isn't cached yet, so it always sees the full declaration by the time your tool runs.
