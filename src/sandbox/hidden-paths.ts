@@ -5,7 +5,12 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
 import type { PermissionService } from '@/permissions/permissions'
 
-import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from './canonical-secrets'
+import {
+  CANONICAL_AGENT_SECRET_DIRS,
+  CANONICAL_AGENT_SECRET_FILES,
+  OPERATOR_CLI_CREDENTIAL_DIRS,
+  RUNTIME_OWNED_SECRET_DIRS,
+} from './canonical-secrets'
 import { SandboxMaskTargetError } from './errors'
 import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 
@@ -36,8 +41,8 @@ export function resolveHiddenPaths(
 ): HiddenPaths {
   const seesPrivate = canSeePrivateSurface(permissions, origin)
   const dirs = [
-    ...CANONICAL_AGENT_SECRET_DIRS.map((dir) => join(agentDir, dir)),
-    ...(seesPrivate ? [] : PRIVATE_DIRS.map((dir) => join(agentDir, dir))),
+    ...RUNTIME_OWNED_SECRET_DIRS.map((dir) => join(agentDir, dir)),
+    ...(seesPrivate ? [] : [...OPERATOR_CLI_CREDENTIAL_DIRS, ...PRIVATE_DIRS].map((dir) => join(agentDir, dir))),
   ]
   const files = [...CANONICAL_AGENT_SECRET_FILES, ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES].map((f) =>
     join(agentDir, f),
