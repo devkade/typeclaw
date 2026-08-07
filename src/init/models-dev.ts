@@ -38,9 +38,16 @@ const PROVIDER_TO_MODELS_DEV: Record<KnownProviderId, string | null> = {
   xai: 'xai',
   minimax: 'minimax',
   deepseek: 'deepseek',
-  // Upstage is not listed on models.dev (checked api.json — no `upstage` lab
-  // entry, only HuggingFace open-model ids). Mapping to `upstage` is harmless:
-  // the upstream lookup misses and the curated Solar entries surface anyway.
+  // models.dev has listed Upstage since 2025-07-09 (solar-pro2 + solar-mini,
+  // then solar-pro3 on 2026-01-13 and solar-pro4 on 2026-08-06), so this
+  // mapping hits rather than misses. `buildOption` prefers upstream
+  // name/reasoning/limits, so the picker can show numbers that disagree with
+  // `providers.ts`. Display-only: `customModelMetaFromOption` returns
+  // undefined for known refs, so `resolveModel` still serves the curated
+  // record — including the `thinkingLevelMap` and `compat` that Upstage's
+  // wire format depends on and models.dev has no field for. solar-open2 is
+  // partner-program only and still absent upstream, so it keeps surfacing
+  // curated.
   upstage: 'upstage',
   moonshot: 'moonshot',
   // moonshot-coding (Kimi Code subscription) is a billing surface, not a
