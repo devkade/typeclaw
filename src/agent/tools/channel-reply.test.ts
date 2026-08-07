@@ -16,6 +16,7 @@ function fakeRouter(
   handler: (msg: OutboundMessage) => Promise<SendResult>,
   options: {
     consecutiveCount?: number
+    qualifyingWorkObserved?: boolean
     resolveReviewThread?: ChannelRouter['resolveReviewThread']
     getReviewState?: ChannelRouter['getReviewState']
   } = {},
@@ -23,6 +24,7 @@ function fakeRouter(
   return {
     route: async () => {},
     send: handler,
+    hasQualifyingWorkThisLogicalTurn: () => options.qualifyingWorkObserved ?? false,
     getConsecutiveSendCount: () => options.consecutiveCount ?? 0,
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),
     registerOutbound: () => {},
@@ -130,6 +132,42 @@ async function runTool(
 }
 
 describe('createChannelReplyTool', () => {
+  test('denies an unsupported completion claim before posting it', async () => {
+    let sent = 0
+    const tool = createChannelReplyTool({
+      router: fakeRouter(async () => {
+        sent++
+        return { ok: true }
+      }),
+      origin: slackThreadOrigin,
+    })
+
+    const result = await runTool(tool, { text: '반영했어' })
+
+    expect(sent).toBe(0)
+    expect(result.details).toMatchObject({ ok: false })
+    expect((result.content[0] as { text: string }).text).toContain('perform the work')
+  })
+
+  test('allows a completion claim after qualifying work was observed', async () => {
+    let sent = 0
+    const tool = createChannelReplyTool({
+      router: fakeRouter(
+        async () => {
+          sent++
+          return { ok: true }
+        },
+        { qualifyingWorkObserved: true },
+      ),
+      origin: slackThreadOrigin,
+    })
+
+    const result = await runTool(tool, { text: 'I saved it' })
+
+    expect(sent).toBe(1)
+    expect(result.details).toMatchObject({ ok: true })
+  })
+
   test('addresses the message from the origin and forwards text to router.send', async () => {
     const calls: OutboundMessage[] = []
     const tool = createChannelReplyTool({

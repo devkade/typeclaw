@@ -20,6 +20,7 @@ import { readContinuationState } from '@/agent/todo/continuation-state'
 import { recordTurnOutcome } from '@/agent/todo/continuation-wiring'
 import { resolveTodoScope } from '@/agent/todo/scope'
 import { writeTodos } from '@/agent/todo/store'
+import { createChannelReplyTool } from '@/agent/tools/channel-reply'
 import type { PermissionService } from '@/permissions'
 import type { HookBus, SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
@@ -13772,7 +13773,7 @@ describe('ChannelRouter per-turn live role anchor', () => {
 describe('ChannelRouter post-tool follow-up suppression', () => {
   function afterToolContext(
     toolName: string,
-    result: { ok: boolean; more_work_this_turn?: boolean },
+    result: Record<string, unknown>,
     isError: boolean,
     replyText?: string,
   ): AfterToolCallContext {
@@ -13839,6 +13840,82 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     await agent.afterToolCall!(afterToolContext('channel_send', { ok: true }, false))
     expect(agent.signal.aborted).toBe(false)
   })
+
+  test('records only successful non-communication, non-control work as completion evidence', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const agent = sessions[0]!.agent
+    let sent = 0
+    router.registerOutbound('discord-bot', async () => {
+      sent++
+      return { ok: true }
+    })
+    const reply = createChannelReplyTool({ router, origin: KEY })
+    const executeReply = (text: string) =>
+      reply.execute(
+        'reply-call',
+        { text, more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+
+    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false))
+    await agent.afterToolCall!(afterToolContext('todo_write', { ok: true }, false))
+    expect(router.hasQualifyingWorkThisLogicalTurn!(KEY)).toBe(false)
+    expect((await executeReply('반영했어')).details).toMatchObject({ ok: false })
+    expect(sent).toBe(0)
+
+    await agent.afterToolCall!(afterToolContext('write', { ok: false }, true))
+    expect(router.hasQualifyingWorkThisLogicalTurn!(KEY)).toBe(false)
+    expect((await executeReply('반영했어')).details).toMatchObject({ ok: false })
+    expect(sent).toBe(0)
+
+    await agent.afterToolCall!(afterToolContext('edit', { ok: true }, false))
+    expect(router.hasQualifyingWorkThisLogicalTurn!(KEY)).toBe(true)
+    expect((await executeReply('반영했어')).details).toMatchObject({ ok: true })
+    expect(sent).toBe(1)
+
+    router.__testing!.injectContinuationReminder(KEY, 'continue the current logical turn')
+    await router.__testing!.flushDebounce(KEY)
+    expect(router.hasQualifyingWorkThisLogicalTurn!(KEY)).toBe(true)
+
+    await router.route(inbound({ externalMessageId: 'next-real-turn', text: 'new task' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(router.hasQualifyingWorkThisLogicalTurn!(KEY)).toBe(false)
+  })
+
+  test.each(['web_fetch', 'web_search'])(
+    'does not accept a claim after a normally returned %s failure',
+    async (toolName) => {
+      const dir = await tempDir()
+      const { router, sessions } = makeRouter(dir)
+      await router.route(inbound())
+      await router.__testing!.flushDebounce(KEY)
+      const agent = sessions[0]!.agent
+      let sent = 0
+      router.registerOutbound('discord-bot', async () => {
+        sent++
+        return { ok: true }
+      })
+      const reply = createChannelReplyTool({ router, origin: KEY })
+
+      await agent.afterToolCall!(afterToolContext(toolName, { error: true, message: 'request failed' }, false))
+      const result = await reply.execute(
+        'reply-call',
+        { text: 'I saved it', more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+
+      expect(router.hasQualifyingWorkThisLogicalTurn!(KEY)).toBe(false)
+      expect(result.details).toMatchObject({ ok: false })
+      expect(sent).toBe(0)
+    },
+  )
 
   test('stashes the reply text on a terminal channel_reply so the willingness nudge can read it', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
