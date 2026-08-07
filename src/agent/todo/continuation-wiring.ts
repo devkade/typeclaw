@@ -52,6 +52,7 @@ export async function recordTurnOutcome(args: {
   origin: SessionOrigin
   turnId: string
   stopReason: TurnOutcome['stopReason']
+  termination?: TurnOutcome['termination']
   tokens?: number
   now?: number
 }): Promise<void> {
@@ -62,6 +63,7 @@ export async function recordTurnOutcome(args: {
     turnId: args.turnId,
     stopReason: args.stopReason,
     endedAt: args.now ?? Date.now(),
+    ...(args.termination !== undefined ? { termination: args.termination } : {}),
     ...(args.tokens !== undefined ? { tokens: args.tokens } : {}),
   }
   await writeContinuationState(args.agentDir, scope, onTurnOutcome(state, outcome))
