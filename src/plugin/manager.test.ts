@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test'
 
 import { z } from 'zod'
 
+import { rolesConfigSchema } from '@/permissions'
+
 import { defineTool } from './define'
 import { type LoadPluginEntryFn, PluginNotFoundError, PluginSecurityError } from './loader'
 import { loadPlugins, summarizeLoaded, pluginCronJobs } from './manager'
@@ -255,6 +257,67 @@ describe('loadPlugins — a failed plugin does not influence the permission mode
     // the security-critical assertion: the failed plugin's exclusion must NOT
     // have stripped the surviving plugin's owner-wildcard bypass.
     expect(result.permissions.has(ownerOrigin, 'security.bypass.allowedPlugin')).toBe(true)
+  })
+})
+
+describe('loadPlugins — ungranted plugin permission warning', () => {
+  const gatedPlugin: LoadPluginEntryFn = async () => ({
+    name: 'standup-log',
+    version: undefined,
+    source: 'standup-log',
+    defined: { permissions: ['standup.publish.remote'], plugin: async () => ({}) },
+  })
+
+  test('warns naming the plugin when no role grants the declared permission', async () => {
+    const cap = captureWarnings()
+    try {
+      await loadPlugins({ entries: ['standup-log'], agentDir: '/tmp', configsByName: {}, loadEntry: gatedPlugin })
+    } finally {
+      cap.restore()
+    }
+
+    const warning = cap.warnings.find((w) => w.includes('standup.publish.remote'))
+    expect(warning).toBeDefined()
+    expect(warning).toContain('plugin "standup-log"')
+    expect(warning).toContain('no role grants it')
+    expect(warning).toContain('roles.<role>.permissions[]')
+  })
+
+  test('stays silent once a role grants it', async () => {
+    const roles = rolesConfigSchema.parse({
+      owner: { match: ['tui'], permissions: ['channel.respond', 'standup.publish.remote'] },
+    })
+    const cap = captureWarnings()
+    try {
+      await loadPlugins({
+        entries: ['standup-log'],
+        agentDir: '/tmp',
+        configsByName: {},
+        loadEntry: gatedPlugin,
+        roles,
+      })
+    } finally {
+      cap.restore()
+    }
+
+    expect(cap.warnings.filter((w) => w.includes('standup.publish.remote'))).toEqual([])
+  })
+
+  test('stays silent for a security.bypass.* string the owner wildcard already covers', async () => {
+    const loadEntry: LoadPluginEntryFn = async () => ({
+      name: 'guarded',
+      version: undefined,
+      source: 'guarded',
+      defined: { permissions: ['security.bypass.myGuard'], plugin: async () => ({}) },
+    })
+    const cap = captureWarnings()
+    try {
+      await loadPlugins({ entries: ['guarded'], agentDir: '/tmp', configsByName: {}, loadEntry })
+    } finally {
+      cap.restore()
+    }
+
+    expect(cap.warnings.filter((w) => w.includes('security.bypass.myGuard'))).toEqual([])
   })
 })
 
