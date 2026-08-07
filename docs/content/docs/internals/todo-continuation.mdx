@@ -70,7 +70,7 @@ The just-completed turn's token spend (`lastTurnOutcome.tokens`, from the assist
 1. **`no-incomplete-todos`** — nothing left to do.
 2. **`restart-kick-suppressed`** — the one-shot restart suppressor is armed (below).
 3. **`user-abort-blocked`** — the durable user-abort suppressor is set (policy D1).
-4. **`turn-not-safe`** — the last outcome is missing, `unknown`, or `aborted`. `unknown` is the fail-closed value: an idle that can't classify the prior turn does **not** auto-inject.
+4. **`turn-not-safe`** — the last outcome is missing, `unknown`, or an unproven `aborted`. The sole safe abort is a successful terminal `channel_reply` carrying runtime-owned `termination: 'terminal-after-channel-reply'` provenance; the raw stop reason remains `aborted`. `unknown`, missing, stale, and malformed provenance all fail closed.
 5. **`max-auto-turns` / `max-tokens` / `max-wall-clock`** — a budget ceiling tripped.
 6. **`stagnation`** — `stagnationCount` hit the limit.
 
@@ -81,7 +81,7 @@ Only after all six pass does it return `inject` with `autoTurnCount + 1`.
 Two suppressors live in `ContinuationState` and gate injection independent of budget:
 
 - **Restart-kick** (`suppressNextIdleNudgeReason: 'restart-kick'`) — a one-shot. The post-restart kick prompt owns the first idle, so the first idle after a restart consumes this and skips exactly one injection. It is consumed even on a skip, so the suppressor always burns exactly once (`maybeInjectContinuation`, `consumeRestartKickSuppression`).
-- **User-abort** (`autoResumeBlockedUntilRealUserTurn`) — durable. Set when a turn ends via explicit user abort (`onTurnOutcome` on `stopReason: 'aborted'`); cleared only by the next real user turn (`onTurnStart`). While set, no auto-continuation fires regardless of budget. A user who hits stop is not second-guessed by the runtime.
+- **User-abort** (`autoResumeBlockedUntilRealUserTurn`) — durable. Set when a turn ends via explicit user abort (`onTurnOutcome` on `stopReason: 'aborted'`); cleared only by the next real user turn (`onTurnStart`). While set, no auto-continuation fires regardless of budget. The runtime's turn-stamped terminal-`channel_reply` provenance is the narrow exception because that abort intentionally suppresses a redundant post-tool model call after the reply has landed. Every unproven abort still arms the block, so a user who hits stop is not second-guessed by the runtime.
 
 ### Fail-closed state parsing
 
@@ -92,7 +92,7 @@ Two suppressors live in `ContinuationState` and gate injection independent of bu
 `src/agent/todo/continuation-wiring.ts` is the seam between the engine and the per-origin drain loop:
 
 - **`recordTurnStart`** resets the episode at the start of a **real** user turn. Injected continuation turns pass `isRealUserTurn=false` so the budget keeps counting down. No-op for scopeless origins.
-- **`recordTurnOutcome`** persists the just-completed turn's `stopReason` + `tokens` from a pi `message_end` event. `classifyStopReason` maps anything unrecognized to `unknown` so the idle path fails closed; `extractTurnUsage` only reads assistant `message_end` events.
+- **`recordTurnOutcome`** persists the just-completed turn's `stopReason` + `tokens` from a pi `message_end` event. Channel sessions also attach one-shot terminal-reply provenance only when the raw outcome is `aborted` and the router's abort stamp matches the current turn. Per-session writes are serialized, and the drain awaits the chain before continuation reads state. `classifyStopReason` maps anything unrecognized to `unknown` so the idle path fails closed; `extractTurnUsage` only reads assistant `message_end` events.
 - **`armRestartKickForOrigin`** arms the one-shot before a restart kick.
 - **`runIdleContinuation`** is the idle-path entry: it calls `maybeInjectContinuation` (decide + persist) and, on `injected`, delivers the `CONTINUATION_PROMPT` via the origin-appropriate mechanism the caller supplies (TUI `stream.publish`; channel `pendingSystemReminders` + drain).
 
