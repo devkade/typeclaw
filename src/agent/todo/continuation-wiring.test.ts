@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
 
-import { readContinuationState } from './continuation-state'
+import { continuationStatePath, readContinuationState } from './continuation-state'
 import {
   armRestartKickForOrigin,
   classifyStopReason,
@@ -61,6 +61,22 @@ describe('recordTurnOutcome / recordTurnStart', () => {
     const state = await readContinuationState(agentDir, SCOPE)
     expect(state.lastTurnOutcome?.stopReason).toBe('aborted')
     expect(state.autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test('records trusted terminal-reply provenance without arming the abort suppressor', async () => {
+    await recordTurnOutcome({
+      agentDir,
+      origin: TUI,
+      turnId: 't1',
+      stopReason: 'aborted',
+      termination: 'terminal-after-channel-reply',
+    })
+    const state = await readContinuationState(agentDir, SCOPE)
+    expect(state.lastTurnOutcome).toMatchObject({
+      stopReason: 'aborted',
+      termination: 'terminal-after-channel-reply',
+    })
+    expect(state.autoResumeBlockedUntilRealUserTurn).toBe(false)
   })
 
   test('a real user turn clears the abort suppressor; an injected turn does not', async () => {
@@ -148,6 +164,33 @@ describe('runIdleContinuation', () => {
   test('does not deliver after a user abort', async () => {
     await writeTodos(agentDir, SCOPE, [{ content: 'task', status: 'pending' }])
     await recordTurnOutcome({ agentDir, origin: TUI, turnId: 't1', stopReason: 'aborted' })
+    let delivered = false
+    const ok = await runIdleContinuation({ agentDir, origin: TUI, deliver: () => (delivered = true) })
+    expect(ok).toBe(false)
+    expect(delivered).toBe(false)
+    expect((await readContinuationState(agentDir, SCOPE)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test('a persisted bogus termination value does not authorize continuation', async () => {
+    await writeTodos(agentDir, SCOPE, [{ content: 'task', status: 'pending' }])
+    const path = continuationStatePath(agentDir, SCOPE)
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 1,
+        state: {
+          lastTurnOutcome: {
+            turnId: 't1',
+            stopReason: 'aborted',
+            termination: 'forged-safe-abort',
+            endedAt: 1,
+          },
+        },
+      }),
+      'utf8',
+    )
+
     let delivered = false
     const ok = await runIdleContinuation({ agentDir, origin: TUI, deliver: () => (delivered = true) })
     expect(ok).toBe(false)

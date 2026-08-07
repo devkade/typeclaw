@@ -131,6 +131,17 @@ describe('onTurnOutcome', () => {
     expect(next.autoResumeBlockedUntilRealUserTurn).toBe(true)
   })
 
+  test('a terminal channel-reply abort does not arm the durable suppressor', () => {
+    const outcome: TurnOutcome = {
+      turnId: 't',
+      stopReason: 'aborted',
+      termination: 'terminal-after-channel-reply',
+      endedAt: 9,
+    }
+    const next = onTurnOutcome(emptyContinuationState(), outcome)
+    expect(next.autoResumeBlockedUntilRealUserTurn).toBe(false)
+  })
+
   test('a normal stop does not arm the suppressor', () => {
     const outcome: TurnOutcome = { turnId: 't', stopReason: 'stop', endedAt: 9 }
     expect(onTurnOutcome(emptyContinuationState(), outcome).autoResumeBlockedUntilRealUserTurn).toBe(false)

@@ -17,7 +17,9 @@ import {
 } from '@/agent/restart-handoff'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { readContinuationState } from '@/agent/todo/continuation-state'
+import { recordTurnOutcome } from '@/agent/todo/continuation-wiring'
 import { resolveTodoScope } from '@/agent/todo/scope'
+import { writeTodos } from '@/agent/todo/store'
 import type { PermissionService } from '@/permissions'
 import type { HookBus, SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
@@ -330,6 +332,25 @@ function emptyStopAfterToolWork(session: FakeSession, id: string = 'tw', userId:
   session.leafEntry = emptyStopEntry
 }
 
+function terminalReplyContext(replyText: string): AfterToolCallContext {
+  return {
+    assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
+    toolCall: {
+      type: 'toolCall',
+      id: 'tc-terminal-reply',
+      name: 'channel_reply',
+      arguments: { text: replyText },
+    } as AfterToolCallContext['toolCall'],
+    args: { text: replyText },
+    result: {
+      content: [{ type: 'text' as const, text: 'ignored' }],
+      details: { ok: true },
+    } as AfterToolCallContext['result'],
+    isError: false,
+    context: { systemPrompt: '', messages: [], tools: [] },
+  }
+}
+
 const baseConfig: ChannelAdapterConfig = {
   engagement: { trigger: ['mention', 'reply', 'dm'], stickiness: { perReply: { window: 60_000 } } },
   enabled: true,
@@ -379,6 +400,7 @@ function makeRouter(
     newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
     listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
     runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
+    recordTurnOutcome?: CreateChannelRouterOptions['recordTurnOutcome']
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
@@ -403,6 +425,7 @@ function makeRouter(
       ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
     ...(options.runIdleContinuation !== undefined ? { runIdleContinuation: options.runIdleContinuation } : {}),
+    ...(options.recordTurnOutcome !== undefined ? { recordTurnOutcome: options.recordTurnOutcome } : {}),
     permissions: options.permissions ?? grantAllPermissions,
     now: () => nowRef.value,
     logger: {
@@ -7899,6 +7922,185 @@ describe('ChannelRouter commands', () => {
     expect(sessions[0]!.prompts[0]).toContain('long task')
   })
 
+  test('/stop supersedes terminal-reply provenance before the aborted outcome is captured', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    let continuationRuns = 0
+    const { router, sessions } = makeRouter(dir, {
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
+      await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
+      await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(continuationRuns).toBe(0)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test('/stop supersedes a terminal outcome whose write is already pending', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    let releaseTerminalWrite: (() => void) | undefined
+    let terminalWriteStarted = false
+    let outcomeWrites = 0
+    let continuationRuns = 0
+    const terminalWriteGate = new Promise<void>((resolve) => {
+      releaseTerminalWrite = resolve
+    })
+    const { router, sessions } = makeRouter(dir, {
+      recordTurnOutcome: async (args) => {
+        outcomeWrites++
+        if (outcomeWrites === 1) {
+          terminalWriteStarted = true
+          await terminalWriteGate
+        }
+        await recordTurnOutcome(args)
+      },
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
+      await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
+      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+      await waitFor(() => terminalWriteStarted)
+      const stopping = router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+      releaseTerminalWrite!()
+      await stopping
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(outcomeWrites).toBe(2)
+    expect(continuationRuns).toBe(0)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test('/stop during an in-flight continuation decision drops the reminder and still arms the block', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    let continuationRuns = 0
+    let stopping: Promise<unknown> | undefined
+    let routerRef: ChannelRouter | undefined
+    const { router, sessions } = makeRouter(dir, {
+      runIdleContinuation: async ({ deliver }) => {
+        continuationRuns++
+        if (continuationRuns > 1) return false
+        // The decision is already in flight when the user stops. `stop` only
+        // awaits the outcome chain at its very end, so this cannot deadlock.
+        stopping = routerRef!.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+        await waitFor(() => sessions[0]!.aborted > 0)
+        deliver('keep working through the leftover todos')
+        return true
+      },
+    })
+    routerRef = router
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Working on it.' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    await stopping
+
+    // The reminder was dropped at delivery, so no injected continuation turn ran.
+    expect(continuationRuns).toBe(1)
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test("a /stop's durable abort write is serialized after an in-flight continuation decision", async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    // A decision that reads state, then writes it, must not have the user's
+    // durable abort land *inside* that window — the abort would be clobbered.
+    const events: string[] = []
+    let decisions = 0
+    let stopping: Promise<unknown> | undefined
+    let routerRef: ChannelRouter | undefined
+    const { router, sessions } = makeRouter(dir, {
+      recordTurnOutcome: async (args) => {
+        events.push(`write:${args.stopReason}`)
+        await recordTurnOutcome(args)
+      },
+      runIdleContinuation: async ({ deliver }) => {
+        decisions++
+        if (decisions > 1) return false
+        events.push('decision:start')
+        stopping = routerRef!.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+        await waitFor(() => sessions[0]!.aborted > 0)
+        events.push('decision:end')
+        deliver('keep working through the leftover todos')
+        return true
+      },
+    })
+    routerRef = router
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Working on it.' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('Working on it.') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    await stopping
+
+    expect(events).toEqual(['write:stop', 'decision:start', 'decision:end', 'write:aborted'])
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
   test('unknown commands are consumed instead of sent as prompts', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
@@ -13650,6 +13852,203 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
       afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false, '바로 계속 확인하겠습니다'),
     )
     expect(agent.signal.aborted).toBe(false)
+  })
+
+  test('terminal channel_reply with incomplete todos delivers a continuation reminder', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'finish the follow-up', status: 'pending' }])
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'finish both steps' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async (text) => {
+      attempt++
+      if (attempt === 1) {
+        await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'First step is done.' })
+        await sessions[0]!.agent.afterToolCall!(
+          afterToolContext('channel_reply', { ok: true }, false, 'First step is done.'),
+        )
+        sessions[0]!.setAssistantMidTurn('First step is done.', 'aborted')
+        sessions[0]!.emit({
+          type: 'message_end',
+          message: { ...assistantMessage(''), stopReason: 'aborted' },
+        })
+        return
+      }
+
+      if (attempt > 2) {
+        sessions[0]!.setAssistantText('NO_REPLY')
+        return
+      }
+      expect(text).toContain('Incomplete todo items remain in your list')
+      await writeTodos(dir, scope, [{ content: 'finish the follow-up', status: 'completed' }])
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Follow-up finished.' })
+      sessions[0]!.setAssistantText('Follow-up finished.')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('Follow-up finished.') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts[1]).toContain('Incomplete todo items remain in your list')
+  })
+
+  test('an unproven abort with incomplete todos remains blocked until a later user turn', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume', status: 'pending' }])
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start, then stop' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping here.' })
+      sessions[0]!.setAssistantMidTurn('Stopping here.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test('a terminal-reply stamp from an earlier turn cannot authorize a later abort', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume stale work', status: 'pending' }])
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'two turns' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt === 1) {
+        await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'First turn reply.' })
+        await sessions[0]!.agent.afterToolCall!(
+          afterToolContext('channel_reply', { ok: true }, false, 'First turn reply.'),
+        )
+        sessions[0]!.setAssistantMidTurn('First turn reply.', 'aborted')
+        router.__testing!.injectContinuationReminder(KEY, 'Run a second turn.')
+        return
+      }
+
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Second turn aborted.' })
+      sessions[0]!.setAssistantMidTurn('Second turn aborted.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test('awaits the outcome write before deciding whether to continue todos', async () => {
+    const dir = await tempDir()
+    let releaseOutcomeWrite: (() => void) | undefined
+    let outcomeWriteStarted = false
+    let continuationObservedCompletedWrite = false
+    const outcomeWriteGate = new Promise<void>((resolve) => {
+      releaseOutcomeWrite = resolve
+    })
+    const { router, sessions } = makeRouter(dir, {
+      recordTurnOutcome: async () => {
+        outcomeWriteStarted = true
+        await outcomeWriteGate
+      },
+      runIdleContinuation: async () => {
+        continuationObservedCompletedWrite = true
+        return false
+      },
+    })
+
+    await router.route(inbound({ text: 'order the writes' }))
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+    }
+    const drained = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => outcomeWriteStarted)
+    expect(continuationObservedCompletedWrite).toBe(false)
+    releaseOutcomeWrite!()
+    await drained
+    expect(continuationObservedCompletedWrite).toBe(true)
+  })
+
+  test('a rejected outcome write skips continuation for that turn and recovers on the next turn', async () => {
+    const dir = await tempDir()
+    const origin: SessionOrigin = {
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    }
+    const scope = resolveTodoScope(origin)!
+    await writeTodos(dir, scope, [{ content: 'finish later', status: 'pending' }])
+    await recordTurnOutcome({
+      agentDir: dir,
+      origin,
+      turnId: 'ses_fake_1',
+      stopReason: 'stop',
+    })
+    let outcomeWrites = 0
+    let continuationRuns = 0
+    const { router, sessions } = makeRouter(dir, {
+      recordTurnOutcome: async (args) => {
+        outcomeWrites++
+        if (outcomeWrites === 1) throw new Error('first write failed')
+        await recordTurnOutcome(args)
+      },
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'stop this work' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopped.' })
+      sessions[0]!.setAssistantMidTurn('Stopped.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(outcomeWrites).toBe(1)
+    expect(continuationRuns).toBe(0)
+
+    await router.route(inbound({ text: 'try a new turn' }))
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('second') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(outcomeWrites).toBe(2)
+    expect(continuationRuns).toBe(1)
   })
 })
 
