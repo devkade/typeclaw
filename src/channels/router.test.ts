@@ -8008,6 +8008,99 @@ describe('ChannelRouter commands', () => {
     expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
   })
 
+  test('/stop during an in-flight continuation decision drops the reminder and still arms the block', async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    let continuationRuns = 0
+    let stopping: Promise<unknown> | undefined
+    let routerRef: ChannelRouter | undefined
+    const { router, sessions } = makeRouter(dir, {
+      runIdleContinuation: async ({ deliver }) => {
+        continuationRuns++
+        if (continuationRuns > 1) return false
+        // The decision is already in flight when the user stops. `stop` only
+        // awaits the outcome chain at its very end, so this cannot deadlock.
+        stopping = routerRef!.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+        await waitFor(() => sessions[0]!.aborted > 0)
+        deliver('keep working through the leftover todos')
+        return true
+      },
+    })
+    routerRef = router
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Working on it.' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    await stopping
+
+    // The reminder was dropped at delivery, so no injected continuation turn ran.
+    expect(continuationRuns).toBe(1)
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
+  test("a /stop's durable abort write is serialized after an in-flight continuation decision", async () => {
+    const dir = await tempDir()
+    const scope = resolveTodoScope({
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    })!
+    await writeTodos(dir, scope, [{ content: 'do not resume after stop', status: 'pending' }])
+    // A decision that reads state, then writes it, must not have the user's
+    // durable abort land *inside* that window — the abort would be clobbered.
+    const events: string[] = []
+    let decisions = 0
+    let stopping: Promise<unknown> | undefined
+    let routerRef: ChannelRouter | undefined
+    const { router, sessions } = makeRouter(dir, {
+      recordTurnOutcome: async (args) => {
+        events.push(`write:${args.stopReason}`)
+        await recordTurnOutcome(args)
+      },
+      runIdleContinuation: async ({ deliver }) => {
+        decisions++
+        if (decisions > 1) return false
+        events.push('decision:start')
+        stopping = routerRef!.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+        await waitFor(() => sessions[0]!.aborted > 0)
+        events.push('decision:end')
+        deliver('keep working through the leftover todos')
+        return true
+      },
+    })
+    routerRef = router
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the task' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Working on it.' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('Working on it.') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    await stopping
+
+    expect(events).toEqual(['write:stop', 'decision:start', 'decision:end', 'write:aborted'])
+    expect((await readContinuationState(dir, scope)).autoResumeBlockedUntilRealUserTurn).toBe(true)
+  })
+
   test('unknown commands are consumed instead of sent as prompts', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)

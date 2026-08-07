@@ -2870,17 +2870,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const maybeContinueTodosChannel = async (live: LiveSession): Promise<void> => {
     if (live.destroyed) return
     if (live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) return
-    try {
-      await (options.runIdleContinuation ?? runIdleContinuation)({
-        agentDir: options.agentDir,
-        origin: buildLiveOrigin(live),
-        deliver: (text) => {
-          live.pendingSystemReminders.push(text)
-        },
-      })
-    } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: todo continuation failed: ${describeError(err)}`)
-    }
+    // Joined to the outcome-write chain so a concurrent /stop's durable abort is
+    // ORDERED AFTER this decision's own state write instead of racing it. The
+    // decision itself awaits disk, so the stop marker is re-read at delivery
+    // time too: a user who stops mid-decision must not receive the reminder.
+    const decision = live.todoOutcomeWrite.then(async () => {
+      try {
+        await (options.runIdleContinuation ?? runIdleContinuation)({
+          agentDir: options.agentDir,
+          origin: buildLiveOrigin(live),
+          deliver: (text) => {
+            if (live.destroyed || live.userStoppedTurnSeq === live.turnSeq) {
+              logger.info(`[channels] ${live.keyId}: dropping todo continuation reminder after user stop`)
+              return
+            }
+            live.pendingSystemReminders.push(text)
+          },
+        })
+      } catch (err) {
+        logger.warn(`[channels] ${live.keyId}: todo continuation failed: ${describeError(err)}`)
+      }
+      return true
+    })
+    live.todoOutcomeWrite = decision
+    await decision
   }
 
   const postEmptyTurnFallback = async (live: LiveSession, cause: string): Promise<void> => {
