@@ -781,14 +781,20 @@ export const KNOWN_PROVIDERS = {
   // the console, the OpenAI-SDK example, and the agent docs all use bare `/v1`.
   //
   // Model lineup spans two families on the same Console API + key:
-  //   * Closed chat models. solar-pro4 (512K context / 128K output, released
-  //     2026-08-06, current flagship) is per the live model page
-  //     console.upstage.ai/docs/models/solar-pro4; the rest are from the agent
-  //     API reference (console.upstage.ai/api/docs/for-agents) as of
-  //     2026-03-23: solar-pro3 (102B MoE / 12B active, 128K), solar-pro2
-  //     (31B, 65K), solar-mini (10.7B, 32K, cheap/fast). Note that the
-  //     for-agents dump is stale (self-dated 2026-03-07) and omits pro4 — its
-  //     absence there is not evidence the model is unavailable.
+  //   * Closed chat models, per the live model pages under
+  //     console.upstage.ai/docs/models — solar-pro-4, solar-pro-3,
+  //     solar-pro-2, solar-mini (the slugs are hyphenated; the unhyphenated
+  //     form 404s): solar-pro4 (524288 context / 131072 output, released
+  //     2026-08-06, current flagship), solar-pro3 (102B MoE / 12B active,
+  //     128000), solar-pro2 (31B, 65536), solar-mini (10.7B, 32768,
+  //     cheap/fast). The contextWindow values below are those exact
+  //     documented figures. Upstage publishes NO maximum output length for
+  //     pro3/pro2/mini, so their maxTokens are deliberate conservative
+  //     choices of ours rather than sourced numbers — do not "correct" them
+  //     against a third-party catalog that states one. The older agent API
+  //     reference (console.upstage.ai/api/docs/for-agents) is stale
+  //     (self-dated 2026-03-07) and omits pro4 — its absence there is not
+  //     evidence the model is unavailable.
   //   * The open-weight Solar Open family: solar-open2 (Solar Open 2), a 102B
   //     MoE / 12B active model with a 128K context. It launched on the Console
   //     API for the Solar Agent Partner program (Stage 1, from 2026-07-17) —
@@ -965,7 +971,7 @@ export const KNOWN_PROVIDERS = {
         },
         input: ['text'],
         cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0 },
-        contextWindow: 65000,
+        contextWindow: 65536,
         maxTokens: 16000,
         compat: {
           supportsStore: false,
@@ -985,7 +991,7 @@ export const KNOWN_PROVIDERS = {
         reasoning: false,
         input: ['text'],
         cost: { input: 0.15, output: 0.15, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 32000,
+        contextWindow: 32768,
         maxTokens: 8000,
         compat: {
           supportsStore: false,
