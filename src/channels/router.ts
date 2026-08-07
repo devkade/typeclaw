@@ -196,6 +196,7 @@ export const SESSION_GC_INTERVAL_MS = 60 * 1000
 // recovery paths (`source: 'system'`) bypass.
 export const MAX_CHANNEL_SENDS_PER_TURN = 10
 export const ENGAGE_REACTION_EMOJI = 'eyes'
+export const CONTINUATION_REACTION_EMOJI = 'hourglass_flowing_sand'
 // Best-effort "zipping it / going quiet" ack dropped on the triggering message
 // when the model disengages (channel_disengage); fire-and-forget like engage :eyes:.
 export const DISENGAGE_REACTION_EMOJI = 'zipper_mouth_face'
@@ -456,20 +457,31 @@ export const MAX_WILLINGNESS_NUDGES = 1
 // Injected when a reply that ended the turn (terminal-reply abort) promised to
 // keep working but omitted `more_work_this_turn: true`. Reminder-only, SYSTEM MESSAGE
 // framing so persona-rich models do not reply to the notice itself.
+// Leads with the DELIVERY imperative, mirroring SEND_WILLINGNESS_NUDGE below. An
+// earlier revision closed on a bare "If there is nothing left to do, reply with
+// `NO_REPLY`" and production models took that door after doing the promised work:
+// "nothing left to DO" reads as satisfied the moment the investigation finishes,
+// so the turn exited silent while still holding the answer. Splitting "no work
+// left" from "nothing to report", and scoping NO_REPLY to already-delivered, is
+// the load-bearing part of this wording — do not collapse it back.
 export const WILLINGNESS_NUDGE = [
   '---',
   '**[SYSTEM MESSAGE — not from a human]**',
   '',
-  'Your last reply said you would keep working this turn, but it ended right',
-  'after sending — a successful channel reply ends the turn unless you set',
+  'Your last reply promised the human you would keep working, but the turn ended',
+  'right after sending — a successful channel reply ends the turn unless you set',
   '`more_work_this_turn: true` on it. This is an automated signal from the channel',
   'router, not a message from anyone in the chat. **Do not acknowledge or reply to',
   'this notice itself.**',
   '',
-  'If you still have work to do (fetch data, run a tool, spawn a subagent, then',
-  'reply with the result), do it now — and on the status reply that precedes more',
-  'work this turn, set `more_work_this_turn: true`. If there is nothing left to do,',
-  'reply with `NO_REPLY`.',
+  'Someone is waiting on the result you just promised. Do the work now (fetch data,',
+  'run a tool, spawn a subagent) and post what you find — and on any further status',
+  'reply that precedes more work this turn, set `more_work_this_turn: true`. If you',
+  'already did the work, post the conclusion you reached: having no work left is NOT',
+  'the same as having nothing to report, and a promise that never lands reads to the',
+  'human as being ignored.',
+  '',
+  '`NO_REPLY` is correct ONLY if the result you promised is already in the channel.',
   '',
   '---',
 ].join('\n')
@@ -480,6 +492,10 @@ export const WILLINGNESS_NUDGE = [
 // needs `more_work_this_turn: true`; this path is a `channel_send` (which never ends the
 // turn) whose follow-up degenerated, so the model just needs to emit the reply it
 // already worked out. Shares MAX_WILLINGNESS_NUDGES so a turn can't double-nudge.
+// Scopes NO_REPLY the same way WILLINGNESS_NUDGE does, and for the same reason:
+// both nudges share `willingnessNudges`, so both are covered by the
+// `no_reply_after_willingness_nudge` fallback. A nudge that still advertised
+// NO_REPLY as an ordinary exit would contradict the guard that answers it.
 export const SEND_WILLINGNESS_NUDGE = [
   '---',
   '**[SYSTEM MESSAGE — not from a human]**',
@@ -489,8 +505,12 @@ export const SEND_WILLINGNESS_NUDGE = [
   'message. This is an automated signal from the channel router, not a message',
   'from anyone in the chat. **Do not acknowledge or reply to this notice itself.**',
   '',
-  'Send the answer you just worked out now via your channel send tool. If you',
-  'genuinely have nothing to report, reply with `NO_REPLY`.',
+  'Send the answer you just worked out now via your channel send tool. Post what',
+  'you found even if the finding is "no change" or "it failed" — someone is waiting',
+  'on the result you promised, and having no work left is not the same as having',
+  'nothing to report.',
+  '',
+  '`NO_REPLY` is correct ONLY if the result you promised is already in the channel.',
   '',
   '---',
 ].join('\n')
@@ -906,6 +926,12 @@ type LiveSession = {
   // legitimately keeps its "seen, not replying" ack, unlike the transient
   // engage :eyes: which teardown must strip.
   activeSilentAckReactions: Array<Promise<ReactionRef | null>>
+  // One add promise per willingness status posted by the agent, resolving to
+  // the removable reaction-instance ref. Cross-turn state on purpose: the
+  // hourglass stays visible until a substantive result, fallback, explicit
+  // silence, stop, or teardown retires every outstanding promise. Storing the
+  // promise synchronously prevents cleanup racing a slow reaction add.
+  activeContinuationReactions: Array<Promise<ReactionRef | null>>
   lastTurnAuthorIds: Set<string>
   // Mirror of currentTurnAuthorId at end-of-turn (the LAST speaker of the
   // prior batch), preserved across the drain finally-block which resets
@@ -931,6 +957,11 @@ type LiveSession = {
   // the drain loop's run condition checks BOTH queues so a system
   // reminder alone is enough to trigger a turn.
   pendingSystemReminders: string[]
+  // True only for the reminder-only iteration that consumed a willingness
+  // nudge. `willingnessNudges` persists across the logical turn, so it remains
+  // nonzero after a substantive result and would misclassify NO_REPLY from a
+  // later unrelated reminder as another dropped promise.
+  willingnessReminderIteration: boolean
   consecutiveSends: Map<string, number>
   // Per-(chat:thread) text of the last reserved bot send. Set
   // SYNCHRONOUSLY inside router.send before the outbound callback awaits,
@@ -2238,6 +2269,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         originRef,
         promptQueue: [],
         pendingSystemReminders: [],
+        willingnessReminderIteration: false,
         contextBuffer: [],
         currentTurnAttachments: [],
         historyTimedAttachments: [],
@@ -2263,6 +2295,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         pendingTurnReactions: [],
         silentAckTurn: null,
         activeSilentAckReactions: [],
+        activeContinuationReactions: [],
         // `lastTurnAuthorId` (string, used for `lastInboundAuthorId` in
         // origin) and `lastTurnAuthorIds` (Set, used by
         // `grantStickyForReplyTargets` as the fallback when
@@ -2829,18 +2862,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const postEmptyTurnFallback = async (live: LiveSession, cause: string): Promise<void> => {
     logger.warn(`[channels] ${live.keyId} empty_turn_fallback cause=${cause}`)
     live.emptyTurnFallbackTurn = live.turnSeq
-    const result = await send(
-      {
-        adapter: live.key.adapter,
-        workspace: live.key.workspace,
-        chat: live.key.chat,
-        thread: live.key.thread,
-        text: EMPTY_TURN_FALLBACK_TEXT,
-      },
-      { source: 'system', outputKind: 'meta' },
-    )
-    if (!result.ok) {
-      logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
+    try {
+      const result = await send(
+        {
+          adapter: live.key.adapter,
+          workspace: live.key.workspace,
+          chat: live.key.chat,
+          thread: live.key.thread,
+          text: EMPTY_TURN_FALLBACK_TEXT,
+        },
+        { source: 'system', outputKind: 'meta' },
+      )
+      if (!result.ok) {
+        logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
+      }
+    } finally {
+      void dropContinuationReactions(live)
     }
   }
 
@@ -2969,6 +3006,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.promptQueue.length = 0
     live.pendingSystemReminders.length = 0
     live.continueReplyTurn = null
+    void dropContinuationReactions(live)
     await stopTypingHeartbeat(live)
     try {
       await live.session.abort()
@@ -3089,6 +3127,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const observed = live.contextBuffer.splice(0, live.contextBuffer.length)
         const reminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
         live.currentTurnAttachments = collectTurnAttachments(observed, batch)
+        live.willingnessReminderIteration =
+          batch.length === 0 && reminders.some((r) => r === WILLINGNESS_NUDGE || r === SEND_WILLINGNESS_NUDGE)
 
         if (batch.length > 0) {
           // A fresh user batch starts a NEW logical turn. Drop any provider
@@ -4491,8 +4531,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.pendingQuoteCandidate = null
     }
     const text = normalizeSendText(msg.text)
-    const outputKind =
-      opts?.outputKind ?? (text !== undefined && detectContinuationWillingness(text) ? 'status' : 'substantive')
+    const continuationWillingness = text !== undefined && detectContinuationWillingness(text)
+    const outputKind = opts?.outputKind ?? (continuationWillingness ? 'status' : 'substantive')
 
     // Central enforcement. Tool-initiated sends are subject to two policies:
     // a per-turn count cap (kills runaway loops regardless of content) and
@@ -4586,6 +4626,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     let delivered = false
     let messageId: string | undefined
     let messageIds: readonly string[] | undefined
+    let reactionRef: ReactionRef | undefined
     try {
       for (const cb of snapshot) {
         const result = await cb(msg)
@@ -4593,6 +4634,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           delivered = true
           messageId = result.messageId
           messageIds = result.messageIds
+          reactionRef = result.reactionRef
           break
         }
         lastError = result.error
@@ -4621,6 +4663,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         else live.lastSentText.set(sendKey, priorLastSentText)
       }
       return { ok: false, error: lastError ?? 'no callback accepted the outbound', code: 'callback-rejected' }
+    }
+
+    if (live && continuationWillingness && reactionRef !== undefined) {
+      reactOnContinuationWillingness(live, reactionRef)
+    } else if (live && !continuationWillingness && outputKind === 'substantive') {
+      void dropContinuationReactions(live)
     }
 
     if (live) {
@@ -4687,6 +4735,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ok: true,
       ...(messageId !== undefined ? { messageId } : {}),
       ...(messageIds !== undefined ? { messageIds } : {}),
+      ...(reactionRef !== undefined ? { reactionRef } : {}),
     }
   }
 
@@ -4729,6 +4778,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.skippedTurn = null
       logger.info(`[channels] ${live.keyId} skipped_by_tool reason=${JSON.stringify(reason)}`)
       armSilentTurnAck(live, 'skip_response')
+      void dropContinuationReactions(live)
       return
     }
     if (live.skippedTurn !== null && live.skippedTurn.turnSeq === live.turnSeq) {
@@ -5092,9 +5142,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         await postEmptyTurnFallback(live, 'empty_stop_after_tool_work_retries_exhausted')
         return
       }
+      // Explicit NO_REPLY normally records a deliberate choice to stay silent.
+      // Only the reminder iteration that consumed a willingness nudge is different:
+      // the turn-persistent nudge budget remains nonzero after a substantive result,
+      // so using it here would post a bogus fallback on a later unrelated reminder.
+      if (
+        isNoReplySignal(assistantText) &&
+        live.willingnessReminderIteration &&
+        live.successfulChannelSends === successfulSendsBeforePrompt &&
+        live.promptQueue.length === 0
+      ) {
+        await postEmptyTurnFallback(live, 'no_reply_after_willingness_nudge')
+        return
+      }
       const leakedReasoning = !isNoReplySignal(assistantText)
       logger.info(`[channels] ${live.keyId} no_reply${leakedReasoning ? ' (with_leaked_reasoning)' : ''}`)
       armSilentTurnAck(live, 'no_reply')
+      void dropContinuationReactions(live)
       return
     }
 
@@ -5322,6 +5386,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     clearQueuedEngageReactions(live)
     dropEngageReactions(live, live.currentTurnEngageReactions)
     live.currentTurnEngageReactions = []
+    void dropContinuationReactions(live)
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
     live.debounceTimer = null
     live.unsubProviderErrors?.()
@@ -6003,6 +6068,66 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           .catch((err) => {
             logger.info(
               `[channels] silent-ack-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
+            )
+          }),
+      ),
+    ).then(() => undefined)
+  }
+
+  const reactOnContinuationWillingness = (live: LiveSession, reactionRef: ReactionRef): void => {
+    const addResult = react({
+      adapter: live.key.adapter,
+      workspace: live.key.workspace,
+      chat: live.key.chat,
+      thread: live.key.thread,
+      reactionRef,
+      emoji: CONTINUATION_REACTION_EMOJI,
+    })
+    void addResult
+      .then((result) => {
+        if (!result.ok && result.code !== 'unsupported') {
+          logger.info(
+            `[channels] continuation-react failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
+          )
+        }
+      })
+      .catch((err) => {
+        logger.info(
+          `[channels] continuation-react threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
+        )
+      })
+    live.activeContinuationReactions.push(
+      addResult.then((result) => (result.ok ? (result.reactionRef ?? null) : null)).catch(() => null),
+    )
+  }
+
+  const dropContinuationReactions = (live: LiveSession): Promise<void> => {
+    const addPromises = live.activeContinuationReactions
+    if (addPromises.length === 0) return Promise.resolve()
+    live.activeContinuationReactions = []
+    return Promise.all(
+      addPromises.map((addPromise) =>
+        addPromise
+          .then((reactionRef) => {
+            if (reactionRef === null) return undefined
+            return removeReaction({
+              adapter: live.key.adapter,
+              workspace: live.key.workspace,
+              chat: live.key.chat,
+              thread: live.key.thread,
+              reactionRef,
+            })
+          })
+          .then((result) => {
+            if (result && !result.ok && result.code !== 'unsupported' && result.code !== 'not-found') {
+              logger.info(
+                `[channels] continuation-unreact failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
+              )
+            }
+          })
+          .catch((err) => {
+            logger.info(
+              `[channels] continuation-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
             )
           }),
       ),
