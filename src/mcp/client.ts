@@ -20,6 +20,11 @@ export type McpToolInfo = {
   fileOperands?: ToolFileOperands
 }
 
+// The wire key an MCP server sets on a tool's `_meta` to declare its operands.
+// `_meta` is an arbitrary record in the MCP spec and survives the server → wire
+// → client round-trip through the official SDK unchanged.
+export const MCP_FILE_OPERANDS_META_KEY = 'x-file-operands'
+
 // The SDK defaults each request to 60s; typeclaw boot should fail fast enough
 // that one dead MCP server does not make the agent feel hung at startup.
 export const DEFAULT_MCP_REQUEST_TIMEOUT_MS = 30_000
@@ -28,16 +33,48 @@ export const DEFAULT_MCP_CONNECT_TIMEOUT_MS = 15_000
 export type McpConnection = {
   name: string
   listTools(): Promise<McpToolInfo[]>
+  // Cache-only view of the last successful listTools(). Returns undefined until
+  // the catalog has been fetched once, and never performs I/O — the pre-execution
+  // file-operand preflight reads target metadata through this so resolving it can
+  // never spawn a stdio server or open an HTTP session before the security hooks run.
+  peekTools(): McpToolInfo[] | undefined
   refresh(): Promise<McpToolInfo[]>
   callTool(toolName: string, args?: Record<string, unknown>): Promise<CallToolResult>
   close(): Promise<void>
 }
 
-function readDeclaredFileOperands(meta: Record<string, unknown> | undefined): ToolFileOperands | undefined {
+const FILE_OPERAND_CATEGORIES = ['input', 'output', 'create', 'destructive', 'nonFile'] as const
+
+// Wire metadata is server-controlled, so it is parsed rather than cast: a
+// declaration like `{ nonFile: 'query' }` would otherwise reach the scanner as a
+// string and have `.includes()` grant a substring-wide exemption. Any malformed
+// recognized category discards the WHOLE declaration (fail closed) instead of
+// honoring the well-formed remainder, so a partially-corrupt payload can never
+// silently widen the scanned surface.
+export function parseDeclaredFileOperands(meta: Record<string, unknown> | undefined): ToolFileOperands | undefined {
   if (typeof meta !== 'object' || meta === null) return undefined
-  const declared = meta['x-file-operands']
-  if (typeof declared !== 'object' || declared === null) return undefined
-  return declared as ToolFileOperands
+  const declared = meta[MCP_FILE_OPERANDS_META_KEY]
+  if (typeof declared !== 'object' || declared === null || Array.isArray(declared)) return undefined
+
+  const parsed: Record<string, readonly string[]> = {}
+  const claimed = new Set<string>()
+  for (const category of FILE_OPERAND_CATEGORIES) {
+    const value = (declared as Record<string, unknown>)[category]
+    if (value === undefined) continue
+    if (!Array.isArray(value)) return undefined
+    if (!value.every((entry) => typeof entry === 'string' && entry.trim() !== '')) return undefined
+    // One operand path cannot be two things at once, and the combinations are
+    // not merely redundant but contradictory: `nonFile` claims a value is never
+    // dereferenced locally while `input` claims it is a real file to snapshot.
+    // Resolving such a conflict by precedence would make the effective policy
+    // depend on category order, so reject the declaration instead.
+    for (const operandPath of value as string[]) {
+      if (claimed.has(operandPath)) return undefined
+      claimed.add(operandPath)
+    }
+    parsed[category] = [...(value as string[])]
+  }
+  return Object.keys(parsed).length === 0 ? undefined : (parsed as ToolFileOperands)
 }
 
 export type McpSdkClient = {
@@ -120,12 +157,15 @@ export function createMcpConnection(
         signal: opts.signal,
       })
       tools.push(
-        ...result.tools.map((tool) => ({
-          name: tool.name,
-          description: tool.description ?? '',
-          inputSchema: tool.inputSchema,
-          fileOperands: readDeclaredFileOperands(tool._meta),
-        })),
+        ...result.tools.map((tool) => {
+          const fileOperands = parseDeclaredFileOperands(tool._meta)
+          return {
+            name: tool.name,
+            description: tool.description ?? '',
+            inputSchema: tool.inputSchema,
+            ...(fileOperands === undefined ? {} : { fileOperands }),
+          }
+        }),
       )
       cursor = result.nextCursor
     } while (cursor !== undefined)
@@ -140,8 +180,13 @@ export function createMcpConnection(
       if (cachedTools !== undefined) return cachedTools
       return fetchTools()
     },
+    peekTools(): McpToolInfo[] | undefined {
+      return cachedTools
+    },
+    // fetchTools never reads the cache, so the previous catalog is kept until a
+    // replacement is in hand: a failed or in-flight refresh must not blank out the
+    // metadata that peekTools() serves to the pre-execution operand preflight.
     refresh(): Promise<McpToolInfo[]> {
-      cachedTools = undefined
       return fetchTools()
     },
     callTool(toolName: string, args?: Record<string, unknown>): Promise<CallToolResult> {
