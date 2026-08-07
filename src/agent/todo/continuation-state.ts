@@ -81,7 +81,9 @@ export function onTurnStart(state: ContinuationState, isRealUserTurn: boolean): 
 // consumed here regardless — so a later genuine user abort still arms D1.
 export function onTurnOutcome(state: ContinuationState, outcome: TurnOutcome): ContinuationState {
   const next: ContinuationState = { ...state, lastTurnOutcome: outcome, restartAbortPending: false }
-  if (outcome.stopReason === 'aborted' && !state.restartAbortPending) {
+  const isSafeTerminalReplyAbort =
+    outcome.stopReason === 'aborted' && outcome.termination === 'terminal-after-channel-reply'
+  if (outcome.stopReason === 'aborted' && !state.restartAbortPending && !isSafeTerminalReplyAbort) {
     next.autoResumeBlockedUntilRealUserTurn = true
   }
   return next
