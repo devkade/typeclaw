@@ -66,7 +66,7 @@ function matchesKoreanClaim(text: string): boolean {
   for (const phrase of KO_PHRASES) {
     for (const index of phraseIndexes(text, phrase)) {
       if (claimIsQuestion(text, index) || claimHasPastOrAttributedContext(text, index)) continue
-      const prefix = text.slice(Math.max(0, index - 24), index)
+      const prefix = text.slice(Math.max(latestSentenceBoundary(text, index) + 1, index - 24), index)
       if (KOREAN_OTHER_SUBJECT.test(prefix) && !KOREAN_FIRST_PERSON_SUBJECT.test(prefix)) continue
       return true
     }
@@ -108,9 +108,13 @@ function earliestIndex(text: string, needles: readonly string[], offset: number)
 }
 
 function claimHasPastOrAttributedContext(text: string, claimIndex: number): boolean {
-  const sentenceStart = Math.max(...SENTENCE_TERMINATORS.map((terminator) => text.lastIndexOf(terminator, claimIndex)))
+  const sentenceStart = latestSentenceBoundary(text, claimIndex)
   const prefix = text.slice(sentenceStart + 1, claimIndex)
   return HISTORICAL_MARKERS.some((marker) => prefix.includes(marker)) || ATTRIBUTION_END.test(prefix)
+}
+
+function latestSentenceBoundary(text: string, offset: number): number {
+  return Math.max(...SENTENCE_TERMINATORS.map((terminator) => text.lastIndexOf(terminator, offset)))
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -252,6 +256,7 @@ const NON_ASSERTED_SPAN_PATTERNS: readonly RegExp[] = [
   /```[\s\S]*?```/gu,
   /`[^`\r\n]*`/gu,
   /"[^"\r\n]*"/gu,
+  /(?<![\p{L}\p{N}])'[^'\r\n]+'(?![\p{L}\p{N}])/gu,
   /“[^”\r\n]*”/gu,
   /‘[^’\r\n]*’/gu,
   /「[^」\r\n]*」/gu,

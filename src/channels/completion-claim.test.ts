@@ -72,6 +72,7 @@ describe('checkCompletionClaim', () => {
 
   test.each([
     'The warning "I fixed it" is inaccurate.',
+    "The warning 'I fixed it' is inaccurate.",
     'The warning “I fixed it” is inaccurate.',
     'The warning 「I fixed it」 is inaccurate.',
     'The warning 『I fixed it』 is inaccurate.',
@@ -80,6 +81,20 @@ describe('checkCompletionClaim', () => {
   ])('allows completion-shaped text inside quotation or code spans: %s', (text) => {
     expect(checkCompletionClaim({ text, qualifyingWorkObserved: false }).kind).toBe('allow')
   })
+
+  test.each(["I've fixed it", "je l'ai enregistré", "l'ho salvato"])(
+    'does not mistake a contraction apostrophe for a quotation span: %s',
+    (text) => {
+      expect(checkCompletionClaim({ text, qualifyingWorkObserved: false }).kind).toBe('block')
+    },
+  )
+
+  test.each(['상류 시스템이 끝냈어. 반영했어', '상류 시스템이 끝냈어。반영했어', '상류 시스템이 끝냈어\n반영했어'])(
+    'does not carry a Korean third-person subject across a sentence boundary: %s',
+    (text) => {
+      expect(checkCompletionClaim({ text, qualifyingWorkObserved: false }).kind).toBe('block')
+    },
+  )
 })
 
 describe('isQualifyingWorkResult', () => {
