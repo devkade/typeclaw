@@ -40,14 +40,10 @@ const PROVIDER_TO_MODELS_DEV: Record<KnownProviderId, string | null> = {
   deepseek: 'deepseek',
   // models.dev has listed Upstage since 2025-07-09 (solar-pro2 + solar-mini,
   // then solar-pro3 on 2026-01-13 and solar-pro4 on 2026-08-06), so this
-  // mapping hits rather than misses. `buildOption` prefers upstream
-  // name/reasoning/limits, so the picker can show numbers that disagree with
-  // `providers.ts`. Display-only: `customModelMetaFromOption` returns
-  // undefined for known refs, so `resolveModel` still serves the curated
-  // record — including the `thinkingLevelMap` and `compat` that Upstage's
-  // wire format depends on and models.dev has no field for. solar-open2 is
-  // partner-program only and still absent upstream, so it keeps surfacing
-  // curated.
+  // mapping hits rather than misses — harmless either way, since `buildOption`
+  // lets upstream fill gaps but never override the curated Solar records, and
+  // those specify every field. solar-open2 is partner-program only and still
+  // absent upstream, so it surfaces curated.
   upstage: 'upstage',
   moonshot: 'moonshot',
   // moonshot-coding (Kimi Code subscription) is a billing surface, not a
@@ -310,6 +306,19 @@ type BuildOptionOpts = {
   upstream?: ModelsDevModel
 }
 
+// The curated record wins every field it specifies; upstream only fills gaps.
+// A known ref always resolves to the curated record at runtime — `resolveModel`
+// reads `KNOWN_PROVIDERS`, never models.dev, and `customModelMetaFromOption`
+// declines to persist metadata for known refs — so letting upstream win here
+// only desynchronized the picker from the model it was describing. It showed in
+// what `formatModelLabel`/`formatModelHint` render (name, context, reasoning):
+// models.dev names solar-pro3/pro2/mini with their bare ids, so the picker
+// offered "solar-pro3" where the curated record says "Solar Pro 3". maxTokens
+// and cost reach no surface today, so aligning them is consistency within the
+// record, not a visible fix. `supportsVision` already resolved this way (see
+// `resolveInput`, and the note on `ModelOption.supportsVision`); this extends
+// the rule to the rest. Refs we do not curate still take everything from
+// upstream, which is the whole point of merging it in.
 function buildOption(ref: ModelRef | string, opts: BuildOptionOpts): ModelOption {
   const providerId = providerForModelRef(ref)
   const modelId = ref.slice(providerId.length + 1)
@@ -323,6 +332,7 @@ function buildOption(ref: ModelRef | string, opts: BuildOptionOpts): ModelOption
         maxTokens?: number
         reasoning?: boolean
         input?: ReadonlyArray<string>
+        cost?: ModelOptionCost
       }
     >
   )[modelId]
@@ -332,11 +342,11 @@ function buildOption(ref: ModelRef | string, opts: BuildOptionOpts): ModelOption
     providerId,
     providerName: provider.name,
     modelId,
-    modelName: opts.upstream?.name ?? curatedModel?.name ?? modelId,
-    reasoning: opts.upstream?.reasoning ?? curatedModel?.reasoning ?? false,
-    contextWindow: opts.upstream?.limit?.context ?? curatedModel?.contextWindow ?? null,
-    maxTokens: opts.upstream?.limit?.output ?? curatedModel?.maxTokens ?? null,
-    cost: resolveCost(opts.upstream?.cost),
+    modelName: curatedModel?.name ?? opts.upstream?.name ?? modelId,
+    reasoning: curatedModel?.reasoning ?? opts.upstream?.reasoning ?? false,
+    contextWindow: curatedModel?.contextWindow ?? opts.upstream?.limit?.context ?? null,
+    maxTokens: curatedModel?.maxTokens ?? opts.upstream?.limit?.output ?? null,
+    cost: curatedModel?.cost ?? resolveCost(opts.upstream?.cost),
     curated: opts.curated,
     supportsVision: input.includes('image'),
   }

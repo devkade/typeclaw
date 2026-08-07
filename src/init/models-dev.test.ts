@@ -68,7 +68,7 @@ describe('fetchModelOptions', () => {
   })
 
   test('merges live data with curated entries when fetch succeeds', async () => {
-    // given: a stub response with a richer name for one curated model and a new upstream model.
+    // given: a stub response with a rival name for one curated model and a new upstream model.
     const stub = {
       openai: {
         id: 'openai',
@@ -110,7 +110,7 @@ describe('fetchModelOptions', () => {
 
     expect(result.source).toBe('models.dev')
     const nano = result.options.find((o) => o.ref === 'openai/gpt-5.4-nano')
-    expect(nano?.modelName).toBe('GPT-5.4 nano (live)')
+    expect(nano?.modelName).toBe('GPT-5.4 nano')
     const live = result.options.find((o) => o.ref === 'openai/gpt-6-live')
     expect(live).toMatchObject({
       modelName: 'GPT-6 Live',
@@ -125,6 +125,82 @@ describe('fetchModelOptions', () => {
     expect(result.options.some((o) => o.modelName === 'Invalid')).toBe(false)
     // kimi-k2p6-turbo is curated-only; must still appear even though models.dev didn't list it.
     expect(result.options.some((o) => o.modelId === 'accounts/fireworks/routers/kimi-k2p6-turbo')).toBe(true)
+  })
+
+  test('a curated record outranks contradicting models.dev metadata on every field', async () => {
+    // The picker has to describe what `resolveModel` will actually serve, and
+    // that is always the curated record for a known ref. Upstream disagreeing
+    // is the normal case, not an anomaly: models.dev names solar-pro3 with its
+    // bare id and caps its output at 8192, where providers.ts says "Solar Pro
+    // 3" and 32000.
+    const fetchImpl = routedFetch({
+      [MODELS_DEV_URL]: {
+        openai: {
+          id: 'openai',
+          name: 'OpenAI',
+          models: {
+            'gpt-5.4-nano': {
+              id: 'gpt-5.4-nano',
+              name: 'GPT-5.4 nano (live)',
+              reasoning: false,
+              modalities: { input: ['text'], output: ['text'] },
+              limit: { context: 111111, output: 2222 },
+              cost: { input: 9.99, output: 9.99, cache_read: 9.99, cache_write: 9.99 },
+            },
+          },
+        },
+      },
+      [OPENGATEWAY_CATALOG_URL]: new Error('gateway catalog down'),
+      [OPENGATEWAY_PRICES_URL]: new Error('gateway prices down'),
+    })
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    expect(result.options.find((o) => o.ref === 'openai/gpt-5.4-nano')).toMatchObject({
+      modelName: 'GPT-5.4 nano',
+      reasoning: true,
+      supportsVision: true,
+      contextWindow: 400000,
+      maxTokens: 128000,
+      cost: { input: 0.2, output: 1.25, cacheRead: 0.02, cacheWrite: 0 },
+    })
+  })
+
+  test('upstream still supplies every field for a ref we do not curate', async () => {
+    // The flip to curated-first must not starve uncurated models, which have no
+    // curated record to read and would otherwise lose their metadata entirely.
+    const fetchImpl = routedFetch({
+      [MODELS_DEV_URL]: {
+        openai: {
+          id: 'openai',
+          name: 'OpenAI',
+          models: {
+            'gpt-6-live': {
+              id: 'gpt-6-live',
+              name: 'GPT-6 Live',
+              reasoning: true,
+              modalities: { input: ['text', 'image'], output: ['text'] },
+              limit: { context: 500000, output: 64000 },
+              cost: { input: 1, output: 2, cache_read: 0.1, cache_write: 0.2 },
+            },
+          },
+        },
+      },
+      [OPENGATEWAY_CATALOG_URL]: new Error('gateway catalog down'),
+      [OPENGATEWAY_PRICES_URL]: new Error('gateway prices down'),
+    })
+
+    const result = await fetchModelOptions({ fetchImpl })
+
+    expect(result.options.find((o) => o.ref === 'openai/gpt-6-live')).toMatchObject({
+      modelName: 'GPT-6 Live',
+      curated: false,
+      reasoning: true,
+      supportsVision: true,
+      contextWindow: 500000,
+      maxTokens: 64000,
+      cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2 },
+    })
   })
 
   test('never synthesizes bare models.dev ids onto opengateway, which requires a creator prefix', async () => {
