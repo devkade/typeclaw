@@ -28,6 +28,7 @@ import type { CreateChannelRouterOptions } from './router'
 import {
   CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS,
   CHANNEL_MAX_OUTPUT_TOKENS,
+  CONTINUATION_REACTION_EMOJI,
   createChannelRouter,
   disengageReactionEmojiFor,
   DUPLICATE_SEND_ERROR,
@@ -13681,22 +13682,23 @@ describe('ChannelRouter continuation willingness nudge', () => {
     session.setAssistantMidTurn(replyText, 'aborted')
   }
 
-  test('queues a nudge when a terminal reply promises to continue without more_work_this_turn:true', async () => {
+  test('posts a fallback when the willingness nudge ends in explicit NO_REPLY', async () => {
     const dir = await tempDir()
+    const logs: string[] = []
     const sent: string[] = []
-    const { router, sessions } = makeRouter(dir)
+    const { router, sessions } = makeRouter(dir, { logs })
     router.registerOutbound('discord-bot', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
 
-    await router.route(inbound({ text: '다시 확인해봐' }))
+    await router.route(inbound({ text: 'check it again' }))
     let attempt = 0
     sessions[0]!.onPrompt = async (text) => {
       attempt++
       // given: first turn replies with a continuation promise (no more_work_this_turn:true)
       if (attempt === 1) {
-        await replyTurn(sessions[0]!, router, '바로 계속 확인하겠습니다')
+        await replyTurn(sessions[0]!, router, "I'll keep checking on that now.")
         return
       }
       // then: the nudge arrives as a reminder-only re-prompt; now do the work
@@ -13706,6 +13708,51 @@ describe('ChannelRouter continuation willingness nudge', () => {
     await router.__testing!.flushDebounce(KEY)
 
     expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent).toEqual(["I'll keep checking on that now.", EMPTY_TURN_FALLBACK_TEXT])
+    expect(logs.some((m) => m.includes('empty_turn_fallback cause=no_reply_after_willingness_nudge'))).toBe(true)
+  })
+
+  test('does not post a fallback for NO_REPLY from a later unrelated reminder after the promised result', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const laterReminder = '<system-reminder>Perform unrelated turn cleanup.</system-reminder>'
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'check it again' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async (text) => {
+      attempt++
+      if (attempt === 1) {
+        await replyTurn(sessions[0]!, router, "I'll keep checking on that now.")
+        return
+      }
+      if (attempt === 2) {
+        expect(text).toContain(WILLINGNESS_NUDGE)
+        sessions[0]!.setAssistantText('SENT')
+        await router.send({
+          adapter: 'discord-bot',
+          workspace: 'g1',
+          chat: 'c1',
+          text: 'The cause was a permission setting.',
+        })
+        router.__testing!.injectContinuationReminder(KEY, laterReminder)
+        return
+      }
+      expect(text).toContain(laterReminder)
+      expect(text).not.toContain(WILLINGNESS_NUDGE)
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(3)
+    expect(sent).toEqual(["I'll keep checking on that now.", 'The cause was a permission setting.'])
+    expect(sent).not.toContain(EMPTY_TURN_FALLBACK_TEXT)
+    expect(logs.some((m) => m.includes('empty_turn_fallback cause=no_reply_after_willingness_nudge'))).toBe(false)
   })
 
   test('does NOT queue a nudge for a final reply with no continuation intent', async () => {
@@ -13737,6 +13784,274 @@ describe('ChannelRouter continuation willingness nudge', () => {
     await router.__testing!.flushDebounce(KEY)
 
     expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+})
+
+describe('ChannelRouter continuation willingness reaction', () => {
+  const WILLINGNESS_REPLY = "I'll check the exact failure message and work out what was blocked."
+  const TARGET_REF: ReactionRef = { adapter: 'discord-bot', value: 'outbound-target' }
+  const INSTANCE_REF: ReactionRef = { adapter: 'discord-bot', value: 'continuation-instance' }
+
+  function terminalReplyContext(replyText: string): AfterToolCallContext {
+    return {
+      assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
+      toolCall: {
+        type: 'toolCall',
+        id: 'tc-continuation',
+        name: 'channel_reply',
+        arguments: { text: replyText },
+      } as AfterToolCallContext['toolCall'],
+      args: { text: replyText },
+      result: {
+        content: [{ type: 'text' as const, text: 'ignored' }],
+        details: { ok: true },
+      } as AfterToolCallContext['result'],
+      isError: false,
+      context: { systemPrompt: '', messages: [], tools: [] },
+    }
+  }
+
+  async function sendTerminalWillingness(
+    session: FakeSession,
+    router: ChannelRouter,
+    text: string = WILLINGNESS_REPLY,
+  ): Promise<void> {
+    await session.agent.afterToolCall!(terminalReplyContext(text))
+    await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text })
+    session.setAssistantMidTurn(text, 'aborted')
+  }
+
+  test('adds an hourglass to the agent own willingness message', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const added: ReactionRequest[] = []
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
+    router.registerReaction('discord-bot', async (req) => {
+      added.push(req)
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+
+    await router.route(inbound({ text: 'look at it again' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    await waitFor(() => added.length === 1)
+    expect(added[0]).toMatchObject({
+      adapter: 'discord-bot',
+      chat: 'c1',
+      emoji: CONTINUATION_REACTION_EMOJI,
+      reactionRef: TARGET_REF,
+    })
+  })
+
+  test('retires the hourglass when a substantive follow-up lands', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const removed: ReactionRef[] = []
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
+    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'tell me the result too' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      await router.send({
+        adapter: 'discord-bot',
+        workspace: 'g1',
+        chat: 'c1',
+        text: 'The block came from a missing permission.',
+      })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([INSTANCE_REF])
+  })
+
+  test('retires the hourglass when the promised turn falls back', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const removed: ReactionRef[] = []
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async (msg) =>
+      msg.text === EMPTY_TURN_FALLBACK_TEXT
+        ? { ok: false, error: 'fallback delivery failed' }
+        : { ok: true, reactionRef: TARGET_REF },
+    )
+    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'please check' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt === 1) {
+        await sendTerminalWillingness(sessions[0]!, router)
+        return
+      }
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([INSTANCE_REF])
+  })
+
+  test('retires the hourglass on a final NO_REPLY', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const removed: ReactionRef[] = []
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
+    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'please check' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([INSTANCE_REF])
+  })
+
+  test('does not react when the send result omits a reaction target ref', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const added: ReactionRequest[] = []
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerReaction('discord-bot', async (req) => {
+      added.push(req)
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+
+    await router.route(inbound({ text: 'please check' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(added).toHaveLength(0)
+  })
+
+  test('stays a no-op when the adapter has no reaction callback', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const removed: ReactionRef[] = []
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'please check' }))
+    sessions[0]!.onPrompt = async () => {
+      const status = await router.send({
+        adapter: 'discord-bot',
+        workspace: 'g1',
+        chat: 'c1',
+        text: WILLINGNESS_REPLY,
+      })
+      const answer = await router.send({
+        adapter: 'discord-bot',
+        workspace: 'g1',
+        chat: 'c1',
+        text: 'It turned out to be a permissions problem.',
+      })
+      expect(status.ok).toBe(true)
+      expect(answer.ok).toBe(true)
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(removed).toHaveLength(0)
+  })
+
+  test('cleanup waits for an unresolved hourglass add before removing it', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const removed: ReactionRef[] = []
+    let releaseAdd: (() => void) | undefined
+    const addGate = new Promise<void>((resolve) => {
+      releaseAdd = resolve
+    })
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
+    router.registerReaction('discord-bot', async () => {
+      await addGate
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'please check' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'That check is done.' })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(removed).toHaveLength(0)
+
+    releaseAdd!()
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([INSTANCE_REF])
+  })
+
+  test('one substantive result retires every pending willingness status', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const removed: ReactionRef[] = []
+    let outboundCount = 0
+    router.setTypingCapability('discord-bot', true)
+    router.registerOutbound('discord-bot', async () => {
+      outboundCount++
+      return {
+        ok: true,
+        reactionRef: { adapter: 'discord-bot', value: `outbound-${outboundCount}` },
+      }
+    })
+    router.registerReaction('discord-bot', async (req) => ({
+      ok: true,
+      reactionRef: { adapter: 'discord-bot', value: `instance-${req.reactionRef.value}` },
+    }))
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'keep me posted' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: "I'll check the logs too." })
+      await router.send({
+        adapter: 'discord-bot',
+        workspace: 'g1',
+        chat: 'c1',
+        text: 'Both logs showed the same permission error.',
+      })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    await waitFor(() => removed.length === 2)
+    expect(removed.map((ref) => ref.value).sort()).toEqual(['instance-outbound-1', 'instance-outbound-2'])
   })
 })
 
@@ -13860,7 +14175,7 @@ describe('ChannelRouter channel_send willingness nudge', () => {
       return { ok: true }
     })
 
-    await router.route(inbound({ text: '확인해줘' }))
+    await router.route(inbound({ text: 'please check' }))
     let attempt = 0
     sessions[0]!.onPrompt = async () => {
       attempt++
@@ -14006,7 +14321,7 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
       return { ok: true }
     })
 
-    await router.route(inbound({ text: '확인해줘' }))
+    await router.route(inbound({ text: 'please check' }))
     let attempt = 0
     sessions[0]!.onPrompt = async () => {
       attempt++
@@ -14099,7 +14414,7 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
       return { ok: true }
     })
 
-    await router.route(inbound({ text: '확인해줘' }))
+    await router.route(inbound({ text: 'please check' }))
     let attempt = 0
     sessions[0]!.onPrompt = async () => {
       attempt++
@@ -14127,7 +14442,7 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
       return { ok: true }
     })
 
-    await router.route(inbound({ text: '확인해줘' }))
+    await router.route(inbound({ text: 'please check' }))
     let attempt = 0
     sessions[0]!.onPrompt = async () => {
       attempt++

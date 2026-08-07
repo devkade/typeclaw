@@ -106,6 +106,7 @@ export function createSlackOutboundCallback(deps: {
         const filename = attachment.filename ?? basename(path)
         await deps.client.uploadFile([msg.chat], buffer, filename)
       }
+      // The user-account SDK send APIs return no posted-message id, so no reaction target ref is available.
       return { ok: true }
     } catch (err) {
       const message = describeError(err)

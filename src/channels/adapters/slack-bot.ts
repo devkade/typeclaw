@@ -56,7 +56,11 @@ import {
 } from './slack-bot-classify'
 import { createSlackDedupe } from './slack-bot-dedupe'
 import { createSlackEditMessageCallback } from './slack-bot-edit'
-import { createSlackReactionCallback, createSlackRemoveReactionCallback } from './slack-bot-reactions'
+import {
+  createSlackReactionCallback,
+  createSlackRemoveReactionCallback,
+  encodeSlackReactionRef,
+} from './slack-bot-reactions'
 import { enrichSlackReferenceContext } from './slack-bot-reference'
 import {
   buildSlashAckPayload,
@@ -1006,7 +1010,12 @@ export function createOutboundCallback(deps: {
           if (threadTs === null && chunks.length > 1) threadTs = sent.ts
         }
         if (typingTracker) await typingTracker.clearAfterSend(msg.chat, msg.typingThread ?? msg.thread)
-        return { ok: true, messageId: sentTs[0], messageIds: sentTs }
+        return {
+          ok: true,
+          messageId: sentTs[0],
+          messageIds: sentTs,
+          reactionRef: encodeSlackReactionRef({ channel: msg.chat, ts: sentTs[0]! }),
+        }
       } catch (err) {
         const message = describeError(err)
         logger.error(`[slack-bot] postMessage failed: ${message}`)

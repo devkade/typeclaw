@@ -30,6 +30,7 @@ import {
   DISCORD_HISTORY_LIMIT_MAX,
   DISCORD_SLASH_COMMAND_NAMES,
 } from './discord-bot'
+import { encodeDiscordReactionRef } from './discord-bot-reactions'
 import { DISCORD_SLASH_COMMAND_TYPE_CHAT_INPUT } from './discord-bot-slash-commands'
 
 const provenanceConfig: ChannelAdapterConfig = {
@@ -1708,7 +1709,12 @@ describe('discord-bot createOutboundCallback', () => {
     // when
     const result = await cb(makeMsg({ text: 'hello' }))
     // then
-    expect(result).toEqual({ ok: true, messageId: 'm1', messageIds: ['m1'] })
+    expect(result).toEqual({
+      ok: true,
+      messageId: 'm1',
+      messageIds: ['m1'],
+      reactionRef: encodeDiscordReactionRef({ channel: 'c1', message: 'm1' }),
+    })
     expect(uploads).toHaveLength(0)
     expect(sends).toEqual([{ chat: 'c1', content: 'hello', options: undefined }])
   })

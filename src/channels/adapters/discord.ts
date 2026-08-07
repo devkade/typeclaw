@@ -108,6 +108,7 @@ export function createDiscordOutboundCallback(deps: {
           await deps.client.sendMessage(msg.chat, chunk, replyOption(index === 0 ? replyTo : undefined))
         }
       }
+      // The user-account SDK send APIs return no posted-message id, so no reaction target ref is available.
       return { ok: true }
     } catch (err) {
       const message = describeError(err)
