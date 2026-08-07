@@ -68,6 +68,15 @@ describe('createDiscordReactionCallback', () => {
     expect(calls[0]!.emoji).toBe('👍')
   })
 
+  it('maps the continuation hourglass name to unicode', async () => {
+    const calls: AddCall[] = []
+    const cb = createDiscordReactionCallback({
+      client: { addReaction: async (channel, message, emoji) => void calls.push({ channel, message, emoji }) },
+    })
+    await cb(addReq('hourglass_flowing_sand'))
+    expect(calls[0]!.emoji).toBe('⏳')
+  })
+
   it('rejects an unmapped emoji name as unsupported without calling the SDK', async () => {
     let called = false
     const cb = createDiscordReactionCallback({
