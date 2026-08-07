@@ -17,6 +17,7 @@ import {
 } from '@/agent/restart-handoff'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { readContinuationState } from '@/agent/todo/continuation-state'
+import { recordTurnOutcome } from '@/agent/todo/continuation-wiring'
 import { resolveTodoScope } from '@/agent/todo/scope'
 import { writeTodos } from '@/agent/todo/store'
 import type { PermissionService } from '@/permissions'
@@ -13797,31 +13798,59 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     expect(continuationObservedCompletedWrite).toBe(true)
   })
 
-  test('a rejected outcome write does not prevent the next write from running', async () => {
+  test('a rejected outcome write skips continuation for that turn and recovers on the next turn', async () => {
     const dir = await tempDir()
+    const origin: SessionOrigin = {
+      kind: 'channel',
+      adapter: KEY.adapter,
+      workspace: KEY.workspace,
+      chat: KEY.chat,
+      thread: KEY.thread,
+      participants: [],
+    }
+    const scope = resolveTodoScope(origin)!
+    await writeTodos(dir, scope, [{ content: 'finish later', status: 'pending' }])
+    await recordTurnOutcome({
+      agentDir: dir,
+      origin,
+      turnId: 'ses_fake_1',
+      stopReason: 'stop',
+    })
     let outcomeWrites = 0
-    let writesObservedAtContinuation = 0
+    let continuationRuns = 0
     const { router, sessions } = makeRouter(dir, {
-      recordTurnOutcome: async () => {
+      recordTurnOutcome: async (args) => {
         outcomeWrites++
         if (outcomeWrites === 1) throw new Error('first write failed')
+        await recordTurnOutcome(args)
       },
       runIdleContinuation: async () => {
-        writesObservedAtContinuation = outcomeWrites
+        continuationRuns++
         return false
       },
     })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
 
-    await router.route(inbound({ text: 'survive a write failure' }))
+    await router.route(inbound({ text: 'stop this work' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopped.' })
+      sessions[0]!.setAssistantMidTurn('Stopped.', 'aborted')
+      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(outcomeWrites).toBe(1)
+    expect(continuationRuns).toBe(0)
+
+    await router.route(inbound({ text: 'try a new turn' }))
     sessions[0]!.onPrompt = () => {
       sessions[0]!.setAssistantText('NO_REPLY')
-      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('first') })
       sessions[0]!.emit({ type: 'message_end', message: assistantMessage('second') })
     }
     await router.__testing!.flushDebounce(KEY)
 
     expect(outcomeWrites).toBe(2)
-    expect(writesObservedAtContinuation).toBe(2)
+    expect(continuationRuns).toBe(1)
   })
 })
 

@@ -1232,10 +1232,10 @@ type LiveSession = {
   unsubProviderErrors: (() => void) | null
   unsubTypingActivity: (() => void) | null
   unsubTodoOutcome: (() => void) | null
-  // Serializes message_end outcome persistence. The drain awaits this before
-  // continuation reads the state, and each rejection is recovered so one disk
-  // failure cannot poison every later turn in this live session.
-  todoOutcomeWrite: Promise<void>
+  // Serializes outcome persistence. The tail always fulfills so one disk
+  // failure cannot poison every later turn; its value separately reports
+  // whether the latest write succeeded before continuation reads state.
+  todoOutcomeWrite: Promise<boolean>
 }
 
 // `event` is null for command invocations that originated outside the inbound
@@ -2355,7 +2355,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         unsubProviderErrors: null,
         unsubTypingActivity: null,
         unsubTodoOutcome: null,
-        todoOutcomeWrite: Promise.resolve(),
+        todoOutcomeWrite: Promise.resolve(true),
       }
       // Raw text is logged on EVERY attempt for operators; the user-facing
       // notice is deferred. The upstream SDK retries internally, and each retry
@@ -2389,9 +2389,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           ...(termination !== undefined ? { termination } : {}),
           ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
         }
-        live.todoOutcomeWrite = live.todoOutcomeWrite
-          .then(() => (options.recordTurnOutcome ?? recordTurnOutcome)(outcomeArgs))
-          .catch((err) => logger.error(`[channels] ${live.keyId}: todo outcome capture failed: ${describeError(err)}`))
+        enqueueTodoOutcomeWrite(live, outcomeArgs)
       })
       live.unsubTypingActivity = subscribeTypingActivity(created.session, live)
       installChannelReplyTerminalHook(live)
@@ -3010,6 +3008,31 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  const enqueueTodoOutcomeWrite = (
+    live: LiveSession,
+    args: Parameters<typeof recordTurnOutcome>[0],
+  ): Promise<boolean> => {
+    const write = live.todoOutcomeWrite.then(async () => {
+      try {
+        await (options.recordTurnOutcome ?? recordTurnOutcome)(args)
+        return true
+      } catch (err) {
+        logger.error(`[channels] ${live.keyId}: todo outcome capture failed: ${describeError(err)}`)
+        return false
+      }
+    })
+    live.todoOutcomeWrite = write
+    return write
+  }
+
+  const awaitLatestTodoOutcomeWrite = async (live: LiveSession): Promise<boolean> => {
+    while (true) {
+      const write = live.todoOutcomeWrite
+      const succeeded = await write
+      if (write === live.todoOutcomeWrite) return succeeded
+    }
+  }
+
   const fireSessionEnd = async (live: LiveSession): Promise<void> => {
     if (!live.hooks) return
     try {
@@ -3260,7 +3283,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.policyDeniedToolSendsThisTurn.clear()
         resetReviewTurn(live.sessionId)
         const isRealUserTurn = batch.length > 0
-        await live.todoOutcomeWrite
+        await awaitLatestTodoOutcomeWrite(live)
         await recordTodoTurnStart(live, isRealUserTurn)
         const retrievalQuery = composeRetrievalQuery(batch)
         // A fresh real-user batch opens a new logical turn. Capture its question
@@ -3407,8 +3430,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           await fireSessionTurnEnd(live)
         }
         await fireSessionIdle(live)
-        await live.todoOutcomeWrite
-        await maybeContinueTodosChannel(live)
+        const outcomeWriteSucceeded = await awaitLatestTodoOutcomeWrite(live)
+        if (!outcomeWriteSucceeded) {
+          logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
+        } else {
+          await maybeContinueTodosChannel(live)
+        }
         await resolveStagedFallback(live)
         live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
         if (live.currentTurnAuthorId !== null) {
