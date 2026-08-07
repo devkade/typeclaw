@@ -1232,6 +1232,10 @@ type LiveSession = {
   unsubProviderErrors: (() => void) | null
   unsubTypingActivity: (() => void) | null
   unsubTodoOutcome: (() => void) | null
+  // Serializes message_end outcome persistence. The drain awaits this before
+  // continuation reads the state, and each rejection is recovered so one disk
+  // failure cannot poison every later turn in this live session.
+  todoOutcomeWrite: Promise<void>
 }
 
 // `event` is null for command invocations that originated outside the inbound
@@ -1606,6 +1610,9 @@ export type CreateChannelRouterOptions = {
   // than pre-seeding pendingSystemReminders from onPrompt (which would pass even if
   // the resolver moved ahead of the continuation).
   runIdleContinuation?: typeof runIdleContinuation
+  // Test seam for holding an outcome write open and asserting drain ordering.
+  // Production always uses the real persistence function.
+  recordTurnOutcome?: typeof recordTurnOutcome
   // Test seam: override the ensureLive watchdog ceiling so the timeout path
   // is exercisable in <100ms instead of the 30s production default.
   ensureLiveTimeoutMs?: number
@@ -2348,6 +2355,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         unsubProviderErrors: null,
         unsubTypingActivity: null,
         unsubTodoOutcome: null,
+        todoOutcomeWrite: Promise.resolve(),
       }
       // Raw text is logged on EVERY attempt for operators; the user-facing
       // notice is deferred. The upstream SDK retries internally, and each retry
@@ -2365,13 +2373,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.unsubTodoOutcome = created.session.subscribe((event: unknown) => {
         const usage = extractTurnUsage(event)
         if (usage === null) return
-        void recordTurnOutcome({
+        const stampedAbort = live.abortReasonThisTurn
+        const termination: 'terminal-after-channel-reply' | undefined =
+          usage.stopReason === 'aborted' &&
+          stampedAbort?.turnSeq === live.turnSeq &&
+          stampedAbort.reason === 'terminal_after_channel_reply'
+            ? 'terminal-after-channel-reply'
+            : undefined
+        if (stampedAbort?.turnSeq === live.turnSeq) live.abortReasonThisTurn = null
+        const outcomeArgs = {
           agentDir: options.agentDir,
           origin: buildLiveOrigin(live),
           turnId: live.sessionId,
           stopReason: usage.stopReason,
+          ...(termination !== undefined ? { termination } : {}),
           ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
-        }).catch((err) => logger.error(`[channels] ${live.keyId}: todo outcome capture failed: ${describeError(err)}`))
+        }
+        live.todoOutcomeWrite = live.todoOutcomeWrite
+          .then(() => (options.recordTurnOutcome ?? recordTurnOutcome)(outcomeArgs))
+          .catch((err) => logger.error(`[channels] ${live.keyId}: todo outcome capture failed: ${describeError(err)}`))
       })
       live.unsubTypingActivity = subscribeTypingActivity(created.session, live)
       installChannelReplyTerminalHook(live)
@@ -3240,6 +3260,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.policyDeniedToolSendsThisTurn.clear()
         resetReviewTurn(live.sessionId)
         const isRealUserTurn = batch.length > 0
+        await live.todoOutcomeWrite
+        await recordTodoTurnStart(live, isRealUserTurn)
         const retrievalQuery = composeRetrievalQuery(batch)
         // A fresh real-user batch opens a new logical turn. Capture its question
         // shape as PENDING (committed only once the turn completes below). The
@@ -3385,7 +3407,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           await fireSessionTurnEnd(live)
         }
         await fireSessionIdle(live)
-        await recordTodoTurnStart(live, isRealUserTurn)
+        await live.todoOutcomeWrite
         await maybeContinueTodosChannel(live)
         await resolveStagedFallback(live)
         live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
