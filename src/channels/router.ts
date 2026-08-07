@@ -5526,12 +5526,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (live.draining) continue
       if (live.promptQueue.length > 0) continue
       // pendingSystemReminders is checked alongside promptQueue because both
-      // represent pending work that drain() will process. Today's only
-      // populator (injectSubagentCompletionReminder) also fires drain()
-      // synchronously, which sets draining=true and shadows this guard via
-      // the line above — but the guard exists to keep the invariant honest
-      // for any future caller that queues a reminder without immediately
-      // waking the drain loop.
+      // represent pending work that drain() will process. Reminder injection
+      // wakes an idle session immediately, but deliberately leaves a pending
+      // inbound debounce in charge so both queues coalesce into one turn.
       if (live.pendingSystemReminders.length > 0) continue
       if (t - live.lastInboundAt <= SESSION_IDLE_MS) continue
       if (isPinnedByRunningChild(live.sessionId, live.keyId, 'idle_gc evicting')) continue
@@ -5927,17 +5924,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // hard-block that legitimate fetch.
     forgetSharedLoopGuardTool(live.sessionId, SUBAGENT_OUTPUT_TOOL_NAME)
     logger.info(`[channels] ${live.keyId}: subagent-completion reminder queued task=${args.taskId} ok=${args.ok}`)
-    // Wake the drain loop. If a turn is already in flight, the wakeup is
-    // a no-op because drain() will pick up the reminder on its next
-    // iteration (it now gates on promptQueue OR pendingSystemReminders).
-    // If the session is idle, fire drain() immediately rather than going
-    // through the debounce path — the reminder is not a user inbound,
-    // so the "coalesce nearby inbounds" rationale for debouncing does
-    // not apply. Mirrors the TUI path's `idle ? 'interrupt' : 'queue'`
-    // semantics: the channel router doesn't have a `delivery: interrupt`
-    // mechanism (no in-flight abort during a turn), but firing drain()
-    // immediately is the equivalent for an idle session.
-    if (!live.draining) {
+    // Wake an idle session immediately, but leave an already-scheduled inbound
+    // debounce in charge. Starting a fire-and-forget drain here would splice
+    // both queues before the debounce owner can await that drain, making the
+    // caller observe an in-progress turn and defeating deterministic coalescing.
+    // An in-flight drain picks up the reminder on its next iteration.
+    if (!live.draining && live.debounceTimer === null) {
       void drain(live)
     }
     return { kind: 'delivered', keyId: live.keyId }
