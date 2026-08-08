@@ -402,6 +402,9 @@ function slowListConnection(name: string, listDelayMs: number, tools: McpToolInf
       await delay(listDelayMs)
       return tools
     },
+    peekTools() {
+      return tools
+    },
     async refresh() {
       return tools
     },
@@ -424,6 +427,9 @@ function paginatedListConnection(name: string, pages: number, pageDelayMs: numbe
   return {
     name,
     listTools,
+    peekTools() {
+      return undefined
+    },
     refresh: listTools,
     async callTool() {
       return { content: [{ type: 'text', text: 'ok' }] }
@@ -471,6 +477,9 @@ function fakeConnection(name: string, tools: McpToolInfo[], closed: string[]): M
     async listTools() {
       return tools
     },
+    peekTools() {
+      return tools
+    },
     async refresh() {
       return tools
     },
@@ -496,6 +505,9 @@ function changingConnection(name: string): McpConnection {
   return {
     name,
     listTools,
+    peekTools() {
+      return undefined
+    },
     refresh: listTools,
     async callTool() {
       return { content: [{ type: 'text', text: 'ok' }] }
@@ -509,6 +521,9 @@ function failingRefreshConnection(name: string): McpConnection {
     name,
     async listTools() {
       return [{ name: `${name}-tool`, description: '', inputSchema: {} }]
+    },
+    peekTools() {
+      return undefined
     },
     async refresh() {
       throw new Error('refresh boom')

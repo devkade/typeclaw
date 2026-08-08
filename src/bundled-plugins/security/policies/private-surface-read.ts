@@ -83,22 +83,27 @@ export function checkPrivateSurfaceReadGuard(
   const { tool, args, agentDir, hidden, fileOperands } = options
   if (UNSCANNED_TOOLS.has(tool)) return undefined
   try {
-    const { deniedDirs, deniedFiles } = deniedSurface(agentDir, hidden)
-    if (deniedDirs.length === 0 && deniedFiles.length === 0) return undefined
-    const identityScanner = createHardlinkIdentityScanner(agentDir, deniedDirs, deniedFiles, hooks)
+    const { canonicalDirs, canonicalFiles, roleDirs, roleFiles } = deniedSurface(agentDir, hidden)
+    const canonicalEmpty = canonicalDirs.length === 0 && canonicalFiles.length === 0
+    const roleEmpty = roleDirs.length === 0 && roleFiles.length === 0
+    if (canonicalEmpty && roleEmpty) return undefined
     const realpath = hooks.realpathNative ?? realpathSync.native
 
-    const nonFile = fileOperands?.nonFile === undefined ? undefined : new Set(fileOperands.nonFile)
-    for (const candidate of collectPathCandidates(args, tool, nonFile)) {
-      const hit = matchHidden(candidate, agentDir, deniedDirs, deniedFiles, identityScanner, realpath)
-      if (hit !== undefined) {
-        return {
-          block: true,
-          reason: [
-            `Guard \`${GUARD_PRIVATE_SURFACE_READ}\` blocked ${tool}: argument \`${candidate}\` resolves to ${hit}, which is not available to LLM tools.`,
-            'The bash sandbox masks the same path. Privileged roles cannot bypass canonical agent credential files; use host-side redacted diagnostics such as `typeclaw doctor`, `typeclaw provider list`, or `typeclaw channel list` instead.',
-          ].join(' '),
-        }
+    if (!canonicalEmpty) {
+      const identityScanner = createHardlinkIdentityScanner(agentDir, canonicalDirs, canonicalFiles, hooks)
+      for (const candidate of collectPathCandidates(args, tool, undefined, undefined, true)) {
+        const hit = matchHidden(candidate, agentDir, canonicalDirs, canonicalFiles, identityScanner, realpath)
+        if (hit !== undefined) return privateSurfacePathBlock(tool, candidate, hit)
+      }
+    }
+
+    if (!roleEmpty) {
+      const identityScanner = createHardlinkIdentityScanner(agentDir, roleDirs, roleFiles, hooks)
+      const nonFile = fileOperands?.nonFile === undefined ? undefined : new Set(fileOperands.nonFile)
+      const localOperands = collectLocalOperandPaths(fileOperands)
+      for (const candidate of collectPathCandidates(args, tool, nonFile, localOperands, false)) {
+        const hit = matchHidden(candidate, agentDir, roleDirs, roleFiles, identityScanner, realpath)
+        if (hit !== undefined) return privateSurfacePathBlock(tool, candidate, hit)
       }
     }
     return undefined
@@ -134,7 +139,9 @@ export function createPrivateSurfaceReadIdentityVerifier(
   options: PrivateSurfaceIdentityOptions,
   hooks: PrivateSurfaceIdentityScanHooks = {},
 ): PrivateSurfaceIdentityVerifier {
-  const { deniedDirs, deniedFiles } = deniedSurface(options.agentDir, options.hidden)
+  const { canonicalDirs, canonicalFiles, roleDirs, roleFiles } = deniedSurface(options.agentDir, options.hidden)
+  const deniedDirs = [...new Set([...canonicalDirs, ...roleDirs])]
+  const deniedFiles = [...new Set([...canonicalFiles, ...roleFiles])]
   const scanner = createHardlinkIdentityScanner(options.agentDir, deniedDirs, deniedFiles, hooks)
   return {
     check(identity) {
@@ -174,11 +181,13 @@ function createHardlinkIdentityScanner(
   })
 }
 
-function deniedSurface(agentDir: string, hidden: HiddenPaths): { deniedDirs: string[]; deniedFiles: string[] } {
+function deniedSurface(
+  agentDir: string,
+  hidden: HiddenPaths,
+): { canonicalDirs: string[]; canonicalFiles: string[]; roleDirs: string[]; roleFiles: string[] } {
   return {
-    deniedDirs: [
+    canonicalDirs: [
       ...new Set([
-        ...hidden.dirs,
         ...RUNTIME_OWNED_SECRET_DIRS.map((dir) => path.join(agentDir, dir)),
         // homedir() follows the live container HOME; the fixed runtime path
         // keeps the same denial deterministic in host-stage tests and any
@@ -189,14 +198,25 @@ function deniedSurface(agentDir: string, hidden: HiddenPaths): { deniedDirs: str
     ],
     // Keep runtime-owned credential stores independent of role-derived
     // visibility so a partially-wired caller cannot expose raw credentials.
-    deniedFiles: [
+    canonicalFiles: [
       ...new Set([
-        ...hidden.files,
         ...CANONICAL_AGENT_SECRET_FILES.map((file) => path.join(agentDir, file)),
         ...CANONICAL_HOME_SECRET_FILES.map((file) => path.join(homedir(), file)),
         ...CANONICAL_HOME_SECRET_FILES.map((file) => path.join(CONTAINER_RUNTIME_HOME, file)),
       ]),
     ],
+    roleDirs: [...new Set(hidden.dirs)],
+    roleFiles: [...new Set(hidden.files)],
+  }
+}
+
+function privateSurfacePathBlock(tool: string, candidate: string, hit: string): SecurityBlock {
+  return {
+    block: true,
+    reason: [
+      `Guard \`${GUARD_PRIVATE_SURFACE_READ}\` blocked ${tool}: argument \`${candidate}\` resolves to ${hit}, which is not available to LLM tools.`,
+      'The bash sandbox masks the same path. Privileged roles cannot bypass canonical agent credential files; use host-side redacted diagnostics such as `typeclaw doctor`, `typeclaw provider list`, or `typeclaw channel list` instead.',
+    ].join(' '),
   }
 }
 
@@ -295,11 +315,37 @@ function trimmedFileUri(value: string): string | undefined {
 // enforcement points agree — an id like `{ tenant: "memory" }` on a tool that
 // declared `nonFile: ['tenant']` is not blocked here. Scoped by EXACT operand
 // path (not key name), so an undeclared key still fails closed; `input`/
-// `output`/`destructive` are deliberately NOT honored (a declared real-file path
-// that resolves under a hidden dir must still block).
-function collectPathCandidates(value: unknown, tool: string, nonFile?: ReadonlySet<string>): string[] {
+// `output`/`create`/`destructive` are never exemptions — they FORCE a scan (a
+// declared real-file path that resolves under a hidden dir must still block).
+// `localOperands` holds the declared `input`/`output`/`create`/`destructive`
+// operand PATHS. A string at one of those paths is ALWAYS scanned, overriding
+// both the prose-key exemptions above and any `nonFile` claim on the same path.
+// Without that override the two exemption layers compose into a bypass: a tool
+// declaring a real local operand under a universally-free-text key (`query`,
+// `content`, `text`, `name`, ...) would have its value skipped here as prose,
+// then dereferenced downstream — so `{ input: ['query'], query: 'memory/x' }`
+// would reach a hidden directory the role cannot see. Declaring a path as a
+// local file is exactly the claim that it is NOT prose.
+function collectLocalOperandPaths(operands: ToolFileOperands | undefined): ReadonlySet<string> | undefined {
+  if (operands === undefined) return undefined
+  const paths = new Set([
+    ...(operands.input ?? []),
+    ...(operands.output ?? []),
+    ...(operands.create ?? []),
+    ...(operands.destructive ?? []),
+  ])
+  return paths.size === 0 ? undefined : paths
+}
+
+function collectPathCandidates(
+  value: unknown,
+  tool: string,
+  nonFile?: ReadonlySet<string>,
+  localOperands?: ReadonlySet<string>,
+  disableExemptions = false,
+): string[] {
   const out: string[] = []
-  walk(value, out, tool, false, nonFile, '')
+  walk(value, out, tool, false, nonFile, localOperands, '', disableExemptions)
   return out
 }
 
@@ -309,27 +355,37 @@ function walk(
   tool: string,
   underExempt: boolean,
   nonFile: ReadonlySet<string> | undefined,
+  localOperands: ReadonlySet<string> | undefined,
   operandPath: string,
+  disableExemptions: boolean,
   key?: string,
 ): void {
   if (typeof value === 'string') {
-    if (nonFile?.has(operandPath) === true) return
-    const isFileUrl = trimmedFileUri(value) !== undefined
-    if (underExempt && !isPathKey(key) && !isFileUrl) return
+    if (!disableExemptions) {
+      const declaredLocal = localOperands?.has(operandPath) === true
+      if (!declaredLocal) {
+        if (nonFile?.has(operandPath) === true) return
+        const isFileUrl = trimmedFileUri(value) !== undefined
+        if (underExempt && !isPathKey(key) && !isFileUrl) return
+      }
+    }
     const normalized = normalizeCandidate(value)
     if (normalized !== undefined) out.push(normalized)
     return
   }
   if (Array.isArray(value)) {
-    for (const item of value) walk(item, out, tool, underExempt, nonFile, operandPath, key)
+    for (const item of value) {
+      walk(item, out, tool, underExempt, nonFile, localOperands, operandPath, disableExemptions, key)
+    }
     return
   }
   if (value !== null && typeof value === 'object') {
     const toolFreeText = FREE_TEXT_KEYS_BY_TOOL[tool]
     for (const [childKey, item] of Object.entries(value)) {
-      const keyIsExempt = NON_PATH_KEYS.has(childKey) || (toolFreeText?.has(childKey) ?? false)
+      if (disableExemptions && childKey === 'filename' && toolFreeText?.has(childKey) === true) continue
+      const keyIsExempt = !disableExemptions && (NON_PATH_KEYS.has(childKey) || (toolFreeText?.has(childKey) ?? false))
       const childPath = operandPath === '' ? childKey : `${operandPath}.${childKey}`
-      walk(item, out, tool, underExempt || keyIsExempt, nonFile, childPath, childKey)
+      walk(item, out, tool, underExempt || keyIsExempt, nonFile, localOperands, childPath, disableExemptions, childKey)
     }
   }
 }

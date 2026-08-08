@@ -25,6 +25,7 @@
     "tunnel-providers",
     "compose",
     "plugin-api",
+    "mcp",
     "bundled-plugins",
     "stream-targets",
     "env-vars"

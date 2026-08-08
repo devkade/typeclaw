@@ -52,6 +52,131 @@ describe('resolveServerEnv', () => {
 })
 
 describe('McpConnection', () => {
+  test('round-trips all declared file operand categories from MCP tool metadata', async () => {
+    const fileOperands = {
+      input: ['source'],
+      output: ['destination'],
+      create: ['created'],
+      destructive: ['removed'],
+      nonFile: ['pattern'],
+    }
+    const connection = createMcpConnection(
+      'server',
+      fakeSdkClient([
+        {
+          name: 'transform',
+          inputSchema: { type: 'object' },
+          _meta: { 'x-file-operands': fileOperands },
+        },
+      ]),
+    )
+
+    expect((await connection.listTools())[0]?.fileOperands).toEqual(fileOperands)
+  })
+
+  test('drops unrecognized file operand metadata keys while preserving recognized categories', async () => {
+    const connection = createMcpConnection(
+      'server',
+      fakeSdkClient([
+        {
+          name: 'search',
+          inputSchema: { type: 'object' },
+          _meta: { 'x-file-operands': { nonFile: ['query'], unsupported: ['ignored'] } },
+        },
+      ]),
+    )
+
+    expect((await connection.listTools())[0]?.fileOperands).toEqual({ nonFile: ['query'] })
+  })
+
+  test.each([
+    ['string root', 'nonFile'],
+    ['null root', null],
+    ['array root', [{ nonFile: ['query'] }]],
+    ['non-array category', { nonFile: 'query' }],
+    ['non-string array member', { nonFile: ['query', 1] }],
+    ['empty string array member', { nonFile: [''] }],
+    ['whitespace-only array member', { nonFile: ['   '] }],
+    ['malformed input beside valid nonFile', { input: 'source', nonFile: ['query'] }],
+  ])('discards the whole file operand declaration for %s', async (_case, declared) => {
+    const connection = createMcpConnection(
+      'server',
+      fakeSdkClient([
+        {
+          name: 'search',
+          inputSchema: { type: 'object' },
+          _meta: { 'x-file-operands': declared },
+        },
+      ]),
+    )
+
+    expect((await connection.listTools())[0]?.fileOperands).toBeUndefined()
+  })
+
+  test('discards a file operand declaration overlapping nonFile and input', async () => {
+    expect(await fileOperandsFromDeclaration({ nonFile: ['query'], input: ['query'] })).toBeUndefined()
+  })
+
+  test('discards a file operand declaration overlapping two local categories', async () => {
+    expect(await fileOperandsFromDeclaration({ input: ['path'], output: ['path'] })).toBeUndefined()
+  })
+
+  test('discards a file operand declaration repeating a path within one category', async () => {
+    expect(await fileOperandsFromDeclaration({ input: ['path', 'path'] })).toBeUndefined()
+  })
+
+  test('preserves distinct paths declared across different categories', async () => {
+    const declared = {
+      input: ['source'],
+      output: ['destination'],
+      create: ['newPath'],
+      destructive: ['oldPath'],
+      nonFile: ['query'],
+    }
+
+    expect(await fileOperandsFromDeclaration(declared)).toEqual(declared)
+  })
+
+  test('omits file operands when metadata or the declaration key is absent', async () => {
+    const connection = createMcpConnection(
+      'server',
+      fakeSdkClient([
+        { name: 'without-meta', inputSchema: { type: 'object' } },
+        { name: 'without-key', inputSchema: { type: 'object' }, _meta: { other: true } },
+      ]),
+    )
+
+    const tools = await connection.listTools()
+    expect(tools[0]?.fileOperands).toBeUndefined()
+    expect(tools[1]?.fileOperands).toBeUndefined()
+  })
+
+  test('peekTools exposes only a successfully loaded catalog', async () => {
+    const connection = createMcpConnection(
+      'server',
+      fakeSdkClient([{ name: 'first', inputSchema: { type: 'object' } }]),
+    )
+
+    expect(connection.peekTools()).toBeUndefined()
+    const catalog = await connection.listTools()
+    expect(connection.peekTools()).toBe(catalog)
+  })
+
+  test('retains the cached catalog when refresh fails', async () => {
+    let listCalls = 0
+    const client = fakeSdkClient([{ name: 'first', inputSchema: { type: 'object' } }])
+    client.listTools = async () => {
+      listCalls += 1
+      if (listCalls > 1) throw new Error('refresh failed')
+      return { tools: [{ name: 'first', inputSchema: { type: 'object' } }] }
+    }
+    const connection = createMcpConnection('server', client)
+    const catalog = await connection.listTools()
+
+    await expect(connection.refresh()).rejects.toThrow('refresh failed')
+    expect(connection.peekTools()).toBe(catalog)
+  })
+
   test('caches listed tools after the first catalog load', async () => {
     let listCalls = 0
     const callResult: CallToolResult = { content: [{ type: 'text', text: 'ok' }] }
@@ -255,4 +380,37 @@ function fakeConnectClient(overrides: {
     connect: overrides.connect,
     close: overrides.close,
   }
+}
+
+function fakeSdkClient(
+  tools: Array<{
+    name: string
+    description?: string
+    inputSchema: unknown
+    _meta?: Record<string, unknown>
+  }>,
+): McpSdkClient {
+  return {
+    async listTools() {
+      return { tools }
+    },
+    async callTool() {
+      return { content: [{ type: 'text', text: 'ok' }] }
+    },
+    async close() {},
+  }
+}
+
+async function fileOperandsFromDeclaration(declared: Record<string, unknown>) {
+  const connection = createMcpConnection(
+    'server',
+    fakeSdkClient([
+      {
+        name: 'tool',
+        inputSchema: { type: 'object' },
+        _meta: { 'x-file-operands': declared },
+      },
+    ]),
+  )
+  return (await connection.listTools())[0]?.fileOperands
 }
